@@ -3,6 +3,7 @@
   import {
     models,
     type PromptOptimizationPolicy,
+    type PromptOptimizationSnapshot,
     getPromptOptimizationPolicy,
     setPromptOptimizationPolicy,
     getConfigPath,
@@ -44,6 +45,8 @@
   let policyByModel = $state<Record<string, PromptOptimizationPolicy>>({});
   let configPath = $state("config.yaml");
   let latestInfo = $state<Record<string, string>>({});
+  let latestSnapshotByModel = $state<Record<string, PromptOptimizationSnapshot | null>>({});
+  let copyStatusByModel = $state<Record<string, string>>({});
 
   const localModels = $derived.by(() => $models.filter((m) => !m.peerID).sort((a, b) => a.id.localeCompare(b.id)));
 
@@ -94,11 +97,57 @@
   async function loadLatestInfo(modelId: string): Promise<void> {
     const latest = await getLatestPromptOptimization(modelId);
     if (!latest) {
+      latestSnapshotByModel = { ...latestSnapshotByModel, [modelId]: null };
       latestInfo = { ...latestInfo, [modelId]: "No optimization snapshot yet." };
       return;
     }
+    latestSnapshotByModel = { ...latestSnapshotByModel, [modelId]: latest };
     const label = `${latest.updatedAt} | ${latest.policy} | applied=${latest.applied}`;
     latestInfo = { ...latestInfo, [modelId]: label };
+  }
+
+  async function copyText(text: string): Promise<boolean> {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      textArea.style.position = "fixed";
+      textArea.style.left = "-9999px";
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(textArea);
+      return ok;
+    } catch (error) {
+      console.error("Failed to copy optimized prompt:", error);
+      return false;
+    }
+  }
+
+  async function copyLatestOptimizedPrompt(modelId: string): Promise<void> {
+    const existing = latestSnapshotByModel[modelId];
+    let snapshot = existing;
+    if (!snapshot) {
+      await loadLatestInfo(modelId);
+      snapshot = latestSnapshotByModel[modelId];
+    }
+
+    const optimizedBody = snapshot?.optimizedBody?.trim();
+    if (!optimizedBody) {
+      copyStatusByModel = { ...copyStatusByModel, [modelId]: "No optimized prompt available to copy." };
+      return;
+    }
+
+    const copied = await copyText(optimizedBody);
+    copyStatusByModel = {
+      ...copyStatusByModel,
+      [modelId]: copied ? "Optimized prompt copied." : "Copy failed.",
+    };
   }
 </script>
 
@@ -147,9 +196,15 @@
             <div class="text-xs text-txtsecondary mt-1" title={options.find((o) => o.value === selected)?.help || ""}>
               {getPolicyLabel(selected)}
             </div>
-            <button class="btn btn--sm mt-2" onclick={() => loadLatestInfo(model.id)}>Latest Optimized Prompt Info</button>
+            <div class="mt-2 flex items-center gap-2">
+              <button class="btn btn--sm" onclick={() => loadLatestInfo(model.id)}>Latest Optimized Prompt Info</button>
+              <button class="btn btn--sm" onclick={() => copyLatestOptimizedPrompt(model.id)}>Copy Optimized Prompt</button>
+            </div>
             {#if latestInfo[model.id]}
               <div class="text-xs text-txtsecondary mt-1 break-all">{latestInfo[model.id]}</div>
+            {/if}
+            {#if copyStatusByModel[model.id]}
+              <div class="text-xs text-txtsecondary mt-1">{copyStatusByModel[model.id]}</div>
             {/if}
           </td>
         </tr>
