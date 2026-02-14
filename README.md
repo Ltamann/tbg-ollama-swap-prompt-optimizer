@@ -1,9 +1,8 @@
-![llama-swap header image](docs/assets/hero3.webp)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/mostlygeek/llama-swap/total)
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/mostlygeek/llama-swap/go-ci.yml)
-![GitHub Repo stars](https://img.shields.io/github/stars/mostlygeek/llama-swap)
+![TBG (O)Llama Swap + Promt Optimizer](docs/assets/hero3.webp)
 
 # TBG (O)Llama  Swap + Promt Optimizer
+
+Based on Benson Wong's [llama-swap](https://github.com/mostlygeek/llama-swap).
 
 Run multiple LLM models on your machine and hot-swap between them as needed. llama-swap works with any OpenAI API-compatible server, giving you the flexibility to switch models without restarting your applications.
 
@@ -100,93 +99,36 @@ The Activity Page shows recent requests:
 
 <img width="1360" height="963" alt="image" src="https://github.com/user-attachments/assets/5f3edee6-d03a-4ae5-ae06-b20ac1f135bd" />
 
-## Installation
+## Install and Build
 
-llama-swap can be installed in multiple ways
+### Prerequisites
 
-1. Docker
-2. Homebrew (OSX and Linux)
-3. WinGet
-4. From release binaries
-5. From source
+- Go (1.24+ recommended)
+- Node.js + npm (for UI build)
+- Optional: CUDA-enabled llama.cpp and/or Ollama runtime
 
-### Docker Install ([download images](https://github.com/mostlygeek/llama-swap/pkgs/container/llama-swap))
-
-Nightly container images with llama-swap and llama-server are built for multiple platforms (cuda, vulkan, intel, etc.) including [non-root variants with improved security](docs/container-security.md).
-The stable-diffusion.cpp server is also included for the musa and vulkan platforms.
+### Build From Source
 
 ```shell
-$ docker pull ghcr.io/mostlygeek/llama-swap:cuda
-
-# run with a custom configuration and models directory
-$ docker run -it --rm --runtime nvidia -p 9292:8080 \
- -v /path/to/models:/models \
- -v /path/to/custom/config.yaml:/app/config.yaml \
- ghcr.io/mostlygeek/llama-swap:cuda
-
-# configuration hot reload supported with a
-# directory volume mount
-$ docker run -it --rm --runtime nvidia -p 9292:8080 \
- -v /path/to/models:/models \
- -v /path/to/custom/config.yaml:/app/config.yaml \
- -v /path/to/config:/config \
- ghcr.io/mostlygeek/llama-swap:cuda -config /config/config.yaml -watch-config
+git clone https://github.com/Ltamann/tbg-ollama-swap-prompt-optimizer.git
+cd tbg-ollama-swap-prompt-optimizer
+make clean all
 ```
 
-<details>
-<summary>
-more examples
-</summary>
+Output binaries are created in `build/`.
+
+### Run
 
 ```shell
-# pull latest images per platform
-docker pull ghcr.io/mostlygeek/llama-swap:cpu
-docker pull ghcr.io/mostlygeek/llama-swap:cuda
-docker pull ghcr.io/mostlygeek/llama-swap:vulkan
-docker pull ghcr.io/mostlygeek/llama-swap:intel
-docker pull ghcr.io/mostlygeek/llama-swap:musa
-
-# tagged llama-swap, platform and llama-server version images
-docker pull ghcr.io/mostlygeek/llama-swap:v166-cuda-b6795
-
-# non-root cuda
-docker pull ghcr.io/mostlygeek/llama-swap:cuda-non-root
-
+# example
+./build/llama-swap -config ./config.yaml -listen 0.0.0.0:8080
 ```
 
-</details>
+On Windows:
 
-### Homebrew Install (macOS/Linux)
-
-```shell
-brew tap mostlygeek/llama-swap
-brew install llama-swap
-llama-swap --config path/to/config.yaml --listen localhost:8080
+```powershell
+.\build\llama-swap-windows-amd64.exe -config .\config.yaml -listen 127.0.0.1:8080
 ```
-
-### WinGet Install (Windows)
-
-> [!NOTE]
-> WinGet is maintained by community contributor [Dvd-Znf](https://github.com/Dvd-Znf) ([#327](https://github.com/mostlygeek/llama-swap/issues/327)). It is not an official part of llama-swap.
-
-```shell
-# install
-C:\> winget install llama-swap
-
-# upgrade
-C:\> winget upgrade llama-swap
-```
-
-### Pre-built Binaries
-
-Binaries are available on the [release](https://github.com/mostlygeek/llama-swap/releases) page for Linux, Mac, Windows and FreeBSD.
-
-### Building from source
-
-1. Building requires Go and Node.js (for UI).
-1. `git clone https://github.com/mostlygeek/llama-swap.git`
-1. `make clean all`
-1. look in the `build/` subdirectory for the llama-swap binary
 
 ## Configuration
 
