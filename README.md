@@ -141,34 +141,111 @@ On Windows:
 ## Configuration
 
 ```yaml
-# minimum viable config.yaml
+# full sample config.yaml for TBG (O)Llama Swap + Promt Optimizer
+
+healthCheckTimeout: 120
+startPort: 10001
+logLevel: info
+includeAliasesInList: true
+
+# optional API protection
+apiKeys:
+  - ${env.LLAMASWAP_API_KEY}
+
+# default behavior for prompt-truncation fallback
+sendLoadingState: true
+
+# reusable key/value variables
+macros:
+  LLAMA_BIN: /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+  MODEL_DIR: /home/admmin/models
+  HOST: 0.0.0.0
+  THREADS: 16
+  GPU_LAYERS: 999
+
+hooks:
+  on_startup:
+    preload:
+      - Qwen3-Coder-Next-MXFP4_MOE
 
 models:
-  model1:
-    cmd: llama-server --port ${PORT} --model /path/to/model.gguf
+  Qwen3-Coder-Next-MXFP4_MOE:
+    name: "Qwen3-Coder-Next"
+    description: "Primary coding model"
+    cmd: >
+      ${LLAMA_BIN}
+      --model ${MODEL_DIR}/Qwen3-Coder-Next-MXFP4_MOE.gguf
+      --host ${HOST} --port ${PORT}
+      --threads ${THREADS}
+      --threads-batch 48
+      --n-gpu-layers ${GPU_LAYERS}
+      --n-cpu-moe 0
+      --ctx-size 202752
+      --batch-size 4096
+      --ubatch-size 512
+      --tensor-split 60,40
+      --flash-attn on
+      --jinja
+      --parallel 1
+    checkEndpoint: /health
+    ttl: 0
+    aliases:
+      - claude-sonnet-4-5
+      - tbg-coder-next
+      - qwen3-coder-next
+    useModelName: Qwen3-Coder-Next-MXFP4_MOE
+    truncationMode: sliding_window
+    filters:
+      # remove client params you want server-side defaults for
+      stripParams: "temperature,top_p,top_k,repeat_penalty"
+      # force stable server-side params
+      setParams:
+        temperature: 0.7
+        top_p: 0.95
+        top_k: 40
+        min_p: 0.01
+    metadata:
+      family: qwen3-coder-next
+      quant: mxfp4
+      vram_hint_gb: 24
+
+  gpt-oss-20b-F16:
+    name: "gpt-oss-20b"
+    description: "Secondary reasoning/coding model"
+    cmd: >
+      ${LLAMA_BIN}
+      --model ${MODEL_DIR}/gpt-oss-20b-F16.gguf
+      --host ${HOST} --port ${PORT}
+      --threads ${THREADS}
+      --n-gpu-layers ${GPU_LAYERS}
+      --ctx-size 262144
+      --batch-size 2048
+      --ubatch-size 512
+      --flash-attn on
+      --jinja
+      --parallel 1
+    checkEndpoint: /health
+    ttl: 1800
+    aliases:
+      - gpt-oss
+      - gpt-oss-20b
+    truncationMode: strict_error
+
+groups:
+  coding:
+    swap: true
+    exclusive: true
+    persistent: false
+    members:
+      - Qwen3-Coder-Next-MXFP4_MOE
+      - gpt-oss-20b-F16
 ```
 
-That's all you need to get started:
+Notes for this fork:
 
-1. `models` - holds all model configurations
-2. `model1` - the ID used in API calls
-3. `cmd` - the command to run to start the server.
-4. `${PORT}` - an automatically assigned port number
-
-Almost all configuration settings are optional and can be added one step at a time:
-
-- Advanced features
-  - `groups` to run multiple models at once
-  - `hooks` to run things on startup
-  - `macros` reusable snippets
-- Model customization
-  - `ttl` to automatically unload models
-  - `aliases` to use familiar model names (e.g., "gpt-4o-mini")
-  - `env` to pass custom environment variables to inference servers
-  - `cmdStop` gracefully stop Docker/Podman containers
-  - `useModelName` to override model names sent to upstream servers
-  - `${PORT}` automatic port variables for dynamic port assignment
-  - `filters` rewrite parts of requests before sending to the upstream server
+1. `ctx-size` is controlled at runtime from the UI/API (`/api/model/:model/ctxsize`) and can override model runtime context behavior without editing `config.yaml`.
+2. Prompt optimization policy is runtime-configurable per model from Settings (`off`, `limit_only`, `always`, `llm_assisted`).
+3. Ollama models are auto-discovered when Ollama is reachable; they do not need `models:` entries in `config.yaml`.
 
 See the [configuration documentation](docs/configuration.md) for all options.
 
