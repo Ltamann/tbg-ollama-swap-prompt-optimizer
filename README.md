@@ -1,91 +1,113 @@
-![TBG (O)Llama Swap + Promt Optimizer - Playground](docs/assets/ui-playground.png)
+![TBG (O)llama Swap + Prompt Optimizer - Playground](docs/assets/ui-playground.png)
 
-# TBG (O)Llama Swap + Promt Optimizer
+# TBG (O)llama Swap + Prompt Optimizer
 
-Based on Benson Wong's [llama-swap](https://github.com/mostlygeek/llama-swap).
+Based on Benson Wong's upstream project: [mostlygeek/llama-swap](https://github.com/mostlygeek/llama-swap).
 
-This fork targets local agent workflows (for example Claude Code CLI) where prompts become very long and repetitive. It adds runtime context control, prompt optimization policies, and an Ollama passthrough hook on top of upstream llama-swap.
+TBG (O)llama Swap + Prompt Optimizer is focused on local agent workflows (for example Claude Code CLI) where prompts become very large, repetitive, and unstable for low-VRAM local inference.
 
-## What This Repo Solves
+## What This Fork Adds
 
-Long local-agent sessions often create:
+- Runtime per-model context override from UI/API
+- Prompt optimization policies per model
+- Latest optimization snapshot endpoint for audit/debug
+- Optional Ollama discovery and passthrough hook
+- Unified model list for configured llama.cpp models and live Ollama models
 
-- prompt payloads that exceed model context limits
-- repeated transcript blocks that waste context budget
+## Why This Exists
 
-TBG (O)Llama Swap + Promt Optimizer can compact prompts before forwarding to the model, helping keep requests inside practical context limits.
+Long local coding-agent sessions can produce:
 
-## Key Features
+- repeated transcript blocks
+- context overflow errors
+- wasted context budget on low-value history
 
-- Model hot-swap via one OpenAI-compatible endpoint
-- Runtime context override per model (`/api/model/:model/ctxsize`)
-- Prompt optimization policies per model:
-  - `off`
-  - `limit_only`
-  - `always`
-  - `llm_assisted`
-- Latest optimization snapshot API:
-  - `/api/model/:model/prompt-optimization/latest`
-- Optional Ollama hook (if Ollama is already running):
-  - auto-discovers models in `/v1/models` and `/ui/models`
-  - exposes IDs as `ollama/<model_name>`
-  - keeps Ollama ctx read-only in UI/API
+TBG (O)llama Swap optimizes request payloads before forwarding upstream so context is used for relevant content.
 
-## How llama-swap Works In This Fork
+## How TBG (O)llama Swap Works
 
-Request flow:
+Request path:
 
-`Client (Claude Code/OpenWebUI) -> TBG (O)Llama Swap + Promt Optimizer -> llama.cpp or Ollama`
+`Client (Claude Code / OpenWebUI) -> TBG (O)llama Swap + Prompt Optimizer -> llama.cpp or Ollama`
 
-1. Client sends request with a `model` ID.
-2. Proxy resolves whether it is a configured llama.cpp model or an `ollama/*` model.
-3. For configured models, proxy ensures the correct upstream process is active (swap if needed).
-4. Prompt optimization policy is applied according to model settings.
-5. Request is forwarded to the active upstream and streamed back to client.
+Detailed behavior:
+
+1. Client calls an OpenAI-compatible endpoint with a `model`.
+2. The proxy resolves the target model source:
+- configured model in `config.yaml`
+- discovered live model with ID `ollama/<name>`
+3. If needed, the proxy swaps upstream process state to match the requested configured model.
+4. Runtime model settings are applied:
+- context override (`/api/model/:model/ctxsize`)
+- prompt optimization policy (`/api/model/:model/prompt-optimization`)
+5. Prompt payload is optionally compacted based on policy:
+- `off` (no optimization)
+- `limit_only` (optimize only near/over limit)
+- `always` (aggressive optimization)
+- `llm_assisted` (smart optimization using model-assisted summarization)
+6. Request is forwarded and response is streamed back to client.
+7. Latest optimization result can be inspected via:
+- `/api/model/:model/prompt-optimization/latest`
 
 ## Prompt Optimization Benchmarks
 
-Test setup:
+Test environment:
 
-- Environment: WSL Ubuntu
-- Model: `gpt-oss-20b-F16`
-- Context: `8096`
-- Compared policies: `always` vs `llm_assisted`
+- WSL Ubuntu
+- model: `gpt-oss-20b-F16`
+- context: `8096`
+- payload: huge repetitive coding-session transcript
 
-### Results Table
+Mode naming used in this README:
 
-| Metric | always | llm_assisted |
+- `off` = optimization disabled
+- `smart` = internal policy `limit_only`
+- `aggressive` = internal policy `always`
+- `llm_assisted` = model-assisted summarization mode (separate from smart)
+
+### Latest Same-Payload Test (smart vs aggressive)
+
+| Mode | prompt_tokens | completion_tokens | total_tokens | latency |
+|---|---:|---:|---:|---:|
+| smart (`limit_only`) | 83 | 32 | 115 | ~2415 ms |
+| aggressive (`always`) | 108 | 32 | 140 | ~2323 ms |
+
+Interpretation:
+
+- both modes stayed inside context and completed successfully.
+- in this test, smart produced fewer prompt tokens than aggressive.
+- aggressive is not guaranteed to be smaller on every prompt; outcomes depend on repetition shape and downstream tokenization.
+
+### Historical Project Runs (aggressive vs llm_assisted)
+
+| Metric | aggressive (`always`) | llm_assisted |
 |---|---:|---:|
 | Avg latency (repeated prompt A/B) | 14.164s | 13.832s |
-| Quality score (marker recall, avg) | 6.0/6 | 6.0/6 |
 | Avg latency (quality test runs) | 5.949s | 5.738s |
+| Quality score (marker recall, avg) | 6.0/6 | 6.0/6 |
+
+### Off Baseline Status
+
+- off vs aggressive baseline values were tested earlier but numeric logs are not currently retained in-repo.
 
 ![Prompt Optimization Benchmark Chart](docs/assets/prompt-optimization-benchmark.png)
 
-### Speed Graph (lower is better)
+### 200k Coding Looseness Factor (Practical Rule)
 
-```mermaid
-xychart-beta
-    title "Prompt Optimization Speed Comparison"
-    x-axis ["A/B Avg", "Quality Avg"]
-    y-axis "Seconds" 0 --> 16
-    bar [14.164, 5.949]
-    bar [13.832, 5.738]
-```
+- `off`: 0% intentional loss, highest fidelity, highest overflow risk.
+- `smart` (`limit_only`): typically ~1-5% semantic loss risk on real coding threads.
+- `aggressive` (`always`): typically ~5-15% semantic/detail loss risk.
 
-Legend:
-- Bar 1: `always`
-- Bar 2: `llm_assisted`
+Recommended looseness factor for coding at 200k:
 
-### Quality Graph (higher is better)
+- smart: `1.05`
+- aggressive: `1.15`
 
-```mermaid
-xychart-beta
-    title "Quality Retention (Marker Recall)"
-    x-axis ["always", "llm_assisted"]
-    y-axis "Score (max 6)" 0 --> 6
-    bar [6, 6]
-```
+Operational guidance:
+
+- default to smart (`limit_only`) for long coding sessions.
+- use aggressive (`always`) only when repetitive bloat still pushes context pressure.
+- keep critical constraints in the latest system/user message so they survive compaction.
 
 ## UI
 
@@ -146,6 +168,11 @@ macros:
   THREADS: 16
   GPU_LAYERS: 999
 
+hooks:
+  on_startup:
+    preload:
+      - Qwen3-Coder-Next-MXFP4_MOE
+
 models:
   Qwen3-Coder-Next-MXFP4_MOE:
     name: "Qwen3-Coder-Next"
@@ -155,12 +182,18 @@ models:
       --model ${MODEL_DIR}/Qwen3-Coder-Next-MXFP4_MOE.gguf
       --host ${HOST} --port ${PORT}
       --threads ${THREADS}
+      --threads-batch 48
       --n-gpu-layers ${GPU_LAYERS}
-      --ctx-size 32768
+      --n-cpu-moe 0
+      --ctx-size 202752
+      --batch-size 4096
+      --ubatch-size 512
+      --tensor-split 60,40
       --flash-attn on
       --jinja
       --parallel 1
     checkEndpoint: /health
+    ttl: 0
     aliases:
       - tbg-coder-next
       - qwen3-coder-next
@@ -187,11 +220,14 @@ models:
       --host ${HOST} --port ${PORT}
       --threads ${THREADS}
       --n-gpu-layers ${GPU_LAYERS}
-      --ctx-size 8192
+      --ctx-size 262144
+      --batch-size 2048
+      --ubatch-size 512
       --flash-attn on
       --jinja
       --parallel 1
     checkEndpoint: /health
+    ttl: 1800
     aliases:
       - gpt-oss
       - gpt-oss-20b
@@ -207,15 +243,22 @@ groups:
       - gpt-oss-20b-F16
 ```
 
-## Runtime Controls
+Runtime notes:
 
-- Context size can be changed at runtime from UI Models page and via `/api/model/:model/ctxsize`.
-- Prompt optimization policy can be changed in Settings and via `/api/model/:model/prompt-optimization`.
-- Ollama models do not require `models:` entries; they appear automatically when Ollama is reachable.
+- Context can be overridden at runtime in UI and API (`/api/model/:model/ctxsize`).
+- Prompt optimization policy is runtime-configurable per model.
+- Ollama models are auto-discovered when Ollama is reachable and are shown as external/read-only for ctx override.
+
+## API Surface Added By This Fork
+
+- `POST /api/model/:model/ctxsize`
+- `GET /api/model/:model/ctxsize`
+- `POST /api/model/:model/prompt-optimization`
+- `GET /api/model/:model/prompt-optimization`
+- `GET /api/model/:model/prompt-optimization/latest`
 
 ## Notes
 
-- This repo focuses on local-model stability for CLI agents that produce repetitive long prompts.
-- See `docs/configuration.md` for complete upstream-compatible config options.
-
+- This project focuses on practical local-model reliability for CLI agents with long repetitive prompts.
+- For full base configuration options, see `docs/configuration.md`.
 
