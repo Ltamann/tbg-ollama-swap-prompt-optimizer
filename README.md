@@ -1,4 +1,4 @@
-![TBG (O)Llama Swap + Promt Optimizer](docs/assets/hero3.webp)
+![TBG (O)Llama Swap + Promt Optimizer - Playground](docs/assets/ui-playground.png)
 
 # TBG (O)Llama  Swap + Promt Optimizer
 
@@ -93,11 +93,19 @@ Notes:
 
 llama-swap includes a real time web interface for monitoring logs and controlling models:
 
-<img width="1164" height="745" alt="image" src="https://github.com/user-attachments/assets/bacf3f9d-819f-430b-9ed2-1bfaa8d54579" />
+![Models UI](docs/assets/ui-models.png)
 
 The Activity Page shows recent requests:
 
-<img width="1360" height="963" alt="image" src="https://github.com/user-attachments/assets/5f3edee6-d03a-4ae5-ae06-b20ac1f135bd" />
+![Activity UI](docs/assets/ui-activity.png)
+
+The Settings Page exposes prompt optimization and model controls:
+
+![Settings UI](docs/assets/ui-settings.png)
+
+The Logs Page gives live proxy and upstream log visibility:
+
+![Logs UI](docs/assets/ui-logs.png)
 
 ## Install and Build
 
