@@ -16,19 +16,25 @@ import (
 )
 
 type Model struct {
-	Id            string `json:"id"`
-	Name          string `json:"name"`
-	Description   string `json:"description"`
-	State         string `json:"state"`
-	Unlisted      bool   `json:"unlisted"`
-	PeerID        string `json:"peerID"`
-	Provider      string `json:"provider,omitempty"`
-	External      bool   `json:"external,omitempty"`
-	CtxReference  int    `json:"ctxReference,omitempty"`
-	CtxConfigured int    `json:"ctxConfigured,omitempty"`
-	CtxSource     string `json:"ctxSource,omitempty"`
-	FitEnabled    bool   `json:"fitEnabled,omitempty"`
-	FitCtxMode    string `json:"fitCtxMode,omitempty"`
+	Id                         string  `json:"id"`
+	Name                       string  `json:"name"`
+	Description                string  `json:"description"`
+	State                      string  `json:"state"`
+	Unlisted                   bool    `json:"unlisted"`
+	PeerID                     string  `json:"peerID"`
+	Provider                   string  `json:"provider,omitempty"`
+	External                   bool    `json:"external,omitempty"`
+	CtxReference               int     `json:"ctxReference,omitempty"`
+	CtxConfigured              int     `json:"ctxConfigured,omitempty"`
+	CtxSource                  string  `json:"ctxSource,omitempty"`
+	FitEnabled                 bool    `json:"fitEnabled,omitempty"`
+	FitCtxMode                 string  `json:"fitCtxMode,omitempty"`
+	TempConfigured             float64 `json:"tempConfigured"`
+	TopPConfigured             float64 `json:"topPConfigured"`
+	TopKConfigured             int     `json:"topKConfigured"`
+	MinPConfigured             float64 `json:"minPConfigured"`
+	PresencePenaltyConfigured  float64 `json:"presencePenaltyConfigured"`
+	FrequencyPenaltyConfigured float64 `json:"frequencyPenaltyConfigured"`
 }
 
 func addApiHandlers(pm *ProxyManager) {
@@ -137,6 +143,7 @@ func (pm *ProxyManager) getModelStatus() []Model {
 		modelCfg := pm.config.Models[modelID]
 		args, _ := (&modelCfg).SanitizedCommand()
 		configCtx, ctxSource, fitFromConfig, fitCtxMode := parseCtxAndFitFromArgs(args)
+		samplingConfigured := parseSamplingFromArgs(args)
 		pm.Lock()
 		runtimeFit, hasFitOverride := pm.fitModes[modelID]
 		runtimeFitCtxMode, hasFitCtxModeOverride := pm.fitCtxModes[modelID]
@@ -152,7 +159,7 @@ func (pm *ProxyManager) getModelStatus() []Model {
 			fitCtxMode = "max"
 		}
 
-		models = append(models, Model{
+		model := Model{
 			Id:            modelID,
 			Name:          pm.config.Models[modelID].Name,
 			Description:   pm.config.Models[modelID].Description,
@@ -163,7 +170,14 @@ func (pm *ProxyManager) getModelStatus() []Model {
 			CtxSource:     ctxSource,
 			FitEnabled:    fitEnabled,
 			FitCtxMode:    fitCtxMode,
-		})
+		}
+		model.TempConfigured = samplingConfigured.temp
+		model.TopPConfigured = samplingConfigured.topP
+		model.TopKConfigured = samplingConfigured.topK
+		model.MinPConfigured = samplingConfigured.minP
+		model.PresencePenaltyConfigured = samplingConfigured.presencePenalty
+		model.FrequencyPenaltyConfigured = samplingConfigured.frequencyPenalty
+		models = append(models, model)
 	}
 
 	// Iterate over the peer models
@@ -190,6 +204,120 @@ func (pm *ProxyManager) getModelStatus() []Model {
 	}
 
 	return models
+}
+
+type samplingConfigured struct {
+	temp             float64
+	topP             float64
+	topK             int
+	minP             float64
+	presencePenalty  float64
+	frequencyPenalty float64
+}
+
+func parseSamplingFromArgs(args []string) samplingConfigured {
+	cfg := samplingConfigured{
+		// llama.cpp defaults from -h
+		temp:             0.8,
+		topP:             0.95,
+		topK:             40,
+		minP:             0.05,
+		presencePenalty:  0.0,
+		frequencyPenalty: 0.0,
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		if arg == "" {
+			continue
+		}
+		if arg == "--temp" {
+			if i+1 < len(args) {
+				if f, err := strconv.ParseFloat(strings.TrimSpace(args[i+1]), 64); err == nil {
+					cfg.temp = f
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--temp=") {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(arg, "--temp=")), 64); err == nil {
+				cfg.temp = f
+			}
+		}
+		if arg == "--top-p" && i+1 < len(args) {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(args[i+1]), 64); err == nil {
+				cfg.topP = f
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--top-p=") {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(arg, "--top-p=")), 64); err == nil {
+				cfg.topP = f
+			}
+			continue
+		}
+		if arg == "--top-k" && i+1 < len(args) {
+			if v, err := strconv.Atoi(strings.TrimSpace(args[i+1])); err == nil {
+				cfg.topK = v
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--top-k=") {
+			if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(arg, "--top-k="))); err == nil {
+				cfg.topK = v
+			}
+			continue
+		}
+		if arg == "--min-p" && i+1 < len(args) {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(args[i+1]), 64); err == nil {
+				cfg.minP = f
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--min-p=") {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(arg, "--min-p=")), 64); err == nil {
+				cfg.minP = f
+			}
+			continue
+		}
+		if (arg == "--presence-penalty" || arg == "--presence_penalty") && i+1 < len(args) {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(args[i+1]), 64); err == nil {
+				cfg.presencePenalty = f
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--presence-penalty=") {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(arg, "--presence-penalty=")), 64); err == nil {
+				cfg.presencePenalty = f
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--presence_penalty=") {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(arg, "--presence_penalty=")), 64); err == nil {
+				cfg.presencePenalty = f
+			}
+			continue
+		}
+		if (arg == "--frequency-penalty" || arg == "--frequency_penalty") && i+1 < len(args) {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(args[i+1]), 64); err == nil {
+				cfg.frequencyPenalty = f
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--frequency-penalty=") {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(arg, "--frequency-penalty=")), 64); err == nil {
+				cfg.frequencyPenalty = f
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--frequency_penalty=") {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(arg, "--frequency_penalty=")), 64); err == nil {
+				cfg.frequencyPenalty = f
+			}
+			continue
+		}
+	}
+	return cfg
 }
 
 type messageType string

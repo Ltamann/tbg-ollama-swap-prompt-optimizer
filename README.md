@@ -119,35 +119,168 @@ Operational guidance:
 
 ![Logs UI](docs/assets/ui-logs.png)
 
-## Build
+## Installation Guides
 
-### Prerequisites
+### Common requirements (all platforms)
 
-- Go 1.24+
-- Node.js + npm (for UI build)
-- Optional: llama.cpp and/or Ollama runtime
+- Git
+- Go `1.24+`
+- Node.js `20+` and npm (for UI build)
+- Optional runtime backends:
+  - `llama.cpp` (`llama-server`)
+  - `ollama`
 
-### Build from source
+Clone once:
 
 ```bash
 git clone https://github.com/Ltamann/tbg-ollama-swap-prompt-optimizer.git
 cd tbg-ollama-swap-prompt-optimizer
-make clean all
 ```
 
-Binaries are generated in `build/`.
+### Linux (Ubuntu/Debian)
 
-## Run
+Install dependencies:
 
 ```bash
-./build/llama-swap -config ./config.yaml -listen 0.0.0.0:8080
+sudo apt update
+sudo apt install -y git make curl ca-certificates build-essential
 ```
 
-Windows:
+Install Node.js 20:
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+```
+
+Install Go 1.24+ (from distro or official tarball), then verify:
+
+```bash
+go version
+node -v
+npm -v
+```
+
+Build:
+
+```bash
+make clean linux
+```
+
+Run:
+
+```bash
+./build/llama-swap-linux-amd64 -config ./config.yaml -listen 0.0.0.0:8080
+```
+
+### macOS (Apple Silicon)
+
+Install dependencies:
+
+```bash
+xcode-select --install
+brew install git go node make
+```
+
+Verify:
+
+```bash
+go version
+node -v
+npm -v
+```
+
+Build:
+
+```bash
+make clean mac
+```
+
+Run:
+
+```bash
+./build/llama-swap-darwin-arm64 -config ./config.yaml -listen 0.0.0.0:8080
+```
+
+### Windows (native PowerShell)
+
+Install dependencies:
+
+- Git for Windows
+- Go 1.24+
+- Node.js 20+ LTS
+- Optional: `make` (or use the manual build commands below)
+
+Verify:
+
+```powershell
+git --version
+go version
+node -v
+npm -v
+```
+
+Build UI:
+
+```powershell
+cd ui-svelte
+npm install
+npm run build
+cd ..
+```
+
+Build Windows binary:
+
+```powershell
+go build -o .\build\llama-swap-windows-amd64.exe .
+```
+
+Run:
 
 ```powershell
 .\build\llama-swap-windows-amd64.exe -config .\config.yaml -listen 127.0.0.1:8080
 ```
+
+### Windows + WSL (recommended for llama.cpp workflows)
+
+In Windows PowerShell, install WSL Ubuntu:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+Inside WSL Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y git make curl ca-certificates build-essential
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+```
+
+Install Go 1.24+ in WSL, then build in WSL:
+
+```bash
+git clone https://github.com/Ltamann/tbg-ollama-swap-prompt-optimizer.git
+cd tbg-ollama-swap-prompt-optimizer
+make clean linux
+```
+
+Run in WSL:
+
+```bash
+./build/llama-swap-linux-amd64 -config ./config.yaml -listen 0.0.0.0:8080
+```
+
+Access UI from Windows browser:
+
+- `http://localhost:8080/ui/`
+
+## Quick Build Matrix
+
+- `make linux` -> `build/llama-swap-linux-amd64` and `build/llama-swap-linux-arm64`
+- `make mac` -> `build/llama-swap-darwin-arm64`
+- `make windows` -> `build/llama-swap-windows-amd64.exe`
 
 ## Configuration (Full Model Sample)
 

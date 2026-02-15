@@ -8,6 +8,12 @@ export interface StreamChunk {
 
 export interface ChatOptions {
   temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  min_p?: number;
+  presence_penalty?: number;
+  frequency_penalty?: number;
+  max_tokens?: number;
 }
 
 function parseSSELine(line: string): StreamChunk | null {
@@ -47,6 +53,12 @@ export async function* streamChatCompletion(
     messages,
     stream: true,
     temperature: options?.temperature,
+    top_p: options?.top_p,
+    top_k: options?.top_k,
+    min_p: options?.min_p,
+    presence_penalty: options?.presence_penalty,
+    frequency_penalty: options?.frequency_penalty,
+    max_tokens: options?.max_tokens,
   };
 
   const response = await fetch("/v1/chat/completions", {

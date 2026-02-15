@@ -16,6 +16,12 @@ export interface Model {
   ctxSource?: "ctx-size" | "fit-ctx" | "";
   fitEnabled?: boolean;
   fitCtxMode?: "max" | "min";
+  tempConfigured?: number;
+  topPConfigured?: number;
+  topKConfigured?: number;
+  minPConfigured?: number;
+  presencePenaltyConfigured?: number;
+  frequencyPenaltyConfigured?: number;
 }
 
 export interface Metrics {
@@ -99,6 +105,11 @@ export interface ChatCompletionRequest {
   messages: ChatMessage[];
   stream: boolean;
   temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  min_p?: number;
+  presence_penalty?: number;
+  frequency_penalty?: number;
   max_tokens?: number;
 }
 

@@ -1,10 +1,12 @@
 <script lang="ts">
+  import { get } from "svelte/store";
   import { models } from "../../stores/api";
   import { persistentStore } from "../../stores/persistent";
   import {
     chatMessagesStore,
     chatIsStreamingStore,
     chatIsReasoningStore,
+    type SamplingSettings,
     cancelChatStreaming,
     newChatSession,
     regenerateFromIndex,
@@ -17,7 +19,21 @@
 
   const selectedModelStore = persistentStore<string>("playground-selected-model", "");
   const systemPromptStore = persistentStore<string>("playground-system-prompt", "");
-  const temperatureStore = persistentStore<number>("playground-temperature", 0.7);
+  const temperatureByModelStore = persistentStore<Record<string, number>>("playground-temperature-by-model", {});
+  const topPByModelStore = persistentStore<Record<string, number>>("playground-top-p-by-model", {});
+  const topKByModelStore = persistentStore<Record<string, number>>("playground-top-k-by-model", {});
+  const minPByModelStore = persistentStore<Record<string, number>>("playground-min-p-by-model", {});
+  const presencePenaltyByModelStore = persistentStore<Record<string, number>>("playground-presence-penalty-by-model", {});
+  const frequencyPenaltyByModelStore = persistentStore<Record<string, number>>("playground-frequency-penalty-by-model", {});
+  const maxTokensByModelStore = persistentStore<Record<string, number>>("playground-max-tokens-by-model", {});
+  let currentTemperature = $state(0.8);
+  let currentTopP = $state(0.95);
+  let currentTopK = $state(40);
+  let currentMinP = $state(0.05);
+  let currentPresencePenalty = $state(0);
+  let currentFrequencyPenalty = $state(0);
+  let currentMaxTokens = $state<number>(0);
+  let initializedSamplingModelID = $state("");
   let userInput = $state("");
   let messagesContainer: HTMLDivElement | undefined = $state();
   let showSettings = $state(false);
@@ -26,6 +42,110 @@
   let imageError = $state<string | null>(null);
 
   let hasModels = $derived($models.some((m) => !m.unlisted));
+
+  function configuredTemperatureForModel(modelID: string): number {
+    const model = $models.find((m) => m.id === modelID);
+    if (model && typeof model.tempConfigured === "number" && Number.isFinite(model.tempConfigured)) {
+      return model.tempConfigured;
+    }
+    return 0.8;
+  }
+
+  function configuredTopPForModel(modelID: string): number {
+    const model = $models.find((m) => m.id === modelID);
+    if (model && typeof model.topPConfigured === "number" && Number.isFinite(model.topPConfigured)) {
+      return model.topPConfigured;
+    }
+    return 0.95;
+  }
+
+  function configuredTopKForModel(modelID: string): number {
+    const model = $models.find((m) => m.id === modelID);
+    if (model && typeof model.topKConfigured === "number" && Number.isFinite(model.topKConfigured)) {
+      return model.topKConfigured;
+    }
+    return 40;
+  }
+
+  function configuredMinPForModel(modelID: string): number {
+    const model = $models.find((m) => m.id === modelID);
+    if (model && typeof model.minPConfigured === "number" && Number.isFinite(model.minPConfigured)) {
+      return model.minPConfigured;
+    }
+    return 0.05;
+  }
+
+  function configuredPresencePenaltyForModel(modelID: string): number {
+    const model = $models.find((m) => m.id === modelID);
+    if (model && typeof model.presencePenaltyConfigured === "number" && Number.isFinite(model.presencePenaltyConfigured)) {
+      return model.presencePenaltyConfigured;
+    }
+    return 0;
+  }
+
+  function configuredFrequencyPenaltyForModel(modelID: string): number {
+    const model = $models.find((m) => m.id === modelID);
+    if (model && typeof model.frequencyPenaltyConfigured === "number" && Number.isFinite(model.frequencyPenaltyConfigured)) {
+      return model.frequencyPenaltyConfigured;
+    }
+    return 0;
+  }
+
+  // Keep sampling settings model-specific and initialize from model config when available.
+  // If missing in config, fall back to llama.cpp defaults.
+  $effect(() => {
+    const modelID = $selectedModelStore;
+    if (!modelID) {
+      initializedSamplingModelID = "";
+      currentTemperature = 0.8;
+      currentTopP = 0.95;
+      currentTopK = 40;
+      currentMinP = 0.05;
+      currentPresencePenalty = 0;
+      currentFrequencyPenalty = 0;
+      currentMaxTokens = 0;
+      return;
+    }
+    if (initializedSamplingModelID === modelID) {
+      return;
+    }
+    initializedSamplingModelID = modelID;
+
+    const configuredTemp = configuredTemperatureForModel(modelID);
+    const configuredTopP = configuredTopPForModel(modelID);
+    const configuredTopK = configuredTopKForModel(modelID);
+    const configuredMinP = configuredMinPForModel(modelID);
+    const configuredPresence = configuredPresencePenaltyForModel(modelID);
+    const configuredFrequency = configuredFrequencyPenaltyForModel(modelID);
+
+    currentTemperature = configuredTemp;
+    currentTopP = configuredTopP;
+    currentTopK = configuredTopK;
+    currentMinP = configuredMinP;
+    currentPresencePenalty = configuredPresence;
+    currentFrequencyPenalty = configuredFrequency;
+    currentMaxTokens = 0;
+
+    temperatureByModelStore.set({ ...get(temperatureByModelStore), [modelID]: configuredTemp });
+    topPByModelStore.set({ ...get(topPByModelStore), [modelID]: configuredTopP });
+    topKByModelStore.set({ ...get(topKByModelStore), [modelID]: configuredTopK });
+    minPByModelStore.set({ ...get(minPByModelStore), [modelID]: configuredMinP });
+    presencePenaltyByModelStore.set({ ...get(presencePenaltyByModelStore), [modelID]: configuredPresence });
+    frequencyPenaltyByModelStore.set({ ...get(frequencyPenaltyByModelStore), [modelID]: configuredFrequency });
+    maxTokensByModelStore.set({ ...get(maxTokensByModelStore), [modelID]: 0 });
+  });
+
+  function currentSamplingSettings(): SamplingSettings {
+    return {
+      temperature: currentTemperature,
+      top_p: currentTopP,
+      top_k: Math.round(currentTopK),
+      min_p: currentMinP,
+      presence_penalty: currentPresencePenalty,
+      frequency_penalty: currentFrequencyPenalty,
+      max_tokens: currentMaxTokens > 0 ? Math.round(currentMaxTokens) : undefined,
+    };
+  }
 
   // Auto-scroll when messages change
   $effect(() => {
@@ -38,7 +158,7 @@
   });
 
   async function sendMessage() {
-    const sent = await sendUserMessage(userInput, attachedImages, $selectedModelStore, $systemPromptStore, $temperatureStore);
+    const sent = await sendUserMessage(userInput, attachedImages, $selectedModelStore, $systemPromptStore, currentSamplingSettings());
     if (sent) {
       userInput = "";
       attachedImages = [];
@@ -55,7 +175,61 @@
   }
 
   async function editMessage(idx: number, newContent: string) {
-    await editUserMessage(idx, newContent, $selectedModelStore, $systemPromptStore, $temperatureStore);
+    await editUserMessage(idx, newContent, $selectedModelStore, $systemPromptStore, currentSamplingSettings());
+  }
+
+  function handleTemperatureInput(value: number): void {
+    currentTemperature = value;
+    const modelID = $selectedModelStore;
+    if (!modelID) return;
+    temperatureByModelStore.set({
+      ...$temperatureByModelStore,
+      [modelID]: value,
+    });
+  }
+
+  function handleTopPInput(value: number): void {
+    currentTopP = value;
+    const modelID = $selectedModelStore;
+    if (!modelID) return;
+    topPByModelStore.set({ ...$topPByModelStore, [modelID]: value });
+  }
+
+  function handleTopKInput(value: number): void {
+    const rounded = Math.max(0, Math.round(value));
+    currentTopK = rounded;
+    const modelID = $selectedModelStore;
+    if (!modelID) return;
+    topKByModelStore.set({ ...$topKByModelStore, [modelID]: rounded });
+  }
+
+  function handleMinPInput(value: number): void {
+    currentMinP = value;
+    const modelID = $selectedModelStore;
+    if (!modelID) return;
+    minPByModelStore.set({ ...$minPByModelStore, [modelID]: value });
+  }
+
+  function handlePresencePenaltyInput(value: number): void {
+    currentPresencePenalty = value;
+    const modelID = $selectedModelStore;
+    if (!modelID) return;
+    presencePenaltyByModelStore.set({ ...$presencePenaltyByModelStore, [modelID]: value });
+  }
+
+  function handleFrequencyPenaltyInput(value: number): void {
+    currentFrequencyPenalty = value;
+    const modelID = $selectedModelStore;
+    if (!modelID) return;
+    frequencyPenaltyByModelStore.set({ ...$frequencyPenaltyByModelStore, [modelID]: value });
+  }
+
+  function handleMaxTokensInput(value: number): void {
+    const rounded = Math.max(0, Math.round(value));
+    currentMaxTokens = rounded;
+    const modelID = $selectedModelStore;
+    if (!modelID) return;
+    maxTokensByModelStore.set({ ...$maxTokensByModelStore, [modelID]: rounded });
   }
 
   function handleKeyDown(event: KeyboardEvent) {
@@ -128,60 +302,87 @@
 </script>
 
 <div class="flex flex-col h-full">
-  <!-- Model selector and controls -->
-  <div class="shrink-0 flex flex-wrap gap-2 mb-4">
-    <ModelSelector bind:value={$selectedModelStore} placeholder="Select a model..." disabled={$chatIsStreamingStore} />
-    <div class="flex gap-2">
-      <button
-        class="btn"
-        onclick={() => (showSettings = !showSettings)}
-        title="Settings"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
-          <path fill-rule="evenodd" d="M8.34 1.804A1 1 0 0 1 9.32 1h1.36a1 1 0 0 1 .98.804l.295 1.473c.497.144.971.342 1.416.587l1.25-.834a1 1 0 0 1 1.262.125l.962.962a1 1 0 0 1 .125 1.262l-.834 1.25c.245.445.443.919.587 1.416l1.473.295a1 1 0 0 1 .804.98v1.36a1 1 0 0 1-.804.98l-1.473.295a6.95 6.95 0 0 1-.587 1.416l.834 1.25a1 1 0 0 1-.125 1.262l-.962.962a1 1 0 0 1-1.262.125l-1.25-.834a6.953 6.953 0 0 1-1.416.587l-.295 1.473a1 1 0 0 1-.98.804H9.32a1 1 0 0 1-.98-.804l-.295-1.473a6.957 6.957 0 0 1-1.416-.587l-1.25.834a1 1 0 0 1-1.262-.125l-.962-.962a1 1 0 0 1-.125-1.262l.834-1.25a6.957 6.957 0 0 1-.587-1.416l-1.473-.295A1 1 0 0 1 1 10.68V9.32a1 1 0 0 1 .804-.98l1.473-.295c.144-.497.342-.971.587-1.416l-.834-1.25a1 1 0 0 1 .125-1.262l.962-.962A1 1 0 0 1 5.38 3.03l1.25.834a6.957 6.957 0 0 1 1.416-.587l.294-1.473ZM13 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" clip-rule="evenodd" />
-        </svg>
-      </button>
-      <button class="btn" onclick={newChat} disabled={$chatMessagesStore.length === 0 && !$chatIsStreamingStore}>
-        New Chat
-      </button>
-    </div>
-  </div>
-
-  <!-- Settings panel -->
-  {#if showSettings}
-    <div class="shrink-0 mb-4 p-4 bg-surface border border-gray-200 dark:border-white/10 rounded">
-      <div class="mb-4">
-        <label class="block text-sm font-medium mb-1" for="system-prompt">System Prompt</label>
-        <textarea
-          id="system-prompt"
-          class="w-full px-3 py-2 rounded border border-gray-200 dark:border-white/10 bg-card focus:outline-none focus:ring-2 focus:ring-primary resize-none"
-          placeholder="You are a helpful assistant..."
-          rows="3"
-          bind:value={$systemPromptStore}
-          disabled={$chatIsStreamingStore}
-        ></textarea>
+  <div class="shrink-0 sticky top-0 z-20 bg-card pb-3">
+    <!-- Model selector and controls -->
+    <div class="flex flex-wrap gap-2 mb-3">
+      <ModelSelector bind:value={$selectedModelStore} placeholder="Select a model..." disabled={$chatIsStreamingStore} />
+      <div class="flex gap-2">
+        <button
+          class="btn"
+          onclick={() => (showSettings = !showSettings)}
+          title="Settings"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+            <path fill-rule="evenodd" d="M8.34 1.804A1 1 0 0 1 9.32 1h1.36a1 1 0 0 1 .98.804l.295 1.473c.497.144.971.342 1.416.587l1.25-.834a1 1 0 0 1 1.262.125l.962.962a1 1 0 0 1 .125 1.262l-.834 1.25c.245.445.443.919.587 1.416l1.473.295a1 1 0 0 1 .804.98v1.36a1 1 0 0 1-.804.98l-1.473.295a6.95 6.95 0 0 1-.587 1.416l.834 1.25a1 1 0 0 1-.125 1.262l-.962.962a1 1 0 0 1-1.262.125l-1.25-.834a6.953 6.953 0 0 1-1.416.587l-.295 1.473a1 1 0 0 1-.98.804H9.32a1 1 0 0 1-.98-.804l-.295-1.473a6.957 6.957 0 0 1-1.416-.587l-1.25.834a1 1 0 0 1-1.262-.125l-.962-.962a1 1 0 0 1-.125-1.262l.834-1.25a6.957 6.957 0 0 1-.587-1.416l-1.473-.295A1 1 0 0 1 1 10.68V9.32a1 1 0 0 1 .804-.98l1.473-.295c.144-.497.342-.971.587-1.416l-.834-1.25a1 1 0 0 1 .125-1.262l.962-.962A1 1 0 0 1 5.38 3.03l1.25.834a6.957 6.957 0 0 1 1.416-.587l.294-1.473ZM13 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" clip-rule="evenodd" />
+          </svg>
+        </button>
+        <button class="btn" onclick={newChat} disabled={$chatMessagesStore.length === 0 && !$chatIsStreamingStore}>
+          New Chat
+        </button>
       </div>
-      <div>
-        <label class="block text-sm font-medium mb-1" for="temperature">
-          Temperature: {$temperatureStore.toFixed(2)}
-        </label>
-        <input
-          id="temperature"
-          type="range"
-          min="0"
-          max="2"
-          step="0.05"
-          class="w-full"
-          bind:value={$temperatureStore}
-          disabled={$chatIsStreamingStore}
-        />
-        <div class="flex justify-between text-xs text-txtsecondary mt-1">
-          <span>Precise (0)</span>
-          <span>Creative (2)</span>
+    </div>
+
+    <!-- Settings panel -->
+    {#if showSettings}
+      <div class="p-4 bg-surface border border-gray-200 dark:border-white/10 rounded">
+        <div class="mb-4">
+          <label class="block text-sm font-medium mb-1" for="system-prompt">System Prompt</label>
+          <textarea
+            id="system-prompt"
+            class="w-full px-3 py-2 rounded border border-gray-200 dark:border-white/10 bg-card focus:outline-none focus:ring-2 focus:ring-primary resize-none"
+            placeholder="You are a helpful assistant..."
+            rows="3"
+            bind:value={$systemPromptStore}
+            disabled={$chatIsStreamingStore}
+          ></textarea>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1" for="temperature">
+            Temperature: {currentTemperature.toFixed(2)}
+          </label>
+          <input
+            id="temperature"
+            type="range"
+            min="0"
+            max="2"
+            step="0.05"
+            class="w-full"
+            bind:value={currentTemperature}
+            oninput={(e) => handleTemperatureInput(parseFloat((e.currentTarget as HTMLInputElement).value))}
+            disabled={$chatIsStreamingStore}
+          />
+          <div class="flex justify-between text-xs text-txtsecondary mt-1">
+            <span>Precise (0)</span>
+            <span>Creative (2)</span>
+          </div>
+        </div>
+        <div class="mt-3">
+          <label class="block text-sm font-medium mb-1" for="top-p">Top P: {currentTopP.toFixed(2)}</label>
+          <input id="top-p" type="range" min="0" max="1" step="0.01" class="w-full" bind:value={currentTopP} oninput={(e) => handleTopPInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
+        </div>
+        <div class="mt-3">
+          <label class="block text-sm font-medium mb-1" for="top-k">Top K: {Math.round(currentTopK)}</label>
+          <input id="top-k" type="range" min="0" max="200" step="1" class="w-full" bind:value={currentTopK} oninput={(e) => handleTopKInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
+        </div>
+        <div class="mt-3">
+          <label class="block text-sm font-medium mb-1" for="min-p">Min P: {currentMinP.toFixed(2)}</label>
+          <input id="min-p" type="range" min="0" max="1" step="0.01" class="w-full" bind:value={currentMinP} oninput={(e) => handleMinPInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
+        </div>
+        <div class="mt-3">
+          <label class="block text-sm font-medium mb-1" for="presence-penalty">Presence Penalty: {currentPresencePenalty.toFixed(2)}</label>
+          <input id="presence-penalty" type="range" min="-2" max="2" step="0.01" class="w-full" bind:value={currentPresencePenalty} oninput={(e) => handlePresencePenaltyInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
+        </div>
+        <div class="mt-3">
+          <label class="block text-sm font-medium mb-1" for="frequency-penalty">Frequency Penalty: {currentFrequencyPenalty.toFixed(2)}</label>
+          <input id="frequency-penalty" type="range" min="-2" max="2" step="0.01" class="w-full" bind:value={currentFrequencyPenalty} oninput={(e) => handleFrequencyPenaltyInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
+        </div>
+        <div class="mt-3">
+          <label class="block text-sm font-medium mb-1" for="max-tokens">Max Tokens (0 = model default): {Math.round(currentMaxTokens)}</label>
+          <input id="max-tokens" type="range" min="0" max="8192" step="64" class="w-full" bind:value={currentMaxTokens} oninput={(e) => handleMaxTokensInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
         </div>
       </div>
-    </div>
-  {/if}
+    {/if}
+  </div>
 
   <!-- Empty state for no models configured -->
   {#if !hasModels}
@@ -209,7 +410,7 @@
             isReasoning={$chatIsReasoningStore && idx === $chatMessagesStore.length - 1 && message.role === "assistant"}
             onEdit={message.role === "user" ? (newContent) => editMessage(idx, newContent) : undefined}
             onRegenerate={message.role === "assistant" && idx > 0 && $chatMessagesStore[idx - 1].role === "user"
-              ? () => regenerateFromIndex(idx - 1, $selectedModelStore, $systemPromptStore, $temperatureStore)
+              ? () => regenerateFromIndex(idx - 1, $selectedModelStore, $systemPromptStore, currentSamplingSettings())
               : undefined}
           />
         {/each}

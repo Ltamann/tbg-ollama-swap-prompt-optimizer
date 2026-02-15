@@ -7,6 +7,16 @@ export const chatMessagesStore = persistentStore<ChatMessage[]>("playground-chat
 export const chatIsStreamingStore = writable(false);
 export const chatIsReasoningStore = writable(false);
 
+export interface SamplingSettings {
+  temperature: number;
+  top_p: number;
+  top_k: number;
+  min_p: number;
+  presence_penalty: number;
+  frequency_penalty: number;
+  max_tokens?: number;
+}
+
 let reasoningStartTime = 0;
 let abortController: AbortController | null = null;
 
@@ -31,10 +41,10 @@ export function newChatSession(): void {
 }
 
 export async function regenerateFromIndex(
-  idx: number,
-  model: string,
-  systemPrompt: string,
-  temperature: number
+	idx: number,
+	model: string,
+	systemPrompt: string,
+	settings: SamplingSettings
 ): Promise<void> {
   if (!model || get(chatIsStreamingStore)) return;
 
@@ -55,7 +65,7 @@ export async function regenerateFromIndex(
     }
     apiMessages.push(...messages.slice(0, -1));
 
-    const stream = streamChatCompletion(model, apiMessages, abortController.signal, { temperature });
+	const stream = streamChatCompletion(model, apiMessages, abortController.signal, settings);
 
     for await (const chunk of stream) {
       if (chunk.done) break;
@@ -106,11 +116,11 @@ export async function regenerateFromIndex(
 }
 
 export async function sendUserMessage(
-  userInput: string,
-  attachedImages: string[],
-  model: string,
-  systemPrompt: string,
-  temperature: number
+	userInput: string,
+	attachedImages: string[],
+	model: string,
+	systemPrompt: string,
+	settings: SamplingSettings
 ): Promise<boolean> {
   const trimmedInput = userInput.trim();
   if ((!trimmedInput && attachedImages.length === 0) || !model || get(chatIsStreamingStore)) {
@@ -135,20 +145,20 @@ export async function sendUserMessage(
   const userIndex = messages.length;
   chatMessagesStore.set([...messages, { role: "user", content }]);
 
-  await regenerateFromIndex(userIndex, model, systemPrompt, temperature);
+	await regenerateFromIndex(userIndex, model, systemPrompt, settings);
   return true;
 }
 
 export async function editUserMessage(
-  idx: number,
-  newContent: string,
-  model: string,
-  systemPrompt: string,
-  temperature: number
+	idx: number,
+	newContent: string,
+	model: string,
+	systemPrompt: string,
+	settings: SamplingSettings
 ): Promise<void> {
   if (get(chatIsStreamingStore) || !model) return;
 
   const messages = get(chatMessagesStore).map((msg, i) => (i === idx ? { ...msg, content: newContent } : msg));
   chatMessagesStore.set(messages);
-  await regenerateFromIndex(idx, model, systemPrompt, temperature);
+	await regenerateFromIndex(idx, model, systemPrompt, settings);
 }
