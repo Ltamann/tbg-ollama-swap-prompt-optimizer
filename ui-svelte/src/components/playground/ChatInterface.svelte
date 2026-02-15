@@ -42,6 +42,9 @@
   let imageError = $state<string | null>(null);
 
   let hasModels = $derived($models.some((m) => !m.unlisted));
+  let selectableModels = $derived(
+    $models.filter((m) => !m.unlisted && !m.peerID)
+  );
 
   function configuredTemperatureForModel(modelID: string): number {
     const model = $models.find((m) => m.id === modelID);
@@ -90,6 +93,25 @@
     }
     return 0;
   }
+
+  // Keep chat model selection aligned with actual running model on load/reconnect.
+  // If a ready model exists, prefer it; otherwise keep current if valid, else first available.
+  $effect(() => {
+    const available = selectableModels;
+    if (available.length === 0) {
+      return;
+    }
+
+    const selected = $selectedModelStore;
+    const selectedIsValid = available.some((m) => m.id === selected);
+    const readyModel = available.find((m) => m.state === "ready");
+    const target = readyModel?.id ?? (selectedIsValid ? selected : available[0].id);
+
+    if (target && target !== selected) {
+      selectedModelStore.set(target);
+      initializedSamplingModelID = "";
+    }
+  });
 
   // Keep sampling settings model-specific and initialize from model config when available.
   // If missing in config, fall back to llama.cpp defaults.
@@ -384,41 +406,39 @@
     {/if}
   </div>
 
-  <!-- Empty state for no models configured -->
-  {#if !hasModels}
-    <div class="flex-1 flex items-center justify-center text-txtsecondary">
-      <p>No models configured. Add models to your configuration to start chatting.</p>
-    </div>
-  {:else}
-    <!-- Messages area -->
-    <div
-      class="flex-1 overflow-y-auto mb-4 px-2"
-      bind:this={messagesContainer}
-    >
-      {#if $chatMessagesStore.length === 0}
-        <div class="h-full flex items-center justify-center text-txtsecondary">
+  <!-- Messages area -->
+  <div
+    class="flex-1 overflow-y-auto mb-4 px-2"
+    bind:this={messagesContainer}
+  >
+    {#if $chatMessagesStore.length === 0}
+      <div class="h-full flex items-center justify-center text-txtsecondary">
+        {#if !hasModels}
+          <p>No models configured. Add models to your configuration to start chatting.</p>
+        {:else}
           <p>Start a conversation by typing a message below.</p>
-        </div>
-      {:else}
-        {#each $chatMessagesStore as message, idx (idx)}
-          <ChatMessageComponent
-            role={message.role}
-            content={message.content}
-            reasoning_content={message.reasoning_content}
-            reasoningTimeMs={message.reasoningTimeMs}
-            isStreaming={$chatIsStreamingStore && idx === $chatMessagesStore.length - 1 && message.role === "assistant"}
-            isReasoning={$chatIsReasoningStore && idx === $chatMessagesStore.length - 1 && message.role === "assistant"}
-            onEdit={message.role === "user" ? (newContent) => editMessage(idx, newContent) : undefined}
-            onRegenerate={message.role === "assistant" && idx > 0 && $chatMessagesStore[idx - 1].role === "user"
-              ? () => regenerateFromIndex(idx - 1, $selectedModelStore, $systemPromptStore, currentSamplingSettings())
-              : undefined}
-          />
-        {/each}
-      {/if}
-    </div>
+        {/if}
+      </div>
+    {:else}
+      {#each $chatMessagesStore as message, idx (idx)}
+        <ChatMessageComponent
+          role={message.role}
+          content={message.content}
+          reasoning_content={message.reasoning_content}
+          reasoningTimeMs={message.reasoningTimeMs}
+          isStreaming={$chatIsStreamingStore && idx === $chatMessagesStore.length - 1 && message.role === "assistant"}
+          isReasoning={$chatIsReasoningStore && idx === $chatMessagesStore.length - 1 && message.role === "assistant"}
+          onEdit={message.role === "user" ? (newContent) => editMessage(idx, newContent) : undefined}
+          onRegenerate={message.role === "assistant" && idx > 0 && $chatMessagesStore[idx - 1].role === "user"
+            ? () => regenerateFromIndex(idx - 1, $selectedModelStore, $systemPromptStore, currentSamplingSettings())
+            : undefined}
+        />
+      {/each}
+    {/if}
+  </div>
 
-    <!-- Input area -->
-    <div class="shrink-0">
+  <!-- Input area -->
+  <div class="shrink-0">
       <!-- Image preview strip -->
       {#if attachedImages.length > 0}
         <div class="mb-2 flex flex-wrap gap-2">
@@ -492,6 +512,5 @@
           {/if}
         </div>
       </div>
-    </div>
-  {/if}
+  </div>
 </div>
