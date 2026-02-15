@@ -1,0 +1,98 @@
+[
+  {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "ctx": 8096,
+    "policy": "off",
+    "run": 1,
+    "success": false,
+    "latency_ms": 17.0,
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "total_tokens": null,
+    "error": "Response status code does not indicate success: 502 (Bad Gateway)."
+  },
+  {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "ctx": 8096,
+    "policy": "off",
+    "run": 2,
+    "success": false,
+    "latency_ms": 6.0,
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "total_tokens": null,
+    "error": "Response status code does not indicate success: 502 (Bad Gateway)."
+  },
+  {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "ctx": 8096,
+    "policy": "limit_only",
+    "run": 1,
+    "success": false,
+    "latency_ms": 17.0,
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "total_tokens": null,
+    "error": "Response status code does not indicate success: 502 (Bad Gateway)."
+  },
+  {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "ctx": 8096,
+    "policy": "limit_only",
+    "run": 2,
+    "success": false,
+    "latency_ms": 8.0,
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "total_tokens": null,
+    "error": "Response status code does not indicate success: 502 (Bad Gateway)."
+  },
+  {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "ctx": 8096,
+    "policy": "always",
+    "run": 1,
+    "success": false,
+    "latency_ms": 8.0,
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "total_tokens": null,
+    "error": "Response status code does not indicate success: 502 (Bad Gateway)."
+  },
+  {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "ctx": 8096,
+    "policy": "always",
+    "run": 2,
+    "success": false,
+    "latency_ms": 14.0,
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "total_tokens": null,
+    "error": "Response status code does not indicate success: 502 (Bad Gateway)."
+  },
+  {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "ctx": 8096,
+    "policy": "llm_assisted",
+    "run": 1,
+    "success": false,
+    "latency_ms": 7.0,
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "total_tokens": null,
+    "error": "Response status code does not indicate success: 502 (Bad Gateway)."
+  },
+  {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "ctx": 8096,
+    "policy": "llm_assisted",
+    "run": 2,
+    "success": false,
+    "latency_ms": 7.0,
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "total_tokens": null,
+    "error": "Response status code does not indicate success: 502 (Bad Gateway)."
+  }
+]
