@@ -8,11 +8,13 @@
     chatIsStreamingStore,
     chatIsReasoningStore,
     type SamplingSettings,
+    type UploadedAttachment,
     cancelChatStreaming,
     newChatSession,
     regenerateFromIndex,
     sendUserMessage,
     editUserMessage,
+    deleteUserMessageWithReply,
   } from "../../stores/playgroundChat";
   import ChatMessageComponent from "./ChatMessage.svelte";
   import ModelSelector from "./ModelSelector.svelte";
@@ -38,9 +40,10 @@
   let userInput = $state("");
   let messagesContainer: HTMLDivElement | undefined = $state();
   let showSettings = $state(false);
-  let attachedImages = $state<string[]>([]);
+  let attachments = $state<UploadedAttachment[]>([]);
   let fileInput = $state<HTMLInputElement | null>(null);
-  let imageError = $state<string | null>(null);
+  let attachmentError = $state<string | null>(null);
+  let isDraggingFiles = $state(false);
   let toolStatusText = $state("");
 
   let hasModels = $derived($models.some((m) => !m.unlisted));
@@ -202,11 +205,11 @@
   });
 
   async function sendMessage() {
-    const sent = await sendUserMessage(userInput, attachedImages, $selectedModelStore, $systemPromptStore, currentSamplingSettings());
+    const sent = await sendUserMessage(userInput, attachments, $selectedModelStore, $systemPromptStore, currentSamplingSettings());
     if (sent) {
       userInput = "";
-      attachedImages = [];
-      imageError = null;
+      attachments = [];
+      attachmentError = null;
     }
   }
 
@@ -220,6 +223,10 @@
 
   async function editMessage(idx: number, newContent: string) {
     await editUserMessage(idx, newContent, $selectedModelStore, $systemPromptStore, currentSamplingSettings());
+  }
+
+  async function deleteMessage(idx: number) {
+    await deleteUserMessageWithReply(idx, $selectedModelStore, $systemPromptStore, currentSamplingSettings());
   }
 
   function handleTemperatureInput(value: number): void {
@@ -284,14 +291,13 @@
   }
 
   const ACCEPTED_IMAGE_FORMATS = ["image/jpeg", "image/png", "image/gif", "image/webp"];
-  const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
-  const MAX_IMAGES_PER_MESSAGE = 5;
+  const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB
+  const MAX_ATTACHMENTS_PER_MESSAGE = 8;
+  const MAX_TEXT_EXTRACT_BYTES = 128 * 1024;
+  const TEXT_EXTENSIONS = [".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".csv", ".log", ".js", ".ts", ".tsx", ".jsx", ".py", ".go", ".java", ".c", ".cpp", ".h", ".hpp", ".rs", ".rb", ".php", ".sh", ".sql", ".xml", ".html", ".css"];
 
-  function validateImageFile(file: File): string | null {
-    if (!ACCEPTED_IMAGE_FORMATS.includes(file.type)) {
-      return `Invalid file type: ${file.type}. Accepted formats: JPG, PNG, GIF, WEBP`;
-    }
-    if (file.size > MAX_IMAGE_SIZE) {
+  function validateAttachment(file: File): string | null {
+    if (file.size > MAX_FILE_SIZE) {
       return `File too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Maximum size: 20MB`;
     }
     return null;
@@ -306,42 +312,118 @@
     });
   }
 
-  async function processImageFiles(files: File[]): Promise<void> {
-    imageError = null;
+  function fileToText(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(new Error("Failed to read text file"));
+      reader.readAsText(file);
+    });
+  }
 
-    if (attachedImages.length + files.length > MAX_IMAGES_PER_MESSAGE) {
-      imageError = `Maximum ${MAX_IMAGES_PER_MESSAGE} images per message`;
+  function hasTextExtension(name: string): boolean {
+    const lower = name.toLowerCase();
+    return TEXT_EXTENSIONS.some((ext) => lower.endsWith(ext));
+  }
+
+  function shouldExtractText(file: File): boolean {
+    if (file.type.startsWith("text/") || file.type === "application/json" || file.type === "application/xml") {
+      return true;
+    }
+    return hasTextExtension(file.name);
+  }
+
+  async function processFiles(files: File[]): Promise<void> {
+    attachmentError = null;
+
+    if (attachments.length + files.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+      attachmentError = `Maximum ${MAX_ATTACHMENTS_PER_MESSAGE} attachments per message`;
       return;
     }
 
     for (const file of files) {
-      const error = validateImageFile(file);
+      const error = validateAttachment(file);
       if (error) {
-        imageError = error;
+        attachmentError = error;
         return;
       }
     }
 
     try {
-      const dataUrls = await Promise.all(files.map(fileToDataUrl));
-      attachedImages = [...attachedImages, ...dataUrls];
+      const nextAttachments: UploadedAttachment[] = [];
+      for (const file of files) {
+        const id = `${file.name}-${file.size}-${file.lastModified}-${Math.random().toString(36).slice(2, 8)}`;
+        if (ACCEPTED_IMAGE_FORMATS.includes(file.type)) {
+          const dataUrl = await fileToDataUrl(file);
+          nextAttachments.push({
+            id,
+            name: file.name,
+            mimeType: file.type,
+            size: file.size,
+            kind: "image",
+            dataUrl,
+          });
+          continue;
+        }
+
+        let textContent = "";
+        if (shouldExtractText(file)) {
+          const text = await fileToText(file);
+          textContent = text.length > MAX_TEXT_EXTRACT_BYTES ? `${text.slice(0, MAX_TEXT_EXTRACT_BYTES)}\n...<truncated>` : text;
+        }
+        nextAttachments.push({
+          id,
+          name: file.name,
+          mimeType: file.type || "application/octet-stream",
+          size: file.size,
+          kind: "file",
+          textContent,
+        });
+      }
+      attachments = [...attachments, ...nextAttachments];
     } catch (error) {
-      imageError = error instanceof Error ? error.message : "Failed to process images";
+      attachmentError = error instanceof Error ? error.message : "Failed to process attachments";
     }
   }
 
-  function handleImageSelect(event: Event) {
+  function handleFileSelect(event: Event) {
     const input = event.target as HTMLInputElement;
     if (input.files && input.files.length > 0) {
-      processImageFiles(Array.from(input.files));
+      processFiles(Array.from(input.files));
     }
     // Reset the input so the same file can be selected again
     input.value = "";
   }
 
-  function removeImage(idx: number) {
-    attachedImages = attachedImages.filter((_, i) => i !== idx);
-    imageError = null;
+  function removeAttachment(id: string) {
+    attachments = attachments.filter((a) => a.id !== id);
+    attachmentError = null;
+  }
+
+  function handleDragOver(event: DragEvent) {
+    event.preventDefault();
+    if ($chatIsStreamingStore || !$selectedModelStore) {
+      return;
+    }
+    isDraggingFiles = true;
+  }
+
+  function handleDragLeave(event: DragEvent) {
+    event.preventDefault();
+    isDraggingFiles = false;
+  }
+
+  function handleDrop(event: DragEvent) {
+    event.preventDefault();
+    isDraggingFiles = false;
+    if ($chatIsStreamingStore || !$selectedModelStore) {
+      return;
+    }
+    const dropped = event.dataTransfer?.files;
+    if (!dropped || dropped.length === 0) {
+      return;
+    }
+    void processFiles(Array.from(dropped));
   }
 </script>
 
@@ -449,9 +531,11 @@
           content={message.content}
           reasoning_content={message.reasoning_content}
           reasoningTimeMs={message.reasoningTimeMs}
+          sources={message.sources}
           isStreaming={$chatIsStreamingStore && idx === $chatMessagesStore.length - 1 && message.role === "assistant"}
           isReasoning={$chatIsReasoningStore && idx === $chatMessagesStore.length - 1 && message.role === "assistant"}
           onEdit={message.role === "user" ? (newContent) => editMessage(idx, newContent) : undefined}
+          onDelete={message.role === "user" ? () => deleteMessage(idx) : undefined}
           onRegenerate={message.role === "assistant" && idx > 0 && $chatMessagesStore[idx - 1].role === "user"
             ? () => regenerateFromIndex(idx - 1, $selectedModelStore, $systemPromptStore, currentSamplingSettings())
             : undefined}
@@ -462,44 +546,49 @@
 
   <!-- Input area -->
   <div class="shrink-0">
-      <!-- Image preview strip -->
-      {#if attachedImages.length > 0}
+      <!-- Attachment strip -->
+      {#if attachments.length > 0}
         <div class="mb-2 flex flex-wrap gap-2">
-          {#each attachedImages as imageUrl, idx (idx)}
-            <div class="relative group">
-              <img
-                src={imageUrl}
-                alt="Attached image {idx + 1}"
-                class="w-20 h-20 object-cover rounded border border-gray-200 dark:border-white/10"
-              />
+          {#each attachments as attachment (attachment.id)}
+            <div class="group flex items-center gap-2 rounded border border-gray-200 dark:border-white/10 bg-surface px-2 py-1 text-xs max-w-[340px]">
+              <span class="shrink-0 text-[10px] text-txtsecondary">{attachment.kind === "image" ? "IMG" : "FILE"}</span>
+              <div class="truncate">
+                <div class="truncate font-medium">{attachment.name}</div>
+                <div class="text-txtsecondary">{Math.max(1, Math.round(attachment.size / 1024))} KB</div>
+              </div>
               <button
-                class="absolute -top-2 -right-2 bg-red-500 text-white rounded-full w-6 h-6 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                onclick={() => removeImage(idx)}
-                title="Remove image"
-              >
-                ×
-              </button>
+                class="ml-auto rounded px-1 text-txtsecondary hover:text-red-500"
+                onclick={() => removeAttachment(attachment.id)}
+                title="Remove attachment"
+              >×</button>
             </div>
           {/each}
         </div>
       {/if}
 
       <!-- Error message -->
-      {#if imageError}
+      {#if attachmentError}
         <div class="mb-2 p-2 bg-red-100 dark:bg-red-900/20 text-red-700 dark:text-red-400 rounded text-sm">
-          {imageError}
+          {attachmentError}
         </div>
       {/if}
 
-      <div class="flex gap-2">
+      <div
+        role="group"
+        aria-label="Message input and attachments"
+        class={`flex gap-2 rounded ${isDraggingFiles ? "ring-2 ring-primary/60 bg-secondary-hover" : ""}`}
+        ondragover={handleDragOver}
+        ondragleave={handleDragLeave}
+        ondrop={handleDrop}
+      >
         <!-- Hidden file input -->
         <input
           type="file"
-          accept=".jpg,.jpeg,.png,.gif,.webp"
+          accept=".jpg,.jpeg,.png,.gif,.webp,.txt,.md,.json,.yaml,.yml,.toml,.csv,.log,.js,.ts,.tsx,.jsx,.py,.go,.java,.c,.cpp,.h,.hpp,.rs,.rb,.php,.sh,.sql,.xml,.html,.css,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.zip"
           multiple
           class="hidden"
           bind:this={fileInput}
-          onchange={handleImageSelect}
+          onchange={handleFileSelect}
         />
 
         <ExpandableTextarea
@@ -511,26 +600,36 @@
         />
         <div class="flex flex-col gap-2">
           {#if $chatIsStreamingStore}
-            <button class="btn bg-red-500 hover:bg-red-600 text-white" onclick={cancelStreaming}>
-              Cancel
+            <button
+              class="btn bg-red-500 hover:bg-red-600 text-white px-3"
+              onclick={cancelStreaming}
+              title="Stop generation"
+              aria-label="Stop generation"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4">
+                <path d="M7 7.75A.75.75 0 0 1 7.75 7h8.5a.75.75 0 0 1 .75.75v8.5a.75.75 0 0 1-.75.75h-8.5a.75.75 0 0 1-.75-.75v-8.5Z" />
+              </svg>
             </button>
           {:else}
             <button
-              class="btn"
+              class="btn px-3"
               onclick={() => fileInput?.click()}
               disabled={$chatIsStreamingStore || !$selectedModelStore}
-              title="Attach image"
+              title="Add files or images"
+              aria-label="Add files or images"
             >
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
-                <path fill-rule="evenodd" d="M1 5.25A2.25 2.25 0 0 1 3.25 3h13.5A2.25 2.25 0 0 1 19 5.25v9.5A2.25 2.25 0 0 1 16.75 17H3.25A2.25 2.25 0 0 1 1 14.75v-9.5Zm1.5 5.81v3.69c0 .414.336.75.75.75h13.5a.75.75 0 0 0 .75-.75v-2.69l-2.22-2.219a.75.75 0 0 0-1.06 0l-1.91 1.909.47.47a.75.75 0 1 1-1.06 1.06L6.53 8.091a.75.75 0 0 0-1.06 0l-2.97 2.97ZM12 7a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" clip-rule="evenodd" />
-              </svg>
+              +
             </button>
             <button
-              class="btn bg-primary text-btn-primary-text hover:opacity-90"
+              class="btn bg-primary text-btn-primary-text hover:opacity-90 px-3"
               onclick={sendMessage}
-              disabled={(!userInput.trim() && attachedImages.length === 0) || !$selectedModelStore}
+              disabled={(!userInput.trim() && attachments.length === 0) || !$selectedModelStore}
+              title="Send message"
+              aria-label="Send message"
             >
-              Send
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4">
+                <path d="M3.32 2.43a.75.75 0 0 1 .78-.1l16.5 8.25a.75.75 0 0 1 0 1.34L4.1 20.17a.75.75 0 0 1-1.06-.83l1.44-6.1a.75.75 0 0 1 .55-.55l8.88-2.22-8.88-2.22a.75.75 0 0 1-.55-.55l-1.44-6.1a.75.75 0 0 1 .28-.77Z" />
+              </svg>
             </button>
           {/if}
         </div>

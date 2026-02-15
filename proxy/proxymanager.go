@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -29,6 +30,12 @@ const (
 )
 
 type proxyCtxKey string
+
+type chatSource struct {
+	URL    string `json:"url"`
+	Title  string `json:"title,omitempty"`
+	Domain string `json:"domain,omitempty"`
+}
 
 type ProxyManager struct {
 	sync.Mutex
@@ -80,6 +87,12 @@ type ProxyManager struct {
 	ollamaLastRefresh time.Time
 	tools             []RuntimeTool
 	toolSettings      ToolRuntimeSettings
+
+	// in-memory activity prompt timeline for current user turn only
+	activityPromptPreviews       []ActivityPromptPreview
+	activityCurrentUserSignature string
+	activityCurrentTurn          int
+	activityNextPromptID         int
 }
 
 type PromptOptimizationPolicy string
@@ -231,6 +244,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 		ollamaModels:              make(map[string]OllamaModel),
 		tools:                     make([]RuntimeTool, 0),
 		toolSettings:              defaultToolRuntimeSettings(),
+		activityPromptPreviews:    make([]ActivityPromptPreview, 0),
 	}
 	pm.loadToolsFromDisk()
 
@@ -1007,6 +1021,7 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	ctx := context.WithValue(c.Request.Context(), proxyCtxKey("streaming"), isStreaming)
 	ctx = context.WithValue(ctx, proxyCtxKey("model"), modelID)
 	c.Request = c.Request.WithContext(ctx)
+	pm.recordActivityPromptPreview(modelID, c.Request.URL.Path, bodyBytes, c.Request.Header)
 
 	if pm.metricsMonitor != nil && c.Request.Method == "POST" {
 		if err := pm.metricsMonitor.wrapHandler(modelID, c.Writer, c.Request, nextHandler); err != nil {
@@ -1064,6 +1079,11 @@ func (pm *ProxyManager) proxyWithToolsIfNeeded(
 
 	content := gjson.GetBytes(finalBody, "choices.0.message.content").String()
 	reasoning := gjson.GetBytes(finalBody, "choices.0.message.reasoning_content").String()
+	sourcesRaw := gjson.GetBytes(finalBody, "choices.0.message.sources").Raw
+	var sources any = []any{}
+	if strings.TrimSpace(sourcesRaw) != "" {
+		_ = json.Unmarshal([]byte(sourcesRaw), &sources)
+	}
 	chunk := map[string]any{
 		"id":      fmt.Sprintf("chatcmpl-tools-%d", time.Now().UnixNano()),
 		"object":  "chat.completion.chunk",
@@ -1076,6 +1096,7 @@ func (pm *ProxyManager) proxyWithToolsIfNeeded(
 					"role":              "assistant",
 					"content":           content,
 					"reasoning_content": reasoning,
+					"sources":           sources,
 				},
 				"finish_reason": "stop",
 			},
@@ -1151,6 +1172,7 @@ func (pm *ProxyManager) invokeInferenceOnce(
 	req.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	req.Header.Del("Transfer-Encoding")
 	req.ContentLength = int64(len(body))
+	pm.recordActivityPromptPreview(modelID, req.URL.Path, body, req.Header)
 
 	rr := httptest.NewRecorder()
 	if err := nextHandler(modelID, rr, req); err != nil {
@@ -1173,6 +1195,7 @@ func (pm *ProxyManager) runToolLoop(
 	working := initialBody
 	finalBody := initialBody
 	finalStatus := http.StatusOK
+	sourceMap := map[string]chatSource{}
 
 	for i := 0; i < maxIterations; i++ {
 		respBody, statusCode, err := pm.invokeInferenceOnce(modelID, nextHandler, orig, working)
@@ -1217,6 +1240,12 @@ func (pm *ProxyManager) runToolLoop(
 				if execErr != nil {
 					out = fmt.Sprintf("tool error: %v", execErr)
 				}
+				for _, src := range extractSourcesFromToolOutput(out) {
+					if strings.TrimSpace(src.URL) == "" {
+						continue
+					}
+					sourceMap[src.URL] = src
+				}
 				rawMessages = append(rawMessages, map[string]any{
 					"role":         "tool",
 					"tool_call_id": callID,
@@ -1236,6 +1265,12 @@ func (pm *ProxyManager) runToolLoop(
 			if execErr != nil {
 				out = fmt.Sprintf("tool error: %v", execErr)
 			}
+			for _, src := range extractSourcesFromToolOutput(out) {
+				if strings.TrimSpace(src.URL) == "" {
+					continue
+				}
+				sourceMap[src.URL] = src
+			}
 			rawMessages = append(rawMessages, map[string]any{
 				"role":    "tool",
 				"name":    toolName,
@@ -1254,8 +1289,80 @@ func (pm *ProxyManager) runToolLoop(
 		}
 		working = nextBody
 	}
+	if len(sourceMap) > 0 && finalStatus >= 200 && finalStatus < 300 {
+		sources := make([]chatSource, 0, len(sourceMap))
+		for _, src := range sourceMap {
+			sources = append(sources, src)
+		}
+		sort.Slice(sources, func(i, j int) bool {
+			return sources[i].URL < sources[j].URL
+		})
+		if b, err := json.Marshal(sources); err == nil {
+			if withSources, err := sjson.SetRawBytes(finalBody, "choices.0.message.sources", b); err == nil {
+				finalBody = withSources
+			}
+		}
+	}
 
 	return finalBody, finalStatus, nil
+}
+
+func extractSourcesFromToolOutput(out string) []chatSource {
+	s := strings.TrimSpace(out)
+	if s == "" {
+		return nil
+	}
+
+	sources := map[string]chatSource{}
+
+	// Try JSON first (searxng direct payloads).
+	if gjson.Valid(s) {
+		results := gjson.Get(s, "results")
+		if results.IsArray() {
+			results.ForEach(func(_, v gjson.Result) bool {
+				u := strings.TrimSpace(v.Get("url").String())
+				if u == "" {
+					return true
+				}
+				title := strings.TrimSpace(v.Get("title").String())
+				domain := sourceDomainFromURL(u)
+				sources[u] = chatSource{URL: u, Title: title, Domain: domain}
+				return true
+			})
+		}
+	}
+
+	// Parse plain-text URLs from compact tool output.
+	for _, token := range strings.Fields(s) {
+		t := strings.TrimSpace(token)
+		t = strings.Trim(t, "[](){}<>,.;'\"")
+		if !strings.HasPrefix(t, "http://") && !strings.HasPrefix(t, "https://") {
+			continue
+		}
+		if _, err := url.ParseRequestURI(t); err != nil {
+			continue
+		}
+		if _, exists := sources[t]; !exists {
+			sources[t] = chatSource{
+				URL:    t,
+				Domain: sourceDomainFromURL(t),
+			}
+		}
+	}
+
+	outSources := make([]chatSource, 0, len(sources))
+	for _, src := range sources {
+		outSources = append(outSources, src)
+	}
+	return outSources
+}
+
+func sourceDomainFromURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(u.Hostname())
 }
 
 func (pm *ProxyManager) applyPromptSizeControl(modelID string, bodyBytes []byte) ([]byte, PromptOptimizationResult, error) {
@@ -1439,13 +1546,14 @@ func (pm *ProxyManager) optimizeMessagesWithLLM(modelConfig config.ModelConfig, 
 
 	var b strings.Builder
 	for _, m := range middle {
-		if strings.TrimSpace(m.Content) == "" {
+		contentText := chatContentToText(m.Content)
+		if strings.TrimSpace(contentText) == "" {
 			continue
 		}
 		b.WriteString("[")
 		b.WriteString(strings.ToUpper(m.Role))
 		b.WriteString("] ")
-		b.WriteString(m.Content)
+		b.WriteString(contentText)
 		b.WriteString("\n\n")
 		if b.Len() > 12000 {
 			break

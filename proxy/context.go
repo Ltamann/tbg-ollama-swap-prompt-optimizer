@@ -83,7 +83,7 @@ func (cm *ContextManager) GetContextInfo(maxTokens int) ContextInfo {
 // ChatMessage represents a single chat message
 type ChatMessage struct {
 	Role         string     `json:"role"`
-	Content      string     `json:"content"`
+	Content      any        `json:"content"`
 	Name         string     `json:"name,omitempty"`
 	FunctionName string     `json:"function_name,omitempty"`
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
@@ -216,8 +216,9 @@ func (cm *ContextManager) CountChatTokens(messages []ChatMessage, tools []ToolSc
 
 	for _, msg := range messages {
 		if msg.Role == "system" || msg.Role == "user" || msg.Role == "assistant" || msg.Role == "tool" {
-			if msg.Content != "" {
-				textParts = append(textParts, fmt.Sprintf("[%s]: %s", strings.ToUpper(msg.Role), msg.Content))
+			contentText := chatContentToText(msg.Content)
+			if contentText != "" {
+				textParts = append(textParts, fmt.Sprintf("[%s]: %s", strings.ToUpper(msg.Role), contentText))
 			}
 		}
 	}
@@ -300,10 +301,10 @@ func (cm *ContextManager) applySlidingWindow(messages []ChatMessage, tools []Too
 
 	if len(result) == 1 {
 		msg := result[0]
-		truncatedContent := cm.truncateContent(msg.Content, maxTokens)
+		truncatedContent := cm.truncateContent(chatContentToText(msg.Content), maxTokens)
 		result[0] = ChatMessage{
 			Role:         msg.Role,
-			Content:      truncatedContent,
+			Content:      applyTextToChatContent(msg.Content, truncatedContent),
 			Name:         msg.Name,
 			FunctionName: msg.FunctionName,
 			ToolCalls:    msg.ToolCalls,
@@ -356,7 +357,7 @@ func (cm *ContextManager) truncateContent(content string, maxTokens int) string 
 func (cm *ContextManager) estimateMessagesTokens(messages []ChatMessage) int {
 	total := 0
 	for _, msg := range messages {
-		total += cm.estimateLineTokens(msg.Content)
+		total += cm.estimateLineTokens(chatContentToText(msg.Content))
 		if msg.Name != "" {
 			total += len(strings.Fields(msg.Name)) * 13 / 10
 		}
@@ -414,19 +415,19 @@ func (cm *ContextManager) compactRepeatedMessages(messages []ChatMessage) []Chat
 			continue
 		}
 		if i == lastIndex {
-			signature := msg.Role + "|" + normalizeMessageContent(msg.Content)
+			signature := msg.Role + "|" + normalizeMessageContent(chatContentToText(msg.Content))
 			seen[signature] = struct{}{}
 			result = append(result, msg)
 			continue
 		}
 
-		signature := msg.Role + "|" + normalizeMessageContent(msg.Content)
+		signature := msg.Role + "|" + normalizeMessageContent(chatContentToText(msg.Content))
 		if _, found := seen[signature]; found {
 			continue
 		}
 
 		seen[signature] = struct{}{}
-		msg.Content = compactRepeatedLines(msg.Content)
+		msg.Content = applyTextToChatContent(msg.Content, compactRepeatedLines(chatContentToText(msg.Content)))
 		result = append(result, msg)
 	}
 
@@ -511,9 +512,79 @@ func (cr CropResult) IsCropped() bool {
 		return false
 	}
 	for i := range cr.Messages {
-		if cr.Messages[i].Role != cr.OriginalMessages[i].Role || cr.Messages[i].Content != cr.OriginalMessages[i].Content {
+		if cr.Messages[i].Role != cr.OriginalMessages[i].Role || chatContentToText(cr.Messages[i].Content) != chatContentToText(cr.OriginalMessages[i].Content) {
 			return true
 		}
 	}
 	return false
+}
+
+func chatContentToText(content any) string {
+	switch v := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, p := range v {
+			m, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			partType := strings.TrimSpace(fmt.Sprintf("%v", m["type"]))
+			switch partType {
+			case "text":
+				if txt, ok := m["text"].(string); ok {
+					txt = strings.TrimSpace(txt)
+					if txt != "" {
+						parts = append(parts, txt)
+					}
+				}
+			case "image_url":
+				parts = append(parts, "[image]")
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", v))
+	}
+}
+
+func applyTextToChatContent(original any, text string) any {
+	switch v := original.(type) {
+	case []any:
+		out := make([]any, 0, len(v)+1)
+		addedText := false
+		for _, p := range v {
+			m, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			partType := strings.TrimSpace(fmt.Sprintf("%v", m["type"]))
+			if partType == "text" {
+				if addedText {
+					continue
+				}
+				cp := make(map[string]any, len(m))
+				for k, val := range m {
+					cp[k] = val
+				}
+				cp["text"] = text
+				out = append(out, cp)
+				addedText = true
+				continue
+			}
+			out = append(out, m)
+		}
+		if !addedText && strings.TrimSpace(text) != "" {
+			out = append([]any{map[string]any{"type": "text", "text": text}}, out...)
+		}
+		if len(out) > 0 {
+			return out
+		}
+		return text
+	default:
+		return text
+	}
 }

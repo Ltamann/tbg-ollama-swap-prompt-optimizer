@@ -4,6 +4,8 @@
     loadModel,
     unloadAllModels,
     killAllLlamaCpp,
+    refreshConfig,
+    restartTBGSwap,
     unloadSingleModel,
     getModelCtxSize,
     setModelCtxSize,
@@ -16,6 +18,8 @@
 
   let isUnloading = $state(false);
   let isKillingLlamaCpp = $state(false);
+  let isRefreshingConfig = $state(false);
+  let isRestartingTBG = $state(false);
   let menuOpen = $state(false);
 
   const showUnlistedStore = persistentStore<boolean>("showUnlisted", true);
@@ -90,6 +94,28 @@
       console.error(e);
     } finally {
       setTimeout(() => (isKillingLlamaCpp = false), 1000);
+    }
+  }
+
+  async function handleRefreshConfig(): Promise<void> {
+    isRefreshingConfig = true;
+    try {
+      await refreshConfig();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setTimeout(() => (isRefreshingConfig = false), 1000);
+    }
+  }
+
+  async function handleRestartTBG(): Promise<void> {
+    isRestartingTBG = true;
+    try {
+      await restartTBGSwap();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setTimeout(() => (isRestartingTBG = false), 1500);
     }
   }
 
@@ -247,6 +273,26 @@
                 </svg>
                 {isKillingLlamaCpp ? "Killing..." : "Kill llama.cpp"}
               </button>
+              <button
+                class="w-full text-left px-4 py-2 hover:bg-secondary-hover flex items-center gap-2"
+                onclick={() => { handleRefreshConfig(); menuOpen = false; }}
+                disabled={isRefreshingConfig}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6">
+                  <path fill-rule="evenodd" d="M4.5 12a7.5 7.5 0 0 1 12.8-5.303l.47.47V4.5a.75.75 0 0 1 1.5 0v4.5a.75.75 0 0 1-.75.75h-4.5a.75.75 0 0 1 0-1.5h2.61l-.39-.39A6 6 0 1 0 18 12a.75.75 0 0 1 1.5 0 7.5 7.5 0 1 1-15 0Z" clip-rule="evenodd" />
+                </svg>
+                {isRefreshingConfig ? "Refreshing..." : "Refresh Config"}
+              </button>
+              <button
+                class="w-full text-left px-4 py-2 hover:bg-secondary-hover flex items-center gap-2"
+                onclick={() => { handleRestartTBG(); menuOpen = false; }}
+                disabled={isRestartingTBG}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6">
+                  <path fill-rule="evenodd" d="M12 3.75a8.25 8.25 0 0 0-7.534 4.894.75.75 0 1 1-1.37-.614A9.75 9.75 0 1 1 12 21.75a.75.75 0 0 1 0-1.5 8.25 8.25 0 1 0 0-16.5ZM12 6a.75.75 0 0 1 .75.75V12a.75.75 0 0 1-1.5 0V6.75A.75.75 0 0 1 12 6Zm0 8.25a.938.938 0 1 0 0 1.875.938.938 0 0 0 0-1.875Z" clip-rule="evenodd" />
+                </svg>
+                {isRestartingTBG ? "Restarting..." : "Restart TBG (O)llama Swap"}
+              </button>
             </div>
           {/if}
         </div>
@@ -284,13 +330,27 @@
           </svg>
           {isUnloading ? "Unloading..." : "Unload All"}
         </button>
-        <button class="btn text-base flex items-center gap-2" onclick={handleKillAllLlamaCpp} disabled={isKillingLlamaCpp}>
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6">
-            <path d="M9.75 3a.75.75 0 0 0-.75.75V6H6.75a.75.75 0 0 0 0 1.5H9v9.75a.75.75 0 0 0 1.5 0V7.5h3v9.75a.75.75 0 0 0 1.5 0V7.5h2.25a.75.75 0 0 0 0-1.5H15V3.75a.75.75 0 0 0-.75-.75h-4.5Z" />
-            <path fill-rule="evenodd" d="M4.5 8.25A2.25 2.25 0 0 1 6.75 6h10.5A2.25 2.25 0 0 1 19.5 8.25v9A3.75 3.75 0 0 1 15.75 21h-7.5A3.75 3.75 0 0 1 4.5 17.25v-9Zm2.25-.75a.75.75 0 0 0-.75.75v9A2.25 2.25 0 0 0 8.25 19.5h7.5A2.25 2.25 0 0 0 18 17.25v-9a.75.75 0 0 0-.75-.75H6.75Z" clip-rule="evenodd" />
-          </svg>
-          {isKillingLlamaCpp ? "Killing..." : "Kill llama.cpp"}
-        </button>
+        <div class="flex flex-col gap-2">
+          <button class="btn text-base flex items-center gap-2" onclick={handleKillAllLlamaCpp} disabled={isKillingLlamaCpp}>
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6">
+              <path d="M9.75 3a.75.75 0 0 0-.75.75V6H6.75a.75.75 0 0 0 0 1.5H9v9.75a.75.75 0 0 0 1.5 0V7.5h3v9.75a.75.75 0 0 0 1.5 0V7.5h2.25a.75.75 0 0 0 0-1.5H15V3.75a.75.75 0 0 0-.75-.75h-4.5Z" />
+              <path fill-rule="evenodd" d="M4.5 8.25A2.25 2.25 0 0 1 6.75 6h10.5A2.25 2.25 0 0 1 19.5 8.25v9A3.75 3.75 0 0 1 15.75 21h-7.5A3.75 3.75 0 0 1 4.5 17.25v-9Zm2.25-.75a.75.75 0 0 0-.75.75v9A2.25 2.25 0 0 0 8.25 19.5h7.5A2.25 2.25 0 0 0 18 17.25v-9a.75.75 0 0 0-.75-.75H6.75Z" clip-rule="evenodd" />
+            </svg>
+            {isKillingLlamaCpp ? "Killing..." : "Kill llama.cpp"}
+          </button>
+          <button class="btn text-sm flex items-center gap-2" onclick={handleRefreshConfig} disabled={isRefreshingConfig}>
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
+              <path fill-rule="evenodd" d="M4.5 12a7.5 7.5 0 0 1 12.8-5.303l.47.47V4.5a.75.75 0 0 1 1.5 0v4.5a.75.75 0 0 1-.75.75h-4.5a.75.75 0 0 1 0-1.5h2.61l-.39-.39A6 6 0 1 0 18 12a.75.75 0 0 1 1.5 0 7.5 7.5 0 1 1-15 0Z" clip-rule="evenodd" />
+            </svg>
+            {isRefreshingConfig ? "Refreshing..." : "Refresh Config"}
+          </button>
+          <button class="btn text-sm flex items-center gap-2" onclick={handleRestartTBG} disabled={isRestartingTBG}>
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
+              <path fill-rule="evenodd" d="M12 3.75a8.25 8.25 0 0 0-7.534 4.894.75.75 0 1 1-1.37-.614A9.75 9.75 0 1 1 12 21.75a.75.75 0 0 1 0-1.5 8.25 8.25 0 1 0 0-16.5ZM12 6a.75.75 0 0 1 .75.75V12a.75.75 0 0 1-1.5 0V6.75A.75.75 0 0 1 12 6Zm0 8.25a.938.938 0 1 0 0 1.875.938.938 0 0 0 0-1.875Z" clip-rule="evenodd" />
+            </svg>
+            {isRestartingTBG ? "Restarting..." : "Restart TBG (O)llama Swap"}
+          </button>
+        </div>
       </div>
     {/if}
   </div>

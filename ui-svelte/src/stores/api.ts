@@ -1,5 +1,5 @@
 import { writable } from "svelte/store";
-import type { Model, Metrics, VersionInfo, LogData, APIEventEnvelope, ReqRespCapture } from "../lib/types";
+import type { Model, Metrics, VersionInfo, LogData, APIEventEnvelope, ReqRespCapture, ActivityPromptPreview } from "../lib/types";
 import { connectionState } from "./theme";
 
 const LOG_LENGTH_LIMIT = 1024 * 100; /* 100KB of log data */
@@ -155,6 +155,34 @@ export async function killAllLlamaCpp(): Promise<void> {
     }
   } catch (error) {
     console.error("Failed to kill llama.cpp processes:", error);
+    throw error;
+  }
+}
+
+export async function refreshConfig(): Promise<void> {
+  try {
+    const response = await fetch(`/api/config/reload`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to refresh config: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to refresh config:", error);
+    throw error;
+  }
+}
+
+export async function restartTBGSwap(): Promise<void> {
+  try {
+    const response = await fetch(`/api/restart`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to restart TBG swap: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to restart TBG swap:", error);
     throw error;
   }
 }
@@ -360,6 +388,19 @@ export async function getCapture(id: number): Promise<ReqRespCapture | null> {
   } catch (error) {
     console.error("Failed to fetch capture:", error);
     return null;
+  }
+}
+
+export async function listActivityPromptPreviews(): Promise<ActivityPromptPreview[]> {
+  try {
+    const response = await fetch("/api/activity/prompts");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch activity prompt previews: ${response.status}`);
+    }
+    return (await response.json()) as ActivityPromptPreview[];
+  } catch (error) {
+    console.error("Failed to fetch activity prompt previews:", error);
+    return [];
   }
 }
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/mostlygeek/llama-swap/event"
+	"github.com/mostlygeek/llama-swap/proxy/config"
 )
 
 type Model struct {
@@ -54,9 +55,12 @@ func addApiHandlers(pm *ProxyManager) {
 		apiGroup.PUT("/tools/settings", pm.apiSetToolSettings)
 		apiGroup.GET("/events", pm.apiSendEvents)
 		apiGroup.GET("/metrics", pm.apiGetMetrics)
+		apiGroup.GET("/activity/prompts", pm.apiGetActivityPrompts)
 		apiGroup.GET("/version", pm.apiGetVersion)
 		apiGroup.GET("/captures/:id", pm.apiGetCapture)
 		apiGroup.GET("/config/path", pm.apiGetConfigPath)
+		apiGroup.POST("/config/reload", pm.apiReloadConfig)
+		apiGroup.POST("/restart", pm.apiRestartTBG)
 	}
 
 	// Add ctx-size endpoint handlers
@@ -449,6 +453,10 @@ func (pm *ProxyManager) apiGetMetrics(c *gin.Context) {
 	c.Data(http.StatusOK, "application/json", jsonData)
 }
 
+func (pm *ProxyManager) apiGetActivityPrompts(c *gin.Context) {
+	c.JSON(http.StatusOK, pm.getActivityPromptPreviews())
+}
+
 func (pm *ProxyManager) apiUnloadSingleModelHandler(c *gin.Context) {
 	requestedModel := strings.TrimPrefix(c.Param("model"), "/")
 	realModelName, found := pm.config.RealModelName(requestedModel)
@@ -485,6 +493,74 @@ func (pm *ProxyManager) apiGetConfigPath(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"configPath": pm.configPath,
 	})
+}
+
+func (pm *ProxyManager) reloadConfigFromDisk(stopModels bool) error {
+	pm.Lock()
+	cfgPath := strings.TrimSpace(pm.configPath)
+	pm.Unlock()
+	if cfgPath == "" {
+		cfgPath = "config.yaml"
+	}
+
+	newCfg, err := config.LoadConfig(cfgPath)
+	if err != nil {
+		return err
+	}
+
+	event.Emit(ConfigFileChangedEvent{ReloadingState: ReloadingStateStart})
+	defer event.Emit(ConfigFileChangedEvent{ReloadingState: ReloadingStateEnd})
+
+	if stopModels {
+		pm.StopProcesses(StopImmediately)
+	}
+
+	pm.Lock()
+	defer pm.Unlock()
+
+	pm.config = newCfg
+
+	// Keep processGroups in sync with config groups.
+	for groupID := range pm.config.Groups {
+		if _, ok := pm.processGroups[groupID]; !ok {
+			pm.processGroups[groupID] = NewProcessGroup(groupID, pm.config, pm.proxyLogger, pm.upstreamLogger)
+		}
+	}
+	for groupID := range pm.processGroups {
+		if _, ok := pm.config.Groups[groupID]; !ok {
+			delete(pm.processGroups, groupID)
+		}
+	}
+
+	// Soft restart clears runtime overrides when requested.
+	if stopModels {
+		pm.ctxSizes = make(map[string]int)
+		pm.fitModes = make(map[string]bool)
+		pm.fitCtxModes = make(map[string]string)
+		pm.promptPolicies = make(map[string]PromptOptimizationPolicy)
+		pm.latestPromptOptimizations = make(map[string]PromptOptimizationSnapshot)
+		pm.activityPromptPreviews = pm.activityPromptPreviews[:0]
+		pm.activityCurrentUserSignature = ""
+		pm.activityCurrentTurn = 0
+	}
+
+	return nil
+}
+
+func (pm *ProxyManager) apiReloadConfig(c *gin.Context) {
+	if err := pm.reloadConfigFromDisk(false); err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, "failed to reload config: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"msg": "ok", "detail": "config reloaded"})
+}
+
+func (pm *ProxyManager) apiRestartTBG(c *gin.Context) {
+	if err := pm.reloadConfigFromDisk(true); err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, "failed to restart TBG: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"msg": "ok", "detail": "TBG soft restart complete"})
 }
 
 func (pm *ProxyManager) apiGetCapture(c *gin.Context) {

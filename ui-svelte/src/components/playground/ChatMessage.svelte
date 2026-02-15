@@ -1,26 +1,30 @@
 <script lang="ts">
   import { renderMarkdown, escapeHtml } from "../../lib/markdown";
-  import { Copy, Check, Pencil, X, Save, RefreshCw, ChevronDown, ChevronRight, Brain, Code } from "lucide-svelte";
+  import { Copy, Check, Pencil, X, Save, RefreshCw, ChevronDown, ChevronRight, Brain, Code, Trash2 } from "lucide-svelte";
   import { getTextContent, getImageUrls } from "../../lib/types";
-  import type { ContentPart } from "../../lib/types";
+  import type { ContentPart, ChatSource } from "../../lib/types";
 
   interface Props {
     role: "user" | "assistant" | "system";
     content: string | ContentPart[];
+    sources?: ChatSource[];
     reasoning_content?: string;
     reasoningTimeMs?: number;
     isStreaming?: boolean;
     isReasoning?: boolean;
     onEdit?: (newContent: string) => void;
+    onDelete?: () => void;
     onRegenerate?: () => void;
   }
 
-  let { role, content, reasoning_content = "", reasoningTimeMs = 0, isStreaming = false, isReasoning = false, onEdit, onRegenerate }: Props = $props();
+  let { role, content, sources = [], reasoning_content = "", reasoningTimeMs = 0, isStreaming = false, isReasoning = false, onEdit, onDelete, onRegenerate }: Props = $props();
 
   let textContent = $derived(getTextContent(content));
   let imageUrls = $derived(getImageUrls(content));
   let hasImages = $derived(imageUrls.length > 0);
+  let hasSources = $derived(sources.length > 0);
   let canEdit = $derived(onEdit !== undefined && !hasImages);
+  let canDelete = $derived(onDelete !== undefined);
 
   let renderedContent = $derived(
     role === "assistant" && !isStreaming
@@ -109,6 +113,24 @@
       cancelEdit();
     }
   }
+
+  function sourceLabel(source: ChatSource): string {
+    return source.title || source.domain || source.url;
+  }
+
+  function sourceDomain(source: ChatSource): string {
+    if (source.domain) return source.domain;
+    try {
+      return new URL(source.url).hostname;
+    } catch {
+      return source.url;
+    }
+  }
+
+  function sourceFavicon(source: ChatSource): string {
+    const d = sourceDomain(source);
+    return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(d)}&sz=32`;
+  }
 </script>
 
 <div class="flex {role === 'user' ? 'justify-end' : 'justify-start'} mb-4">
@@ -175,6 +197,21 @@
         </div>
       {/if}
       {#if !isStreaming}
+        {#if hasSources}
+          <div class="sources-tray mt-2 mb-1" title="Sources">
+            {#each sources as source, idx (source.url + idx)}
+              <a
+                class="source-badge"
+                href={source.url}
+                target="_blank"
+                rel="noreferrer noopener"
+                title={sourceLabel(source)}
+              >
+                <img src={sourceFavicon(source)} alt={sourceDomain(source)} />
+              </a>
+            {/each}
+          </div>
+        {/if}
         <div class="flex gap-1 mt-2 pt-1 border-t border-gray-200 dark:border-white/10">
           {#if onRegenerate}
             <button
@@ -249,14 +286,27 @@
           </div>
         {/if}
         <div class="whitespace-pre-wrap pr-8">{textContent}</div>
-        {#if canEdit}
-          <button
-            class="absolute top-2 right-2 p-1.5 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity bg-white/20 hover:bg-white/30 shadow-sm"
-            onclick={startEdit}
-            title="Edit message"
-          >
-            <Pencil class="w-4 h-4" />
-          </button>
+        {#if canEdit || canDelete}
+          <div class="absolute top-2 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            {#if canEdit}
+              <button
+                class="p-1.5 rounded-lg bg-white/20 hover:bg-white/30 shadow-sm"
+                onclick={startEdit}
+                title="Edit message"
+              >
+                <Pencil class="w-4 h-4" />
+              </button>
+            {/if}
+            {#if canDelete}
+              <button
+                class="p-1.5 rounded-lg bg-white/20 hover:bg-red-500/80 shadow-sm"
+                onclick={onDelete}
+                title="Delete user message and related answer"
+              >
+                <Trash2 class="w-4 h-4" />
+              </button>
+            {/if}
+          </div>
         {/if}
       {/if}
     {/if}
@@ -384,5 +434,50 @@
   /* Highlight.js theme overrides for dark mode */
   :global(.dark) .prose :global(.hljs) {
     background: transparent;
+  }
+
+  .sources-tray {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    overflow: hidden;
+    max-width: 30px;
+    transition: max-width 220ms ease;
+  }
+
+  .sources-tray:hover {
+    max-width: 420px;
+  }
+
+  .source-badge {
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    border-radius: 9999px;
+    border: 1px solid var(--color-border, rgba(128, 128, 128, 0.2));
+    background: var(--color-surface);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    margin-left: -6px;
+    transition: margin-left 220ms ease, transform 120ms ease;
+  }
+
+  .source-badge:first-child {
+    margin-left: 0;
+  }
+
+  .sources-tray:hover .source-badge {
+    margin-left: 0;
+  }
+
+  .source-badge:hover {
+    transform: translateY(-1px);
+  }
+
+  .source-badge img {
+    width: 14px;
+    height: 14px;
   }
 </style>

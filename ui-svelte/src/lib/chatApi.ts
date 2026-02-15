@@ -1,8 +1,9 @@
-import type { ChatMessage, ChatCompletionRequest } from "./types";
+import type { ChatMessage, ChatCompletionRequest, ChatSource } from "./types";
 
 export interface StreamChunk {
   content: string;
   reasoning_content?: string;
+  sources?: ChatSource[];
   done: boolean;
 }
 
@@ -32,9 +33,10 @@ function parseSSELine(line: string): StreamChunk | null {
     const delta = parsed.choices?.[0]?.delta;
     const content = delta?.content || "";
     const reasoning_content = delta?.reasoning_content || "";
+    const sources = (delta?.sources || parsed.choices?.[0]?.message?.sources || []) as ChatSource[];
 
-    if (content || reasoning_content) {
-      return { content, reasoning_content, done: false };
+    if (content || reasoning_content || (Array.isArray(sources) && sources.length > 0)) {
+      return { content, reasoning_content, sources, done: false };
     }
     return null;
   } catch {

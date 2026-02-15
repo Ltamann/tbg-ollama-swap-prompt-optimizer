@@ -46,6 +46,20 @@ export interface ReqRespCapture {
   resp_body: string; // base64 encoded bytes
 }
 
+export interface ActivityPromptPreview {
+  id: number;
+  timestamp: string;
+  model: string;
+  kind: "user_request" | "agent_step";
+  user_turn: number;
+  request_path: string;
+  last_role: string;
+  last_user_prompt: string;
+  prompt_preview: string;
+  message_count: number;
+  user_agent: string;
+}
+
 export interface LogData {
   source: "upstream" | "proxy";
   data: string;
@@ -76,11 +90,18 @@ export type ImageContentPart = {
 
 export type ContentPart = TextContentPart | ImageContentPart;
 
+export interface ChatSource {
+  url: string;
+  title?: string;
+  domain?: string;
+}
+
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string | ContentPart[];
   reasoning_content?: string;
   reasoningTimeMs?: number;
+  sources?: ChatSource[];
 }
 
 export function getTextContent(content: string | ContentPart[]): string {

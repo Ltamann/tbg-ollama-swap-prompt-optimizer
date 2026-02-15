@@ -13,6 +13,9 @@ TBG (O)llama Swap + Prompt Optimizer is focused on local agent workflows (for ex
 - Latest optimization snapshot endpoint for audit/debug
 - Optional Ollama discovery and passthrough hook
 - Unified model list for configured llama.cpp models and live Ollama models
+- Chat attachments in Playground (`+` upload for files/images with drag-and-drop)
+- Source link badges in assistant messages for tool/web results
+- Activity prompt-flow preview (current user turn + agent steps)
 
 ## Why This Exists
 
@@ -118,6 +121,29 @@ Operational guidance:
 ![Settings UI](docs/assets/ui-settings.png)
 
 ![Logs UI](docs/assets/ui-logs.png)
+
+Playground highlights:
+
+- icon-only send/stop controls
+- single `+` button for file/image attachments
+- drag-and-drop file support into chat input
+- attachment chips with remove action
+- edit and delete actions on user turns
+- deleting a user turn also deletes its paired assistant reply
+
+Activity highlights:
+
+- request metrics table (existing)
+- latest prompt-flow panel:
+  - shows preview of prompt payload sent to model
+  - labels each request as `New User Request` or `Agent Step`
+  - keeps steps for current user turn and auto-resets on next user request
+
+Models panel highlights:
+
+- `Kill llama.cpp` emergency stop
+- `Refresh Config` reloads config from disk without full app restart
+- `Restart TBG (O)llama Swap` performs soft restart (stop models + reload runtime config/state)
 
 ## Installation Guides
 
@@ -389,6 +415,9 @@ Runtime notes:
 - `POST /api/model/:model/prompt-optimization`
 - `GET /api/model/:model/prompt-optimization`
 - `GET /api/model/:model/prompt-optimization/latest`
+- `GET /api/activity/prompts`
+- `POST /api/config/reload`
+- `POST /api/restart`
 
 ## Tool Runtime (HTTP + MCP)
 
@@ -408,6 +437,7 @@ Notes:
 - Tools are orchestrated by TBG (O)llama Swap (not by `llama.cpp` alone).
 - Works for clients that use OpenAI-compatible chat endpoints.
 - Streaming requests are finalized as a synthetic SSE completion chunk in this MVP.
+- When tool outputs contain URLs, source metadata is attached to assistant responses and rendered as clickable source badges in chat UI.
 
 ### Tool Types
 
