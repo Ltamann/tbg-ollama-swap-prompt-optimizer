@@ -206,6 +206,34 @@ export async function setModelCtxSize(model: string, ctxSize: number): Promise<v
   }
 }
 
+export async function getModelFitMode(model: string): Promise<boolean> {
+  try {
+    const response = await fetch(`/api/model/${encodeURIComponent(model)}/fit`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch fit mode for ${model}: ${response.status}`);
+    }
+    const data = (await response.json()) as { fit?: boolean };
+    return data.fit === true;
+  } catch (error) {
+    console.error("Failed to fetch fit mode:", model, error);
+    return false;
+  }
+}
+
+export async function setModelFitMode(model: string, fit: boolean): Promise<void> {
+  const response = await fetch(`/api/model/${encodeURIComponent(model)}/fit`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ fit }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to set fit mode for ${model}: ${response.status}`);
+  }
+}
+
 export type PromptOptimizationPolicy = "off" | "limit_only" | "always" | "llm_assisted";
 export interface PromptOptimizationSnapshot {
   model: string;

@@ -1,5 +1,14 @@
 <script lang="ts">
-  import { models, loadModel, unloadAllModels, unloadSingleModel, getModelCtxSize, setModelCtxSize } from "../stores/api";
+  import {
+    models,
+    loadModel,
+    unloadAllModels,
+    unloadSingleModel,
+    getModelCtxSize,
+    setModelCtxSize,
+    getModelFitMode,
+    setModelFitMode,
+  } from "../stores/api";
   import { isNarrow } from "../stores/theme";
   import { persistentStore } from "../stores/persistent";
   import type { Model } from "../lib/types";
@@ -21,6 +30,7 @@
   let ctxSelections = $state<Record<string, number>>({});
   let ctxLoading = $state<Record<string, boolean>>({});
   let ctxKnown = $state<Record<string, boolean>>({});
+  let fitSelections = $state<Record<string, boolean>>({});
 
   let filteredModels = $derived.by(() => {
     const filtered = $models.filter((model) => $showUnlistedStore || !model.unlisted);
@@ -47,6 +57,9 @@
     for (const model of filteredModels.regularModels) {
       if (model.external) {
         continue;
+      }
+      if (fitSelections[model.id] === undefined) {
+        fitSelections = { ...fitSelections, [model.id]: model.fitEnabled === true };
       }
       void ensureCtxSizeLoaded(model.id);
     }
@@ -88,7 +101,9 @@
     ctxLoading = { ...ctxLoading, [modelId]: true };
     try {
       const remote = await getModelCtxSize(modelId);
-      ctxSelections = { ...ctxSelections, [modelId]: remote > 0 ? remote : defaultCtxSize };
+      const model = filteredModels.regularModels.find((m) => m.id === modelId);
+      const configuredCtx = model?.ctxConfigured && model.ctxConfigured > 0 ? model.ctxConfigured : defaultCtxSize;
+      ctxSelections = { ...ctxSelections, [modelId]: remote > 0 ? remote : configuredCtx };
       ctxKnown = { ...ctxKnown, [modelId]: true };
     } finally {
       ctxLoading = { ...ctxLoading, [modelId]: false };
@@ -117,9 +132,21 @@
   async function handleLoadModel(modelId: string): Promise<void> {
     try {
       await persistCtxSize(modelId);
+      await setModelFitMode(modelId, fitSelections[modelId] === true);
       await loadModel(modelId);
     } catch (e) {
       console.error(e);
+    }
+  }
+
+  async function handleFitToggle(modelId: string, checked: boolean): Promise<void> {
+    fitSelections = { ...fitSelections, [modelId]: checked };
+    try {
+      await setModelFitMode(modelId, checked);
+    } catch (e) {
+      console.error(e);
+      const fallback = await getModelFitMode(modelId);
+      fitSelections = { ...fitSelections, [modelId]: fallback };
     }
   }
 
@@ -232,7 +259,10 @@
       <tbody>
         {#each filteredModels.regularModels as model (model.id)}
           {@const isExternal = isExternalModel(model)}
-          {@const currentCtx = isExternal ? (model.ctxReference || 0) : (ctxSelections[model.id] || defaultCtxSize)}
+          {@const currentCtx = isExternal ? (model.ctxReference || 0) : (ctxSelections[model.id] || model.ctxConfigured || defaultCtxSize)}
+          {@const fitEnabled = fitSelections[model.id] === true}
+          {@const ctxSource = fitEnabled ? "fit-ctx" : (model.ctxSource || "ctx-size")}
+          {@const sourceClass = ctxSource === "fit-ctx" ? "text-emerald-600 dark:text-emerald-400" : "text-sky-600 dark:text-sky-400"}
           <tr class="border-b hover:bg-secondary-hover border-gray-200">
             <td class={model.unlisted ? "text-txtsecondary" : ""}>
               {#if isExternal}
@@ -250,22 +280,39 @@
               {/if}
             </td>
             <td class="w-44">
-              <select
-                class="w-full rounded border border-gray-300 dark:border-white/20 bg-surface px-2 py-1 text-sm"
-                value={currentCtx}
-                disabled={isExternal || ctxLoading[model.id]}
-                onchange={(e) => handleCtxChange(model.id, (e.currentTarget as HTMLSelectElement).value)}
-              >
-                {#if isExternal}
-                  <option value={currentCtx}>
-                    {currentCtx > 0 ? formatCtxLabel(currentCtx) : "From Ollama model file"}
-                  </option>
-                {:else}
-                  {#each ctxOptions as ctx}
-                    <option value={ctx}>{formatCtxLabel(ctx)}</option>
-                  {/each}
+              <div class="flex items-center gap-2">
+                {#if !isExternal}
+                  <label class="inline-flex items-center gap-1 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={fitEnabled}
+                      onchange={(e) => handleFitToggle(model.id, (e.currentTarget as HTMLInputElement).checked)}
+                    />
+                    fit
+                  </label>
                 {/if}
-              </select>
+                <select
+                  class="w-full rounded border border-gray-300 dark:border-white/20 bg-surface px-2 py-1 text-sm"
+                  value={currentCtx}
+                  disabled={isExternal || ctxLoading[model.id]}
+                  onchange={(e) => handleCtxChange(model.id, (e.currentTarget as HTMLSelectElement).value)}
+                >
+                  {#if isExternal}
+                    <option value={currentCtx}>
+                      {currentCtx > 0 ? formatCtxLabel(currentCtx) : "From Ollama model file"}
+                    </option>
+                  {:else}
+                    {#each ctxOptions as ctx}
+                      <option value={ctx}>{formatCtxLabel(ctx)}</option>
+                    {/each}
+                  {/if}
+                </select>
+              </div>
+              {#if !isExternal}
+                <div class={`mt-1 text-[10px] leading-tight ${sourceClass}`}>
+                  {ctxSource}
+                </div>
+              {/if}
             </td>
             <td class="w-12">
               {#if isExternal}

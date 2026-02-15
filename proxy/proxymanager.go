@@ -58,6 +58,8 @@ type ProxyManager struct {
 
 	// custom ctx-size per model (stored before loading)
 	ctxSizes map[string]int
+	// runtime fit-mode per model (stored before loading)
+	fitModes map[string]bool
 
 	// runtime prompt optimization policy per model
 	promptPolicies map[string]PromptOptimizationPolicy
@@ -214,6 +216,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 
 		peerProxy:                 peerProxy,
 		ctxSizes:                  make(map[string]int),
+		fitModes:                  make(map[string]bool),
 		promptPolicies:            make(map[string]PromptOptimizationPolicy),
 		latestPromptOptimizations: make(map[string]PromptOptimizationSnapshot),
 		configPath:                "config.yaml",
@@ -501,8 +504,17 @@ func (pm *ProxyManager) swapProcessGroup(realModelName string) (*ProcessGroup, e
 	if process, ok := processGroup.processes[realModelName]; ok && process != nil {
 		pm.Lock()
 		ctxSize := pm.ctxSizes[realModelName]
+		fitEnabled, fitOverride := pm.fitModes[realModelName]
 		pm.Unlock()
+
+		if !fitOverride {
+			if args, err := process.config.SanitizedCommand(); err == nil {
+				_, _, fitEnabled = parseCtxAndFitFromArgs(args)
+			}
+		}
+
 		process.SetRuntimeCtxSize(ctxSize)
+		process.SetRuntimeFitMode(fitEnabled)
 	}
 
 	if processGroup.exclusive {
@@ -515,6 +527,66 @@ func (pm *ProxyManager) swapProcessGroup(realModelName string) (*ProcessGroup, e
 	}
 
 	return processGroup, nil
+}
+
+func parseCtxAndFitFromArgs(args []string) (ctxSize int, source string, fitEnabled bool) {
+	ctxFromCtxSize := 0
+	ctxFromFitCtx := 0
+
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		if arg == "" {
+			continue
+		}
+
+		switch {
+		case arg == "--fit":
+			fitEnabled = true
+			if i+1 < len(args) {
+				next := strings.ToLower(strings.TrimSpace(args[i+1]))
+				switch next {
+				case "off", "false", "0", "no":
+					fitEnabled = false
+				case "on", "true", "1", "yes":
+					fitEnabled = true
+				}
+			}
+		case strings.HasPrefix(arg, "--fit="):
+			val := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(arg, "--fit=")))
+			fitEnabled = val == "on" || val == "true" || val == "1" || val == "yes"
+		case arg == "--fit-ctx":
+			if i+1 < len(args) {
+				if n, err := strconv.Atoi(strings.TrimSpace(args[i+1])); err == nil && n > 0 {
+					ctxFromFitCtx = n
+				}
+			}
+		case strings.HasPrefix(arg, "--fit-ctx="):
+			if n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(arg, "--fit-ctx="))); err == nil && n > 0 {
+				ctxFromFitCtx = n
+			}
+		case arg == "--ctx-size" || arg == "-c":
+			if i+1 < len(args) {
+				if n, err := strconv.Atoi(strings.TrimSpace(args[i+1])); err == nil && n > 0 {
+					ctxFromCtxSize = n
+				}
+			}
+		case strings.HasPrefix(arg, "--ctx-size="):
+			if n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(arg, "--ctx-size="))); err == nil && n > 0 {
+				ctxFromCtxSize = n
+			}
+		}
+	}
+
+	if fitEnabled && ctxFromFitCtx > 0 {
+		return ctxFromFitCtx, "fit-ctx", true
+	}
+	if ctxFromCtxSize > 0 {
+		return ctxFromCtxSize, "ctx-size", fitEnabled
+	}
+	if ctxFromFitCtx > 0 {
+		return ctxFromFitCtx, "fit-ctx", fitEnabled
+	}
+	return 0, "", fitEnabled
 }
 
 func (pm *ProxyManager) listModelsHandler(c *gin.Context) {

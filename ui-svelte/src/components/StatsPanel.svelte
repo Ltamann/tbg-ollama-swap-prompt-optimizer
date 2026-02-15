@@ -21,14 +21,19 @@
     const totalInputTokens = $metrics.reduce((sum, m) => sum + m.input_tokens, 0);
     const totalOutputTokens = $metrics.reduce((sum, m) => sum + m.output_tokens, 0);
 
-    // Calculate token statistics using output_tokens and duration_ms
-    const validMetrics = $metrics.filter((m) => m.duration_ms > 0 && m.output_tokens > 0);
+    // Prefer upstream-reported generation speed when available.
+    // Fallback to output_tokens / duration when speed is missing.
+    const validMetrics = $metrics.filter((m) => (m.tokens_per_second > 0) || (m.duration_ms > 0 && m.output_tokens > 0));
     if (validMetrics.length === 0) {
       return { totalRequests, totalInputTokens, totalOutputTokens, tokenStats: { p99: "0", p95: "0", p50: "0" }, histogramData: null };
     }
 
-    // Calculate tokens/second for each valid metric
-    const tokensPerSecond = validMetrics.map((m) => m.output_tokens / (m.duration_ms / 1000));
+    const tokensPerSecond = validMetrics.map((m) => {
+      if (m.tokens_per_second > 0) {
+        return m.tokens_per_second;
+      }
+      return m.output_tokens / (m.duration_ms / 1000);
+    });
 
     // Sort for percentile calculation
     const sortedTokensPerSecond = [...tokensPerSecond].sort((a, b) => a - b);

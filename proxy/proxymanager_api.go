@@ -14,15 +14,18 @@ import (
 )
 
 type Model struct {
-	Id           string `json:"id"`
-	Name         string `json:"name"`
-	Description  string `json:"description"`
-	State        string `json:"state"`
-	Unlisted     bool   `json:"unlisted"`
-	PeerID       string `json:"peerID"`
-	Provider     string `json:"provider,omitempty"`
-	External     bool   `json:"external,omitempty"`
-	CtxReference int    `json:"ctxReference,omitempty"`
+	Id            string `json:"id"`
+	Name          string `json:"name"`
+	Description   string `json:"description"`
+	State         string `json:"state"`
+	Unlisted      bool   `json:"unlisted"`
+	PeerID        string `json:"peerID"`
+	Provider      string `json:"provider,omitempty"`
+	External      bool   `json:"external,omitempty"`
+	CtxReference  int    `json:"ctxReference,omitempty"`
+	CtxConfigured int    `json:"ctxConfigured,omitempty"`
+	CtxSource     string `json:"ctxSource,omitempty"`
+	FitEnabled    bool   `json:"fitEnabled,omitempty"`
 }
 
 func addApiHandlers(pm *ProxyManager) {
@@ -43,6 +46,8 @@ func addApiHandlers(pm *ProxyManager) {
 	ctxSizeGroup := pm.ginEngine.Group("/api/model", pm.apiKeyAuth())
 	ctxSizeGroup.POST("/:model/ctxsize", pm.apiSetCtxSize)
 	ctxSizeGroup.GET("/:model/ctxsize", pm.apiGetCtxSize)
+	ctxSizeGroup.POST("/:model/fit", pm.apiSetFitMode)
+	ctxSizeGroup.GET("/:model/fit", pm.apiGetFitMode)
 	ctxSizeGroup.POST("/:model/prompt-optimization", pm.apiSetPromptOptimization)
 	ctxSizeGroup.GET("/:model/prompt-optimization", pm.apiGetPromptOptimization)
 	ctxSizeGroup.GET("/:model/prompt-optimization/latest", pm.apiGetLatestPromptOptimization)
@@ -89,13 +94,27 @@ func (pm *ProxyManager) getModelStatus() []Model {
 				state = stateStr
 			}
 		}
+		modelCfg := pm.config.Models[modelID]
+		args, _ := (&modelCfg).SanitizedCommand()
+		configCtx, ctxSource, fitFromConfig := parseCtxAndFitFromArgs(args)
+		pm.Lock()
+		runtimeFit, hasFitOverride := pm.fitModes[modelID]
+		pm.Unlock()
+		fitEnabled := fitFromConfig
+		if hasFitOverride {
+			fitEnabled = runtimeFit
+		}
+
 		models = append(models, Model{
-			Id:          modelID,
-			Name:        pm.config.Models[modelID].Name,
-			Description: pm.config.Models[modelID].Description,
-			State:       state,
-			Unlisted:    pm.config.Models[modelID].Unlisted,
-			Provider:    "llama",
+			Id:            modelID,
+			Name:          pm.config.Models[modelID].Name,
+			Description:   pm.config.Models[modelID].Description,
+			State:         state,
+			Unlisted:      pm.config.Models[modelID].Unlisted,
+			Provider:      "llama",
+			CtxConfigured: configCtx,
+			CtxSource:     ctxSource,
+			FitEnabled:    fitEnabled,
 		})
 	}
 
@@ -306,6 +325,10 @@ type SetCtxSizeRequest struct {
 	CtxSize int `json:"ctxSize"`
 }
 
+type SetFitModeRequest struct {
+	Fit bool `json:"fit"`
+}
+
 func (pm *ProxyManager) apiSetCtxSize(c *gin.Context) {
 	requestedModel := strings.TrimSpace(c.Param("model"))
 	if requestedModel == "" {
@@ -368,6 +391,65 @@ func (pm *ProxyManager) apiGetCtxSize(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"model": modelName, "ctxSize": ctxSize})
+}
+
+func (pm *ProxyManager) apiSetFitMode(c *gin.Context) {
+	requestedModel := strings.TrimSpace(c.Param("model"))
+	if requestedModel == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "model name required")
+		return
+	}
+
+	modelName, found := pm.config.RealModelName(requestedModel)
+	if !found {
+		if _, exists := pm.GetOllamaModelByID(requestedModel); exists {
+			pm.sendErrorResponse(c, http.StatusBadRequest, "fit mode for ollama models is read-only")
+			return
+		}
+		pm.sendErrorResponse(c, http.StatusNotFound, "model not found")
+		return
+	}
+
+	var req SetFitModeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+
+	pm.Lock()
+	pm.fitModes[modelName] = req.Fit
+	pm.Unlock()
+
+	c.JSON(http.StatusOK, gin.H{"msg": "fit mode set successfully", "model": modelName, "fit": req.Fit})
+}
+
+func (pm *ProxyManager) apiGetFitMode(c *gin.Context) {
+	requestedModel := strings.TrimSpace(c.Param("model"))
+	if requestedModel == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "model name required")
+		return
+	}
+
+	modelName, found := pm.config.RealModelName(requestedModel)
+	if !found {
+		if _, exists := pm.GetOllamaModelByID(requestedModel); exists {
+			c.JSON(http.StatusOK, gin.H{"model": requestedModel, "fit": false})
+			return
+		}
+		pm.sendErrorResponse(c, http.StatusNotFound, "model not found")
+		return
+	}
+
+	pm.Lock()
+	fit, hasOverride := pm.fitModes[modelName]
+	pm.Unlock()
+	if !hasOverride {
+		modelCfg := pm.config.Models[modelName]
+		args, _ := (&modelCfg).SanitizedCommand()
+		_, _, fit = parseCtxAndFitFromArgs(args)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"model": modelName, "fit": fit})
 }
 
 type SetPromptOptimizationRequest struct {

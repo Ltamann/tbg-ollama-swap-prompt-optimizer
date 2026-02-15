@@ -83,6 +83,8 @@ type Process struct {
 
 	// optional runtime override used to set --ctx-size before each start
 	runtimeCtxSize atomic.Int64
+	// optional runtime fit-mode override used to set --fit/--fit-ctx before each start
+	runtimeFitMode atomic.Int32
 }
 
 func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, processLogger *LogMonitor, proxyLogger *LogMonitor) *Process {
@@ -231,8 +233,16 @@ func (p *Process) start() error {
 		return fmt.Errorf("unable to get sanitized command: %v", err)
 	}
 
-	if ctxSize := int(p.runtimeCtxSize.Load()); ctxSize > 0 {
-		args = applyCtxSizeArg(args, ctxSize)
+	ctxSize := int(p.runtimeCtxSize.Load())
+	fitMode := p.runtimeFitMode.Load() == 1
+
+	if fitMode {
+		args = applyFitArgs(args, true, ctxSize)
+	} else {
+		args = applyFitArgs(args, false, 0)
+		if ctxSize > 0 {
+			args = applyCtxSizeArg(args, ctxSize)
+		}
 	}
 
 	if curState, err := p.swapState(StateStopped, StateStarting); err != nil {
@@ -382,6 +392,14 @@ func (p *Process) SetRuntimeCtxSize(ctxSize int) {
 	p.runtimeCtxSize.Store(int64(ctxSize))
 }
 
+func (p *Process) SetRuntimeFitMode(enabled bool) {
+	if enabled {
+		p.runtimeFitMode.Store(1)
+		return
+	}
+	p.runtimeFitMode.Store(0)
+}
+
 func applyCtxSizeArg(args []string, ctxSize int) []string {
 	if len(args) == 0 || ctxSize <= 0 {
 		return args
@@ -409,6 +427,71 @@ func applyCtxSizeArg(args []string, ctxSize int) []string {
 	}
 
 	return append(updated, "--ctx-size", ctxValue)
+}
+
+func applyFitArgs(args []string, fitEnabled bool, fitCtx int) []string {
+	if len(args) == 0 {
+		return args
+	}
+
+	updated := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		if arg == "" {
+			continue
+		}
+
+		// Always strip existing fit settings so we can rebuild deterministically
+		if arg == "--fit" || strings.HasPrefix(arg, "--fit=") {
+			if arg == "--fit" && i+1 < len(args) {
+				next := strings.TrimSpace(args[i+1])
+				switch strings.ToLower(next) {
+				case "on", "off", "true", "false", "0", "1", "yes", "no":
+					i++
+				}
+			}
+			continue
+		}
+		if arg == "--fit-ctx" || strings.HasPrefix(arg, "--fit-ctx=") {
+			if arg == "--fit-ctx" && i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+
+		// In fit mode, remove ctx-size and layer placement flags
+		if fitEnabled {
+			if arg == "--ctx-size" || arg == "-c" {
+				if i+1 < len(args) {
+					i++
+				}
+				continue
+			}
+			if strings.HasPrefix(arg, "--ctx-size=") {
+				continue
+			}
+			if arg == "--n-gpu-layers" || arg == "--n-cpu-moe" {
+				if i+1 < len(args) {
+					i++
+				}
+				continue
+			}
+			if strings.HasPrefix(arg, "--n-gpu-layers=") || strings.HasPrefix(arg, "--n-cpu-moe=") {
+				continue
+			}
+		}
+
+		updated = append(updated, args[i])
+	}
+
+	if fitEnabled {
+		updated = append(updated, "--fit", "on")
+		if fitCtx > 0 {
+			updated = append(updated, "--fit-ctx", strconv.Itoa(fitCtx))
+		}
+	}
+
+	return updated
 }
 
 // Stop will wait for inflight requests to complete before stopping the process.

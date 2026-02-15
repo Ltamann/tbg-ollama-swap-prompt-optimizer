@@ -12,6 +12,9 @@ export interface Model {
   provider?: "llama" | "ollama";
   external?: boolean;
   ctxReference?: number;
+  ctxConfigured?: number;
+  ctxSource?: "ctx-size" | "fit-ctx" | "";
+  fitEnabled?: boolean;
 }
 
 export interface Metrics {
