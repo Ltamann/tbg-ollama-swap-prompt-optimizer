@@ -3,6 +3,7 @@
     models,
     loadModel,
     unloadAllModels,
+    killAllLlamaCpp,
     unloadSingleModel,
     getModelCtxSize,
     setModelCtxSize,
@@ -14,6 +15,7 @@
   import type { Model } from "../lib/types";
 
   let isUnloading = $state(false);
+  let isKillingLlamaCpp = $state(false);
   let menuOpen = $state(false);
 
   const showUnlistedStore = persistentStore<boolean>("showUnlisted", true);
@@ -31,6 +33,7 @@
   let ctxLoading = $state<Record<string, boolean>>({});
   let ctxKnown = $state<Record<string, boolean>>({});
   let fitSelections = $state<Record<string, boolean>>({});
+  let fitCtxModeSelections = $state<Record<string, "max" | "min">>({});
 
   let filteredModels = $derived.by(() => {
     const filtered = $models.filter((model) => $showUnlistedStore || !model.unlisted);
@@ -61,6 +64,9 @@
       if (fitSelections[model.id] === undefined) {
         fitSelections = { ...fitSelections, [model.id]: model.fitEnabled === true };
       }
+      if (fitCtxModeSelections[model.id] === undefined) {
+        fitCtxModeSelections = { ...fitCtxModeSelections, [model.id]: model.fitCtxMode === "min" ? "min" : "max" };
+      }
       void ensureCtxSizeLoaded(model.id);
     }
   });
@@ -73,6 +79,17 @@
       console.error(e);
     } finally {
       setTimeout(() => (isUnloading = false), 1000);
+    }
+  }
+
+  async function handleKillAllLlamaCpp(): Promise<void> {
+    isKillingLlamaCpp = true;
+    try {
+      await killAllLlamaCpp();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setTimeout(() => (isKillingLlamaCpp = false), 1000);
     }
   }
 
@@ -132,7 +149,7 @@
   async function handleLoadModel(modelId: string): Promise<void> {
     try {
       await persistCtxSize(modelId);
-      await setModelFitMode(modelId, fitSelections[modelId] === true);
+      await setModelFitMode(modelId, fitSelections[modelId] === true, fitCtxModeSelections[modelId] || "max");
       await loadModel(modelId);
     } catch (e) {
       console.error(e);
@@ -142,11 +159,25 @@
   async function handleFitToggle(modelId: string, checked: boolean): Promise<void> {
     fitSelections = { ...fitSelections, [modelId]: checked };
     try {
-      await setModelFitMode(modelId, checked);
+      await setModelFitMode(modelId, checked, fitCtxModeSelections[modelId] || "max");
     } catch (e) {
       console.error(e);
       const fallback = await getModelFitMode(modelId);
-      fitSelections = { ...fitSelections, [modelId]: fallback };
+      fitSelections = { ...fitSelections, [modelId]: fallback.fit };
+      fitCtxModeSelections = { ...fitCtxModeSelections, [modelId]: fallback.mode };
+    }
+  }
+
+  async function handleFitCtxModeChange(modelId: string, modeValue: string): Promise<void> {
+    const mode = modeValue === "min" ? "min" : "max";
+    fitCtxModeSelections = { ...fitCtxModeSelections, [modelId]: mode };
+    try {
+      await setModelFitMode(modelId, fitSelections[modelId] === true, mode);
+    } catch (e) {
+      console.error(e);
+      const fallback = await getModelFitMode(modelId);
+      fitSelections = { ...fitSelections, [modelId]: fallback.fit };
+      fitCtxModeSelections = { ...fitCtxModeSelections, [modelId]: fallback.mode };
     }
   }
 
@@ -205,6 +236,17 @@
                 </svg>
                 {isUnloading ? "Unloading..." : "Unload All"}
               </button>
+              <button
+                class="w-full text-left px-4 py-2 hover:bg-secondary-hover flex items-center gap-2"
+                onclick={() => { handleKillAllLlamaCpp(); menuOpen = false; }}
+                disabled={isKillingLlamaCpp}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6">
+                  <path d="M9.75 3a.75.75 0 0 0-.75.75V6H6.75a.75.75 0 0 0 0 1.5H9v9.75a.75.75 0 0 0 1.5 0V7.5h3v9.75a.75.75 0 0 0 1.5 0V7.5h2.25a.75.75 0 0 0 0-1.5H15V3.75a.75.75 0 0 0-.75-.75h-4.5Z" />
+                  <path fill-rule="evenodd" d="M4.5 8.25A2.25 2.25 0 0 1 6.75 6h10.5A2.25 2.25 0 0 1 19.5 8.25v9A3.75 3.75 0 0 1 15.75 21h-7.5A3.75 3.75 0 0 1 4.5 17.25v-9Zm2.25-.75a.75.75 0 0 0-.75.75v9A2.25 2.25 0 0 0 8.25 19.5h7.5A2.25 2.25 0 0 0 18 17.25v-9a.75.75 0 0 0-.75-.75H6.75Z" clip-rule="evenodd" />
+                </svg>
+                {isKillingLlamaCpp ? "Killing..." : "Kill llama.cpp"}
+              </button>
             </div>
           {/if}
         </div>
@@ -242,6 +284,13 @@
           </svg>
           {isUnloading ? "Unloading..." : "Unload All"}
         </button>
+        <button class="btn text-base flex items-center gap-2" onclick={handleKillAllLlamaCpp} disabled={isKillingLlamaCpp}>
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6">
+            <path d="M9.75 3a.75.75 0 0 0-.75.75V6H6.75a.75.75 0 0 0 0 1.5H9v9.75a.75.75 0 0 0 1.5 0V7.5h3v9.75a.75.75 0 0 0 1.5 0V7.5h2.25a.75.75 0 0 0 0-1.5H15V3.75a.75.75 0 0 0-.75-.75h-4.5Z" />
+            <path fill-rule="evenodd" d="M4.5 8.25A2.25 2.25 0 0 1 6.75 6h10.5A2.25 2.25 0 0 1 19.5 8.25v9A3.75 3.75 0 0 1 15.75 21h-7.5A3.75 3.75 0 0 1 4.5 17.25v-9Zm2.25-.75a.75.75 0 0 0-.75.75v9A2.25 2.25 0 0 0 8.25 19.5h7.5A2.25 2.25 0 0 0 18 17.25v-9a.75.75 0 0 0-.75-.75H6.75Z" clip-rule="evenodd" />
+          </svg>
+          {isKillingLlamaCpp ? "Killing..." : "Kill llama.cpp"}
+        </button>
       </div>
     {/if}
   </div>
@@ -261,8 +310,9 @@
           {@const isExternal = isExternalModel(model)}
           {@const currentCtx = isExternal ? (model.ctxReference || 0) : (ctxSelections[model.id] || model.ctxConfigured || defaultCtxSize)}
           {@const fitEnabled = fitSelections[model.id] === true}
-          {@const ctxSource = fitEnabled ? "fit-ctx" : (model.ctxSource || "ctx-size")}
-          {@const sourceClass = ctxSource === "fit-ctx" ? "text-emerald-600 dark:text-emerald-400" : "text-sky-600 dark:text-sky-400"}
+          {@const fitCtxMode = fitCtxModeSelections[model.id] || "max"}
+          {@const ctxSource = fitEnabled ? (fitCtxMode === "min" ? "fit-ctx (min)" : "ctx-size (max)") : (model.ctxSource || "ctx-size")}
+          {@const sourceClass = ctxSource.startsWith("fit-ctx") ? "text-emerald-600 dark:text-emerald-400" : "text-sky-600 dark:text-sky-400"}
           <tr class="border-b hover:bg-secondary-hover border-gray-200">
             <td class={model.unlisted ? "text-txtsecondary" : ""}>
               {#if isExternal}
@@ -290,6 +340,15 @@
                     />
                     fit
                   </label>
+                  <select
+                    class="rounded border border-gray-300 dark:border-white/20 bg-surface px-1 py-1 text-xs"
+                    value={fitCtxMode}
+                    onchange={(e) => handleFitCtxModeChange(model.id, (e.currentTarget as HTMLSelectElement).value)}
+                    title="max uses --ctx-size as selected cap; min uses --fit-ctx as selected floor"
+                  >
+                    <option value="max">max</option>
+                    <option value="min">min</option>
+                  </select>
                 {/if}
                 <select
                   class="w-full rounded border border-gray-300 dark:border-white/20 bg-surface px-2 py-1 text-sm"

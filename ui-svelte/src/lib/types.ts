@@ -15,6 +15,7 @@ export interface Model {
   ctxConfigured?: number;
   ctxSource?: "ctx-size" | "fit-ctx" | "";
   fitEnabled?: boolean;
+  fitCtxMode?: "max" | "min";
 }
 
 export interface Metrics {

@@ -145,6 +145,20 @@ export async function unloadAllModels(): Promise<void> {
   }
 }
 
+export async function killAllLlamaCpp(): Promise<void> {
+  try {
+    const response = await fetch(`/api/models/kill-llama-cpp`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to kill llama.cpp processes: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to kill llama.cpp processes:", error);
+    throw error;
+  }
+}
+
 export async function unloadSingleModel(model: string): Promise<void> {
   try {
     const response = await fetch(`/api/models/unload/${model}`, {
@@ -206,27 +220,28 @@ export async function setModelCtxSize(model: string, ctxSize: number): Promise<v
   }
 }
 
-export async function getModelFitMode(model: string): Promise<boolean> {
+export async function getModelFitMode(model: string): Promise<{ fit: boolean; mode: "max" | "min" }> {
   try {
     const response = await fetch(`/api/model/${encodeURIComponent(model)}/fit`);
     if (!response.ok) {
       throw new Error(`Failed to fetch fit mode for ${model}: ${response.status}`);
     }
-    const data = (await response.json()) as { fit?: boolean };
-    return data.fit === true;
+    const data = (await response.json()) as { fit?: boolean; mode?: string };
+    const mode = data.mode === "min" ? "min" : "max";
+    return { fit: data.fit === true, mode };
   } catch (error) {
     console.error("Failed to fetch fit mode:", model, error);
-    return false;
+    return { fit: false, mode: "max" };
   }
 }
 
-export async function setModelFitMode(model: string, fit: boolean): Promise<void> {
+export async function setModelFitMode(model: string, fit: boolean, mode: "max" | "min" = "max"): Promise<void> {
   const response = await fetch(`/api/model/${encodeURIComponent(model)}/fit`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ fit }),
+    body: JSON.stringify({ fit, mode }),
   });
 
   if (!response.ok) {

@@ -4,9 +4,18 @@
   import ConnectionStatus from "./ConnectionStatus.svelte";
 
   function handleTitleChange(newTitle: string): void {
-    const sanitized = newTitle.replace(/\n/g, "").trim().substring(0, 64) || "TBG (O)Llama  Swap + Promt Optimizer";
+    const sanitized = newTitle.replace(/\n/g, "").trim().substring(0, 64) || "TBG (O) LlamA Swap";
     appTitle.set(sanitized);
   }
+
+  // Migrate older persisted titles to the new project name.
+  $effect(() => {
+    const current = ($appTitle || "").trim();
+    const lower = current.toLowerCase();
+    if (!current || lower.includes("llama-swap") || lower === "tbg (o)llama  swap + promt optimizer") {
+      appTitle.set("TBG (O) LlamA Swap");
+    }
+  });
 
   function handleKeyDown(e: KeyboardEvent): void {
     if (e.key === "Enter") {

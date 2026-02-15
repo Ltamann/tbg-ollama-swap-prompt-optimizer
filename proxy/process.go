@@ -85,6 +85,8 @@ type Process struct {
 	runtimeCtxSize atomic.Int64
 	// optional runtime fit-mode override used to set --fit/--fit-ctx before each start
 	runtimeFitMode atomic.Int32
+	// 0 = use --ctx-size as selected target, 1 = use --fit-ctx as minimum floor
+	runtimeFitCtxMode atomic.Int32
 }
 
 func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, processLogger *LogMonitor, proxyLogger *LogMonitor) *Process {
@@ -235,11 +237,12 @@ func (p *Process) start() error {
 
 	ctxSize := int(p.runtimeCtxSize.Load())
 	fitMode := p.runtimeFitMode.Load() == 1
+	fitCtxMode := int(p.runtimeFitCtxMode.Load())
 
 	if fitMode {
-		args = applyFitArgs(args, true, ctxSize)
+		args = applyFitArgs(args, true, ctxSize, fitCtxMode)
 	} else {
-		args = applyFitArgs(args, false, 0)
+		args = applyFitArgs(args, false, 0, 0)
 		if ctxSize > 0 {
 			args = applyCtxSizeArg(args, ctxSize)
 		}
@@ -400,6 +403,14 @@ func (p *Process) SetRuntimeFitMode(enabled bool) {
 	p.runtimeFitMode.Store(0)
 }
 
+func (p *Process) SetRuntimeFitCtxMode(useFitCtxMin bool) {
+	if useFitCtxMin {
+		p.runtimeFitCtxMode.Store(1)
+		return
+	}
+	p.runtimeFitCtxMode.Store(0)
+}
+
 func applyCtxSizeArg(args []string, ctxSize int) []string {
 	if len(args) == 0 || ctxSize <= 0 {
 		return args
@@ -429,7 +440,7 @@ func applyCtxSizeArg(args []string, ctxSize int) []string {
 	return append(updated, "--ctx-size", ctxValue)
 }
 
-func applyFitArgs(args []string, fitEnabled bool, fitCtx int) []string {
+func applyFitArgs(args []string, fitEnabled bool, fitCtx int, fitCtxMode int) []string {
 	if len(args) == 0 {
 		return args
 	}
@@ -458,8 +469,14 @@ func applyFitArgs(args []string, fitEnabled bool, fitCtx int) []string {
 			}
 			continue
 		}
+		if arg == "--fit-target" || strings.HasPrefix(arg, "--fit-target=") {
+			if arg == "--fit-target" && i+1 < len(args) {
+				i++
+			}
+			continue
+		}
 
-		// In fit mode, remove ctx-size and layer placement flags
+		// In fit mode, remove ctx-size, placement and batch tuning flags
 		if fitEnabled {
 			if arg == "--ctx-size" || arg == "-c" {
 				if i+1 < len(args) {
@@ -470,13 +487,52 @@ func applyFitArgs(args []string, fitEnabled bool, fitCtx int) []string {
 			if strings.HasPrefix(arg, "--ctx-size=") {
 				continue
 			}
-			if arg == "--n-gpu-layers" || arg == "--n-cpu-moe" {
+			if arg == "--n-gpu-layers" || arg == "--n-cpu-moe" || arg == "--cpu-moe" || arg == "-ngl" || arg == "-ncmoe" || arg == "-cmoe" {
 				if i+1 < len(args) {
 					i++
 				}
 				continue
 			}
-			if strings.HasPrefix(arg, "--n-gpu-layers=") || strings.HasPrefix(arg, "--n-cpu-moe=") {
+			if strings.HasPrefix(arg, "--n-gpu-layers=") || strings.HasPrefix(arg, "--n-cpu-moe=") || strings.HasPrefix(arg, "-ngl=") || strings.HasPrefix(arg, "-ncmoe=") {
+				continue
+			}
+			// --fit in llama.cpp aborts if tensor_split is user-provided.
+			if arg == "--tensor-split" || arg == "-ts" {
+				if i+1 < len(args) {
+					i++
+				}
+				continue
+			}
+			if strings.HasPrefix(arg, "--tensor-split=") || strings.HasPrefix(arg, "-ts=") {
+				continue
+			}
+			if arg == "--batch-size" || arg == "--ubatch-size" || arg == "-b" || arg == "-ub" {
+				if i+1 < len(args) {
+					i++
+				}
+				continue
+			}
+			if strings.HasPrefix(arg, "--batch-size=") || strings.HasPrefix(arg, "--ubatch-size=") || strings.HasPrefix(arg, "-b=") || strings.HasPrefix(arg, "-ub=") {
+				continue
+			}
+			// --fit cannot rebalance from a row split; clear explicit split/main-gpu hints.
+			if arg == "--split-mode" || arg == "-sm" || arg == "--main-gpu" || arg == "-mg" {
+				if i+1 < len(args) {
+					i++
+				}
+				continue
+			}
+			if strings.HasPrefix(arg, "--split-mode=") || strings.HasPrefix(arg, "-sm=") || strings.HasPrefix(arg, "--main-gpu=") || strings.HasPrefix(arg, "-mg=") {
+				continue
+			}
+			// --fit aborts if tensor buffer overrides are user-set.
+			if arg == "--override-tensor" || arg == "-ot" {
+				if i+1 < len(args) {
+					i++
+				}
+				continue
+			}
+			if strings.HasPrefix(arg, "--override-tensor=") || strings.HasPrefix(arg, "-ot=") {
 				continue
 			}
 		}
@@ -487,8 +543,13 @@ func applyFitArgs(args []string, fitEnabled bool, fitCtx int) []string {
 	if fitEnabled {
 		updated = append(updated, "--fit", "on")
 		if fitCtx > 0 {
-			updated = append(updated, "--fit-ctx", strconv.Itoa(fitCtx))
+			if fitCtxMode == 1 {
+				updated = append(updated, "--fit-ctx", strconv.Itoa(fitCtx))
+			} else {
+				updated = append(updated, "--ctx-size", strconv.Itoa(fitCtx))
+			}
 		}
+		updated = append(updated, "--fit-target", "256")
 	}
 
 	return updated

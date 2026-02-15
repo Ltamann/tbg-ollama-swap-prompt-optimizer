@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os/exec"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +28,7 @@ type Model struct {
 	CtxConfigured int    `json:"ctxConfigured,omitempty"`
 	CtxSource     string `json:"ctxSource,omitempty"`
 	FitEnabled    bool   `json:"fitEnabled,omitempty"`
+	FitCtxMode    string `json:"fitCtxMode,omitempty"`
 }
 
 func addApiHandlers(pm *ProxyManager) {
@@ -34,6 +37,7 @@ func addApiHandlers(pm *ProxyManager) {
 	apiGroup := pm.ginEngine.Group("/api", pm.apiKeyAuth())
 	{
 		apiGroup.POST("/models/unload", pm.apiUnloadAllModels)
+		apiGroup.POST("/models/kill-llama-cpp", pm.apiKillAllLlamaCpp)
 		apiGroup.POST("/models/unload/*model", pm.apiUnloadSingleModelHandler)
 		apiGroup.GET("/events", pm.apiSendEvents)
 		apiGroup.GET("/metrics", pm.apiGetMetrics)
@@ -56,6 +60,42 @@ func addApiHandlers(pm *ProxyManager) {
 func (pm *ProxyManager) apiUnloadAllModels(c *gin.Context) {
 	pm.StopProcesses(StopImmediately)
 	c.JSON(http.StatusOK, gin.H{"msg": "ok"})
+}
+
+func (pm *ProxyManager) apiKillAllLlamaCpp(c *gin.Context) {
+	// First stop all processes managed by llama-swap.
+	pm.StopProcesses(StopImmediately)
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		// Best effort for typical llama.cpp binary names on Windows.
+		cmd = exec.Command("taskkill", "/F", "/IM", "llama-server.exe", "/T")
+	default:
+		// Linux/macOS (including WSL): kill all llama-server processes.
+		cmd = exec.Command("pkill", "-9", "-f", "llama-server")
+	}
+
+	out, err := cmd.CombinedOutput()
+	outStr := strings.TrimSpace(string(out))
+
+	// If no process matched, treat as success.
+	if err != nil {
+		lower := strings.ToLower(outStr)
+		if strings.Contains(lower, "no process found") ||
+			strings.Contains(lower, "not found running instance") ||
+			strings.Contains(lower, "no running instance") {
+			c.JSON(http.StatusOK, gin.H{"msg": "ok", "detail": "no matching llama.cpp processes"})
+			return
+		}
+		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("failed to kill llama.cpp processes: %v (%s)", err, outStr))
+		return
+	}
+
+	if outStr == "" {
+		outStr = "llama.cpp processes killed"
+	}
+	c.JSON(http.StatusOK, gin.H{"msg": "ok", "detail": outStr})
 }
 
 func (pm *ProxyManager) getModelStatus() []Model {
@@ -96,13 +136,20 @@ func (pm *ProxyManager) getModelStatus() []Model {
 		}
 		modelCfg := pm.config.Models[modelID]
 		args, _ := (&modelCfg).SanitizedCommand()
-		configCtx, ctxSource, fitFromConfig := parseCtxAndFitFromArgs(args)
+		configCtx, ctxSource, fitFromConfig, fitCtxMode := parseCtxAndFitFromArgs(args)
 		pm.Lock()
 		runtimeFit, hasFitOverride := pm.fitModes[modelID]
+		runtimeFitCtxMode, hasFitCtxModeOverride := pm.fitCtxModes[modelID]
 		pm.Unlock()
 		fitEnabled := fitFromConfig
 		if hasFitOverride {
 			fitEnabled = runtimeFit
+		}
+		if hasFitCtxModeOverride {
+			fitCtxMode = runtimeFitCtxMode
+		}
+		if fitCtxMode == "" {
+			fitCtxMode = "max"
 		}
 
 		models = append(models, Model{
@@ -115,6 +162,7 @@ func (pm *ProxyManager) getModelStatus() []Model {
 			CtxConfigured: configCtx,
 			CtxSource:     ctxSource,
 			FitEnabled:    fitEnabled,
+			FitCtxMode:    fitCtxMode,
 		})
 	}
 
@@ -326,7 +374,8 @@ type SetCtxSizeRequest struct {
 }
 
 type SetFitModeRequest struct {
-	Fit bool `json:"fit"`
+	Fit  bool   `json:"fit"`
+	Mode string `json:"mode,omitempty"`
 }
 
 func (pm *ProxyManager) apiSetCtxSize(c *gin.Context) {
@@ -415,12 +464,21 @@ func (pm *ProxyManager) apiSetFitMode(c *gin.Context) {
 		pm.sendErrorResponse(c, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = "max"
+	}
+	if mode != "max" && mode != "min" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "fit mode must be one of: max, min")
+		return
+	}
 
 	pm.Lock()
 	pm.fitModes[modelName] = req.Fit
+	pm.fitCtxModes[modelName] = mode
 	pm.Unlock()
 
-	c.JSON(http.StatusOK, gin.H{"msg": "fit mode set successfully", "model": modelName, "fit": req.Fit})
+	c.JSON(http.StatusOK, gin.H{"msg": "fit mode set successfully", "model": modelName, "fit": req.Fit, "mode": mode})
 }
 
 func (pm *ProxyManager) apiGetFitMode(c *gin.Context) {
@@ -442,14 +500,18 @@ func (pm *ProxyManager) apiGetFitMode(c *gin.Context) {
 
 	pm.Lock()
 	fit, hasOverride := pm.fitModes[modelName]
+	mode, hasModeOverride := pm.fitCtxModes[modelName]
 	pm.Unlock()
 	if !hasOverride {
 		modelCfg := pm.config.Models[modelName]
 		args, _ := (&modelCfg).SanitizedCommand()
-		_, _, fit = parseCtxAndFitFromArgs(args)
+		_, _, fit, mode = parseCtxAndFitFromArgs(args)
+	}
+	if !hasModeOverride && mode == "" {
+		mode = "max"
 	}
 
-	c.JSON(http.StatusOK, gin.H{"model": modelName, "fit": fit})
+	c.JSON(http.StatusOK, gin.H{"model": modelName, "fit": fit, "mode": mode})
 }
 
 type SetPromptOptimizationRequest struct {

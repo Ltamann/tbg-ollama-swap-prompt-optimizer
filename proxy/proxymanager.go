@@ -60,6 +60,8 @@ type ProxyManager struct {
 	ctxSizes map[string]int
 	// runtime fit-mode per model (stored before loading)
 	fitModes map[string]bool
+	// fit ctx behavior per model: "max" -> --ctx-size, "min" -> --fit-ctx
+	fitCtxModes map[string]string
 
 	// runtime prompt optimization policy per model
 	promptPolicies map[string]PromptOptimizationPolicy
@@ -217,6 +219,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 		peerProxy:                 peerProxy,
 		ctxSizes:                  make(map[string]int),
 		fitModes:                  make(map[string]bool),
+		fitCtxModes:               make(map[string]string),
 		promptPolicies:            make(map[string]PromptOptimizationPolicy),
 		latestPromptOptimizations: make(map[string]PromptOptimizationSnapshot),
 		configPath:                "config.yaml",
@@ -505,16 +508,25 @@ func (pm *ProxyManager) swapProcessGroup(realModelName string) (*ProcessGroup, e
 		pm.Lock()
 		ctxSize := pm.ctxSizes[realModelName]
 		fitEnabled, fitOverride := pm.fitModes[realModelName]
+		fitCtxMode, fitCtxModeOverride := pm.fitCtxModes[realModelName]
 		pm.Unlock()
 
 		if !fitOverride {
 			if args, err := process.config.SanitizedCommand(); err == nil {
-				_, _, fitEnabled = parseCtxAndFitFromArgs(args)
+				_, _, parsedFitEnabled, parsedFitCtxMode := parseCtxAndFitFromArgs(args)
+				fitEnabled = parsedFitEnabled
+				if !fitCtxModeOverride {
+					fitCtxMode = parsedFitCtxMode
+				}
 			}
+		}
+		if fitCtxMode == "" {
+			fitCtxMode = "max"
 		}
 
 		process.SetRuntimeCtxSize(ctxSize)
 		process.SetRuntimeFitMode(fitEnabled)
+		process.SetRuntimeFitCtxMode(fitCtxMode == "min")
 	}
 
 	if processGroup.exclusive {
@@ -529,9 +541,10 @@ func (pm *ProxyManager) swapProcessGroup(realModelName string) (*ProcessGroup, e
 	return processGroup, nil
 }
 
-func parseCtxAndFitFromArgs(args []string) (ctxSize int, source string, fitEnabled bool) {
+func parseCtxAndFitFromArgs(args []string) (ctxSize int, source string, fitEnabled bool, fitCtxMode string) {
 	ctxFromCtxSize := 0
 	ctxFromFitCtx := 0
+	fitCtxMode = "max"
 
 	for i := 0; i < len(args); i++ {
 		arg := strings.TrimSpace(args[i])
@@ -578,15 +591,15 @@ func parseCtxAndFitFromArgs(args []string) (ctxSize int, source string, fitEnabl
 	}
 
 	if fitEnabled && ctxFromFitCtx > 0 {
-		return ctxFromFitCtx, "fit-ctx", true
+		return ctxFromFitCtx, "fit-ctx", true, "min"
 	}
 	if ctxFromCtxSize > 0 {
-		return ctxFromCtxSize, "ctx-size", fitEnabled
+		return ctxFromCtxSize, "ctx-size", fitEnabled, "max"
 	}
 	if ctxFromFitCtx > 0 {
-		return ctxFromFitCtx, "fit-ctx", fitEnabled
+		return ctxFromFitCtx, "fit-ctx", fitEnabled, "min"
 	}
-	return 0, "", fitEnabled
+	return 0, "", fitEnabled, fitCtxMode
 }
 
 func (pm *ProxyManager) listModelsHandler(c *gin.Context) {

@@ -4,7 +4,7 @@ import type { ScreenWidth } from "../lib/types";
 
 // Persistent stores
 export const isDarkMode = persistentStore<boolean>("theme", false);
-export const appTitle = persistentStore<string>("app-title", "TBG (O)Llama  Swap + Promt Optimizer");
+export const appTitle = persistentStore<string>("app-title", "TBG (O) LlamA Swap");
 
 // Non-persistent stores
 export const screenWidth = writable<ScreenWidth>("md");
