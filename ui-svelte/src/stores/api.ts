@@ -260,6 +260,32 @@ export interface PromptOptimizationSnapshot {
   optimizedBody: string;
 }
 
+export type RuntimeToolType = "http" | "mcp";
+export type RuntimeToolPolicy = "auto" | "always" | "never";
+export interface RuntimeTool {
+  id: string;
+  name: string;
+  type: RuntimeToolType;
+  endpoint: string;
+  enabled: boolean;
+  description?: string;
+  remoteName?: string;
+  policy?: RuntimeToolPolicy;
+  requireApproval?: boolean;
+  timeoutSeconds?: number;
+}
+
+export interface ToolRuntimeSettings {
+  enabled: boolean;
+  webSearchMode: "off" | "auto" | "force";
+  requireApprovalHeader: boolean;
+  approvalHeaderName: string;
+  blockNonLocalEndpoints: boolean;
+  maxToolRounds: number;
+  killPreviousOnSwap: boolean;
+  maxRunningModels: number;
+}
+
 export async function getPromptOptimizationPolicy(model: string): Promise<PromptOptimizationPolicy> {
   try {
     const response = await fetch(`/api/model/${encodeURIComponent(model)}/prompt-optimization`);
@@ -334,5 +360,66 @@ export async function getCapture(id: number): Promise<ReqRespCapture | null> {
   } catch (error) {
     console.error("Failed to fetch capture:", error);
     return null;
+  }
+}
+
+export async function listTools(): Promise<RuntimeTool[]> {
+  const response = await fetch("/api/tools");
+  if (!response.ok) {
+    throw new Error(`Failed to list tools: ${response.status}`);
+  }
+  return (await response.json()) as RuntimeTool[];
+}
+
+export async function getToolRuntimeSettings(): Promise<ToolRuntimeSettings> {
+  const response = await fetch("/api/tools/settings");
+  if (!response.ok) {
+    throw new Error(`Failed to get tool settings: ${response.status}`);
+  }
+  return (await response.json()) as ToolRuntimeSettings;
+}
+
+export async function setToolRuntimeSettings(settings: ToolRuntimeSettings): Promise<ToolRuntimeSettings> {
+  const response = await fetch("/api/tools/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to set tool settings: ${response.status}`);
+  }
+  return (await response.json()) as ToolRuntimeSettings;
+}
+
+export async function createTool(tool: Omit<RuntimeTool, "id"> & { id?: string }): Promise<RuntimeTool> {
+  const response = await fetch("/api/tools", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(tool),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to create tool: ${response.status}`);
+  }
+  return (await response.json()) as RuntimeTool;
+}
+
+export async function updateTool(tool: RuntimeTool): Promise<RuntimeTool> {
+  const response = await fetch(`/api/tools/${encodeURIComponent(tool.id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(tool),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to update tool: ${response.status}`);
+  }
+  return (await response.json()) as RuntimeTool;
+}
+
+export async function deleteTool(id: string): Promise<void> {
+  const response = await fetch(`/api/tools/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to delete tool: ${response.status}`);
   }
 }

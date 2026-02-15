@@ -390,6 +390,73 @@ Runtime notes:
 - `GET /api/model/:model/prompt-optimization`
 - `GET /api/model/:model/prompt-optimization/latest`
 
+## Tool Runtime (HTTP + MCP)
+
+This fork now includes a server-side tool runtime for OpenAI-style function-calling.
+
+Flow:
+
+1. Client sends `/v1/chat/completions`.
+2. TBG (O)llama Swap injects enabled tool schemas into the request.
+3. Model can emit `tool_calls` (or legacy `function_call`).
+4. TBG executes calls (HTTP tools first class, MCP tools supported).
+5. Tool outputs are appended as `role=tool` messages.
+6. Model is called again until final answer or max tool rounds is reached.
+
+Notes:
+
+- Tools are orchestrated by TBG (O)llama Swap (not by `llama.cpp` alone).
+- Works for clients that use OpenAI-compatible chat endpoints.
+- Streaming requests are finalized as a synthetic SSE completion chunk in this MVP.
+
+### Tool Types
+
+- `http` (example: `searxng_web_search`)
+- `mcp` (example: Playwright MCP endpoint)
+
+### Tool Policies
+
+Per tool:
+
+- `auto`: model decides when to call tool
+- `always`: force this tool as first choice
+- `never`: do not expose/execute this tool
+
+Global runtime settings:
+
+- `enabled`: turn entire tool runtime on/off
+- `webSearchMode`: `off | auto | force`
+- `maxToolRounds`: loop cap for tool-calling iterations
+- `killPreviousOnSwap`: stop previous ready llama.cpp model when swapping (default `true`)
+- `maxRunningModels`: cap simultaneous ready models (default `1`)
+- `requireApprovalHeader`: require explicit approval header on requests
+- `approvalHeaderName`: header key (default `X-LlamaSwap-Tool-Approval`)
+- `blockNonLocalEndpoints`: block non-local tool endpoints for safer defaults
+
+### Tool Security Model (MVP)
+
+- Local-only endpoint guard by default (`localhost`, loopback, `host.docker.internal`, `.local`).
+- Optional per-tool `requireApproval`.
+- Optional global approval header gate.
+- Per-tool timeout control.
+- Tool execution is audit-logged in proxy logs (name/type/duration/error status).
+
+### Tool API Endpoints
+
+- `GET /api/tools`
+- `POST /api/tools`
+- `PUT /api/tools/:id`
+- `DELETE /api/tools/:id`
+- `GET /api/tools/settings`
+- `PUT /api/tools/settings`
+
+Tool persistence:
+
+- Stored next to config in `tools.json`
+- Supports legacy array format and new structured format:
+  - `settings`
+  - `tools`
+
 ## Notes
 
 - This project focuses on practical local-model reliability for CLI agents with long repetitive prompts.

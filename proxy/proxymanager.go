@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"sort"
 	"strconv"
@@ -77,6 +78,8 @@ type ProxyManager struct {
 	ollamaClient      *http.Client
 	ollamaModels      map[string]OllamaModel
 	ollamaLastRefresh time.Time
+	tools             []RuntimeTool
+	toolSettings      ToolRuntimeSettings
 }
 
 type PromptOptimizationPolicy string
@@ -226,7 +229,10 @@ func New(proxyConfig config.Config) *ProxyManager {
 		ollamaEndpoint:            "http://127.0.0.1:11434",
 		ollamaClient:              &http.Client{Timeout: 20 * time.Second},
 		ollamaModels:              make(map[string]OllamaModel),
+		tools:                     make([]RuntimeTool, 0),
+		toolSettings:              defaultToolRuntimeSettings(),
 	}
+	pm.loadToolsFromDisk()
 
 	// create the process groups
 	for groupID := range proxyConfig.Groups {
@@ -537,8 +543,73 @@ func (pm *ProxyManager) swapProcessGroup(realModelName string) (*ProcessGroup, e
 			}
 		}
 	}
+	pm.enforceRuntimeProcessPolicy(realModelName)
 
 	return processGroup, nil
+}
+
+func (pm *ProxyManager) enforceRuntimeProcessPolicy(targetModel string) {
+	settings := pm.getToolRuntimeSettings()
+	type runningProc struct {
+		groupID string
+		modelID string
+	}
+	running := make([]runningProc, 0)
+	for groupID, group := range pm.processGroups {
+		for modelID, process := range group.processes {
+			if process == nil {
+				continue
+			}
+			if process.CurrentState() == StateReady {
+				running = append(running, runningProc{groupID: groupID, modelID: modelID})
+			}
+		}
+	}
+
+	killSet := map[string]struct{}{}
+	if settings.KillPreviousOnSwap {
+		for _, rp := range running {
+			if rp.modelID != targetModel {
+				killSet[rp.groupID+":"+rp.modelID] = struct{}{}
+			}
+		}
+	}
+
+	maxKeep := settings.MaxRunningModels
+	if maxKeep < 1 {
+		maxKeep = 1
+	}
+	keep := 1 // always keep target
+	for _, rp := range running {
+		if rp.modelID == targetModel {
+			continue
+		}
+		if _, forcedKill := killSet[rp.groupID+":"+rp.modelID]; forcedKill {
+			continue
+		}
+		if keep < maxKeep {
+			keep++
+			continue
+		}
+		killSet[rp.groupID+":"+rp.modelID] = struct{}{}
+	}
+
+	for key := range killSet {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		groupID, modelID := parts[0], parts[1]
+		group := pm.processGroups[groupID]
+		if group == nil {
+			continue
+		}
+		if err := group.StopProcess(modelID, StopImmediately); err != nil {
+			pm.proxyLogger.Warnf("runtime policy stop failed for %s: %v", modelID, err)
+			continue
+		}
+		pm.proxyLogger.Infof("runtime policy stopped previous model %s", modelID)
+	}
 }
 
 func parseCtxAndFitFromArgs(args []string) (ctxSize int, source string, fitEnabled bool, fitCtxMode string) {
@@ -913,6 +984,17 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 		return
 	}
 
+	if strings.HasPrefix(c.Request.URL.Path, "/v1/chat/completions") {
+		handled, err := pm.proxyWithToolsIfNeeded(c, modelID, nextHandler, bodyBytes)
+		if err != nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("tool execution failed: %s", err.Error()))
+			return
+		}
+		if handled {
+			return
+		}
+	}
+
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	// dechunk it as we already have all the body bytes see issue #11
@@ -939,6 +1021,241 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 			return
 		}
 	}
+}
+
+func (pm *ProxyManager) proxyWithToolsIfNeeded(
+	c *gin.Context,
+	modelID string,
+	nextHandler func(modelID string, w http.ResponseWriter, r *http.Request) error,
+	bodyBytes []byte,
+) (bool, error) {
+	if len(pm.getEnabledTools()) == 0 {
+		return false, nil
+	}
+	if !gjson.GetBytes(bodyBytes, "messages").IsArray() {
+		return false, nil
+	}
+
+	originalStream := gjson.GetBytes(bodyBytes, "stream").Bool()
+	working, err := sjson.SetBytes(bodyBytes, "stream", false)
+	if err != nil {
+		return false, err
+	}
+	working, err = pm.injectToolSchemas(working)
+	if err != nil {
+		return false, err
+	}
+
+	maxIterations := pm.getToolRuntimeSettings().MaxToolRounds
+	finalBody, statusCode, err := pm.runToolLoop(modelID, nextHandler, c.Request, working, maxIterations)
+	if err != nil {
+		return false, err
+	}
+
+	if !originalStream {
+		c.Data(statusCode, "application/json", finalBody)
+		return true, nil
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	content := gjson.GetBytes(finalBody, "choices.0.message.content").String()
+	reasoning := gjson.GetBytes(finalBody, "choices.0.message.reasoning_content").String()
+	chunk := map[string]any{
+		"id":      fmt.Sprintf("chatcmpl-tools-%d", time.Now().UnixNano()),
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   modelID,
+		"choices": []map[string]any{
+			{
+				"index": 0,
+				"delta": map[string]any{
+					"role":              "assistant",
+					"content":           content,
+					"reasoning_content": reasoning,
+				},
+				"finish_reason": "stop",
+			},
+		},
+	}
+	data, _ := json.Marshal(chunk)
+	_, _ = c.Writer.Write([]byte("data: " + string(data) + "\n\n"))
+	_, _ = c.Writer.Write([]byte("data: [DONE]\n\n"))
+	c.Writer.Flush()
+	return true, nil
+}
+
+func (pm *ProxyManager) injectToolSchemas(body []byte) ([]byte, error) {
+	schemas := pm.toolSchemas()
+	if len(schemas) == 0 {
+		return body, nil
+	}
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, err
+	}
+
+	existing, _ := req["tools"].([]any)
+	existingNames := map[string]struct{}{}
+	for _, t := range existing {
+		m, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, _ := m["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if strings.TrimSpace(name) != "" {
+			existingNames[name] = struct{}{}
+		}
+	}
+
+	merged := append([]any{}, existing...)
+	for _, s := range schemas {
+		fn, _ := s["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if _, found := existingNames[name]; found {
+			continue
+		}
+		merged = append(merged, s)
+	}
+	req["tools"] = merged
+	if _, hasChoice := req["tool_choice"]; !hasChoice {
+		if forced := pm.forcedToolName(body); strings.TrimSpace(forced) != "" {
+			req["tool_choice"] = map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name": forced,
+				},
+			}
+		}
+	}
+	req["stream"] = false
+	return json.Marshal(req)
+}
+
+func (pm *ProxyManager) invokeInferenceOnce(
+	modelID string,
+	nextHandler func(modelID string, w http.ResponseWriter, r *http.Request) error,
+	orig *http.Request,
+	body []byte,
+) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(orig.Context(), orig.Method, orig.URL.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header = orig.Header.Clone()
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	req.Header.Del("Transfer-Encoding")
+	req.ContentLength = int64(len(body))
+
+	rr := httptest.NewRecorder()
+	if err := nextHandler(modelID, rr, req); err != nil {
+		return nil, 0, err
+	}
+	status := rr.Code
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return rr.Body.Bytes(), status, nil
+}
+
+func (pm *ProxyManager) runToolLoop(
+	modelID string,
+	nextHandler func(modelID string, w http.ResponseWriter, r *http.Request) error,
+	orig *http.Request,
+	initialBody []byte,
+	maxIterations int,
+) ([]byte, int, error) {
+	working := initialBody
+	finalBody := initialBody
+	finalStatus := http.StatusOK
+
+	for i := 0; i < maxIterations; i++ {
+		respBody, statusCode, err := pm.invokeInferenceOnce(modelID, nextHandler, orig, working)
+		if err != nil {
+			return nil, 0, err
+		}
+		finalBody = respBody
+		finalStatus = statusCode
+		if statusCode < 200 || statusCode >= 300 {
+			return finalBody, finalStatus, nil
+		}
+
+		toolCalls := gjson.GetBytes(respBody, "choices.0.message.tool_calls")
+		hasToolCalls := toolCalls.IsArray() && len(toolCalls.Array()) > 0
+		functionCall := gjson.GetBytes(respBody, "choices.0.message.function_call")
+		hasFunctionCall := functionCall.Exists() && strings.TrimSpace(functionCall.Get("name").String()) != ""
+		if !hasToolCalls && !hasFunctionCall {
+			return finalBody, finalStatus, nil
+		}
+
+		var reqMap map[string]any
+		if err := json.Unmarshal(working, &reqMap); err != nil {
+			return nil, 0, err
+		}
+		rawMessages, _ := reqMap["messages"].([]any)
+
+		var assistantMsg map[string]any
+		if err := json.Unmarshal([]byte(gjson.GetBytes(respBody, "choices.0.message").Raw), &assistantMsg); err == nil {
+			rawMessages = append(rawMessages, assistantMsg)
+		}
+
+		if hasToolCalls {
+			toolCalls.ForEach(func(_, tc gjson.Result) bool {
+				callID := strings.TrimSpace(tc.Get("id").String())
+				toolName := strings.TrimSpace(tc.Get("function.name").String())
+				argText := tc.Get("function.arguments").String()
+				args := map[string]any{}
+				if strings.TrimSpace(argText) != "" {
+					_ = json.Unmarshal([]byte(argText), &args)
+				}
+				out, execErr := pm.executeToolCall(toolName, args, orig.Header)
+				if execErr != nil {
+					out = fmt.Sprintf("tool error: %v", execErr)
+				}
+				rawMessages = append(rawMessages, map[string]any{
+					"role":         "tool",
+					"tool_call_id": callID,
+					"name":         toolName,
+					"content":      out,
+				})
+				return true
+			})
+		} else {
+			toolName := strings.TrimSpace(functionCall.Get("name").String())
+			argText := functionCall.Get("arguments").String()
+			args := map[string]any{}
+			if strings.TrimSpace(argText) != "" {
+				_ = json.Unmarshal([]byte(argText), &args)
+			}
+			out, execErr := pm.executeToolCall(toolName, args, orig.Header)
+			if execErr != nil {
+				out = fmt.Sprintf("tool error: %v", execErr)
+			}
+			rawMessages = append(rawMessages, map[string]any{
+				"role":    "tool",
+				"name":    toolName,
+				"content": out,
+			})
+		}
+
+		reqMap["messages"] = rawMessages
+		reqMap["stream"] = false
+		// After executing at least one tool call, force the next pass to produce
+		// a final assistant answer instead of repeatedly calling tools.
+		reqMap["tool_choice"] = "none"
+		nextBody, err := json.Marshal(reqMap)
+		if err != nil {
+			return nil, 0, err
+		}
+		working = nextBody
+	}
+
+	return finalBody, finalStatus, nil
 }
 
 func (pm *ProxyManager) applyPromptSizeControl(modelID string, bodyBytes []byte) ([]byte, PromptOptimizationResult, error) {
@@ -1207,8 +1524,9 @@ func (pm *ProxyManager) optimizeMessagesWithLLM(modelConfig config.ModelConfig, 
 
 func (pm *ProxyManager) SetConfigPath(configPath string) {
 	pm.Lock()
-	defer pm.Unlock()
 	pm.configPath = strings.TrimSpace(configPath)
+	pm.Unlock()
+	pm.loadToolsFromDisk()
 }
 
 func (pm *ProxyManager) proxyOAIPostFormHandler(c *gin.Context) {

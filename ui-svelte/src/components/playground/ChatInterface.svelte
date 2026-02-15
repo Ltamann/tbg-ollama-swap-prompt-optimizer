@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { get } from "svelte/store";
-  import { models } from "../../stores/api";
+  import { models, listTools, getToolRuntimeSettings } from "../../stores/api";
   import { persistentStore } from "../../stores/persistent";
   import {
     chatMessagesStore,
@@ -40,6 +41,7 @@
   let attachedImages = $state<string[]>([]);
   let fileInput = $state<HTMLInputElement | null>(null);
   let imageError = $state<string | null>(null);
+  let toolStatusText = $state("");
 
   let hasModels = $derived($models.some((m) => !m.unlisted));
   let selectableModels = $derived(
@@ -52,6 +54,26 @@
       return model.tempConfigured;
     }
     return 0.8;
+  }
+
+  onMount(() => {
+    void refreshToolStatus();
+  });
+
+  async function refreshToolStatus(): Promise<void> {
+    try {
+      const [settings, tools] = await Promise.all([getToolRuntimeSettings(), listTools()]);
+      if (!settings.enabled) {
+        toolStatusText = "Tools: Off";
+        return;
+      }
+      const enabledTools = tools.filter((t) => t.enabled && (t.policy || "auto") !== "never");
+      const names = enabledTools.slice(0, 3).map((t) => t.name);
+      const suffix = enabledTools.length > 3 ? ` +${enabledTools.length - 3}` : "";
+      toolStatusText = `Tools: ${enabledTools.length === 0 ? "none" : names.join(", ")}${suffix} | mode=${settings.webSearchMode}`;
+    } catch {
+      toolStatusText = "Tools: status unavailable";
+    }
   }
 
   function configuredTopPForModel(modelID: string): number {
@@ -343,6 +365,7 @@
         </button>
       </div>
     </div>
+    <div class="text-xs text-txtsecondary mb-2">{toolStatusText}</div>
 
     <!-- Settings panel -->
     {#if showSettings}

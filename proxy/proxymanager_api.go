@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/mostlygeek/llama-swap/event"
@@ -45,6 +46,12 @@ func addApiHandlers(pm *ProxyManager) {
 		apiGroup.POST("/models/unload", pm.apiUnloadAllModels)
 		apiGroup.POST("/models/kill-llama-cpp", pm.apiKillAllLlamaCpp)
 		apiGroup.POST("/models/unload/*model", pm.apiUnloadSingleModelHandler)
+		apiGroup.GET("/tools", pm.apiListTools)
+		apiGroup.POST("/tools", pm.apiCreateTool)
+		apiGroup.PUT("/tools/:id", pm.apiUpdateTool)
+		apiGroup.DELETE("/tools/:id", pm.apiDeleteTool)
+		apiGroup.GET("/tools/settings", pm.apiGetToolSettings)
+		apiGroup.PUT("/tools/settings", pm.apiSetToolSettings)
 		apiGroup.GET("/events", pm.apiSendEvents)
 		apiGroup.GET("/metrics", pm.apiGetMetrics)
 		apiGroup.GET("/version", pm.apiGetVersion)
@@ -495,6 +502,158 @@ func (pm *ProxyManager) apiGetCapture(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, capture)
+}
+
+func (pm *ProxyManager) apiListTools(c *gin.Context) {
+	pm.Lock()
+	defer pm.Unlock()
+	tools := append([]RuntimeTool(nil), pm.tools...)
+	for i := range tools {
+		tools[i] = normalizeRuntimeTool(tools[i])
+	}
+	c.JSON(http.StatusOK, tools)
+}
+
+func (pm *ProxyManager) apiGetToolSettings(c *gin.Context) {
+	settings := pm.getToolRuntimeSettings()
+	c.JSON(http.StatusOK, settings)
+}
+
+func (pm *ProxyManager) apiSetToolSettings(c *gin.Context) {
+	var req ToolRuntimeSettings
+	if err := c.ShouldBindJSON(&req); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	req = normalizeToolRuntimeSettings(req)
+	pm.Lock()
+	pm.toolSettings = req
+	pm.Unlock()
+	if err := pm.saveToolsToDisk(); err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, "failed to save tools: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, req)
+}
+
+func (pm *ProxyManager) apiCreateTool(c *gin.Context) {
+	var req RuntimeTool
+	if err := c.ShouldBindJSON(&req); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	if req.ID == "" {
+		req.ID = fmt.Sprintf("tool_%d", time.Now().UnixNano())
+	}
+	req = normalizeRuntimeTool(req)
+	if req.Name == "" || req.Endpoint == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "name and endpoint are required")
+		return
+	}
+	if req.Type != RuntimeToolHTTP && req.Type != RuntimeToolMCP {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "type must be http or mcp")
+		return
+	}
+	settings := pm.getToolRuntimeSettings()
+	if err := validateToolEndpoint(req.Endpoint, settings); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	pm.Lock()
+	for _, t := range pm.tools {
+		if t.ID == req.ID {
+			pm.Unlock()
+			pm.sendErrorResponse(c, http.StatusBadRequest, "tool id already exists")
+			return
+		}
+	}
+	pm.tools = append(pm.tools, req)
+	pm.Unlock()
+
+	if err := pm.saveToolsToDisk(); err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, "failed to save tools: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, req)
+}
+
+func (pm *ProxyManager) apiUpdateTool(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "id required")
+		return
+	}
+	var req RuntimeTool
+	if err := c.ShouldBindJSON(&req); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	req.ID = id
+	req = normalizeRuntimeTool(req)
+	if req.Name == "" || req.Endpoint == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "name and endpoint are required")
+		return
+	}
+	if req.Type != RuntimeToolHTTP && req.Type != RuntimeToolMCP {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "type must be http or mcp")
+		return
+	}
+	settings := pm.getToolRuntimeSettings()
+	if err := validateToolEndpoint(req.Endpoint, settings); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	pm.Lock()
+	updated := false
+	for i, t := range pm.tools {
+		if t.ID == id {
+			pm.tools[i] = req
+			updated = true
+			break
+		}
+	}
+	pm.Unlock()
+	if !updated {
+		pm.sendErrorResponse(c, http.StatusNotFound, "tool not found")
+		return
+	}
+	if err := pm.saveToolsToDisk(); err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, "failed to save tools: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, req)
+}
+
+func (pm *ProxyManager) apiDeleteTool(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "id required")
+		return
+	}
+	pm.Lock()
+	next := make([]RuntimeTool, 0, len(pm.tools))
+	found := false
+	for _, t := range pm.tools {
+		if t.ID == id {
+			found = true
+			continue
+		}
+		next = append(next, t)
+	}
+	pm.tools = next
+	pm.Unlock()
+	if !found {
+		pm.sendErrorResponse(c, http.StatusNotFound, "tool not found")
+		return
+	}
+	if err := pm.saveToolsToDisk(); err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, "failed to save tools: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"msg": "ok"})
 }
 
 type SetCtxSizeRequest struct {
