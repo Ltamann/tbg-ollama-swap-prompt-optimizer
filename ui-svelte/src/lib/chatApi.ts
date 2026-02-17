@@ -4,6 +4,20 @@ export interface StreamChunk {
   content: string;
   reasoning_content?: string;
   sources?: ChatSource[];
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+  };
+  timings?: {
+    prompt_n?: number;
+    predicted_n?: number;
+    prompt_per_second?: number;
+    predicted_per_second?: number;
+    prompt_ms?: number;
+    predicted_ms?: number;
+  };
   done: boolean;
 }
 
@@ -54,9 +68,11 @@ function parseSSELine(line: string): StreamChunk | null {
     const content = delta?.content || "";
     const reasoning_content = delta?.reasoning_content || "";
     const sources = (delta?.sources || parsed.choices?.[0]?.message?.sources || []) as ChatSource[];
+    const usage = parsed?.usage;
+    const timings = parsed?.timings;
 
-    if (content || reasoning_content || (Array.isArray(sources) && sources.length > 0)) {
-      return { content, reasoning_content, sources, done: false };
+    if (content || reasoning_content || (Array.isArray(sources) && sources.length > 0) || usage || timings) {
+      return { content, reasoning_content, sources, usage, timings, done: false };
     }
     return null;
   } catch {

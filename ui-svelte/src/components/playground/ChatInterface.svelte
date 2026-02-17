@@ -709,6 +709,11 @@
           content={message.content}
           reasoning_content={message.reasoning_content}
           reasoningTimeMs={message.reasoningTimeMs}
+          promptTokens={message.promptTokens}
+          promptTokensPerSecond={message.promptTokensPerSecond}
+          generationTokens={message.generationTokens}
+          generationTokensPerSecond={message.generationTokensPerSecond}
+          totalDurationMs={message.totalDurationMs}
           sources={message.sources}
           isStreaming={$chatIsStreamingStore && idx === $chatMessagesStore.length - 1 && message.role === "assistant"}
           isReasoning={$chatIsReasoningStore && idx === $chatMessagesStore.length - 1 && message.role === "assistant"}

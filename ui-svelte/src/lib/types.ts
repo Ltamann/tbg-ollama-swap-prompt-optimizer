@@ -102,6 +102,11 @@ export interface ChatMessage {
   reasoning_content?: string;
   reasoningTimeMs?: number;
   sources?: ChatSource[];
+  promptTokens?: number;
+  promptTokensPerSecond?: number;
+  generationTokens?: number;
+  generationTokensPerSecond?: number;
+  totalDurationMs?: number;
 }
 
 export function getTextContent(content: string | ContentPart[]): string {

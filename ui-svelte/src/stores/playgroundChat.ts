@@ -2,6 +2,8 @@ import { get, writable } from "svelte/store";
 import type { ChatMessage, ContentPart, ChatSource } from "../lib/types";
 import { ChatAPIError, streamChatCompletion, type ChatRequestHeaders } from "../lib/chatApi";
 import { persistentStore } from "./persistent";
+import { contextSize } from "./theme";
+import { models, getModelCtxSize as fetchModelCtxSize, getLatestPromptOptimization } from "./api";
 
 export const chatMessagesStore = persistentStore<ChatMessage[]>("playground-chat-messages", []);
 export const chatIsStreamingStore = writable(false);
@@ -46,6 +48,14 @@ export interface UploadedAttachment {
 
 let reasoningStartTime = 0;
 let abortController: AbortController | null = null;
+let generationStartTime = 0;
+let liveGenerationTokens = 0;
+
+function estimateStreamTokens(chunkText: string): number {
+  if (!chunkText || !chunkText.trim()) return 0;
+  // Streaming chunks are typically token-like fragments, so count one per chunk.
+  return 1;
+}
 
 function mergeSources(existing: ChatSource[] | undefined, incoming: ChatSource[] | undefined): ChatSource[] | undefined {
   if (!incoming || incoming.length === 0) {
@@ -92,6 +102,109 @@ function applyReasoningFallbackIfNeeded(): void {
   }
 }
 
+function estimateContextTokensFromMessages(messages: ChatMessage[]): number {
+  let text = "";
+  for (const message of messages) {
+    const content = message.content;
+    if (typeof content === "string") {
+      text += content;
+      continue;
+    }
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part.type === "text" && typeof part.text === "string") {
+          text += part.text;
+        }
+      }
+    }
+  }
+  return Math.max(0, Math.round(text.length / 4));
+}
+
+function getModelCtxSize(modelId: string): number {
+  const match = get(models).find((m) => m.id === modelId);
+  return match?.ctxConfigured || match?.ctxReference || 0;
+}
+
+function estimateContextTokensFromRawBody(rawBody: string): number {
+  const fallback = Math.max(0, Math.round((rawBody || "").length / 4));
+  if (!rawBody || !rawBody.trim()) {
+    return 0;
+  }
+
+  try {
+    const parsed = JSON.parse(rawBody) as { messages?: Array<{ content?: string | Array<{ type?: string; text?: string }> }> };
+    let text = "";
+    const messages = Array.isArray(parsed?.messages) ? parsed.messages : [];
+    for (const message of messages) {
+      const content = message?.content;
+      if (typeof content === "string") {
+        text += content;
+        continue;
+      }
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part?.type === "text" && typeof part?.text === "string") {
+            text += part.text;
+          }
+        }
+      }
+    }
+    if (text.length > 0) {
+      return Math.max(0, Math.round(text.length / 4));
+    }
+  } catch {
+    // Keep fallback for non-JSON payloads.
+  }
+
+  return fallback;
+}
+
+async function ensureModelCtx(modelId: string): Promise<number> {
+  const fromStore = getModelCtxSize(modelId);
+  if (fromStore > 0) {
+    return fromStore;
+  }
+  const fromApi = await fetchModelCtxSize(modelId);
+  if (fromApi > 0) {
+    contextSize.update((current) =>
+      current.modelId === modelId
+        ? { ...current, modelCtx: fromApi }
+        : current
+    );
+  }
+  return fromApi;
+}
+
+async function syncPromptOptimizationSnapshot(
+  modelId: string,
+  requestStartedAt: number,
+  fallbackInputCtx: number
+): Promise<boolean> {
+  const snapshot = await getLatestPromptOptimization(modelId);
+  if (!snapshot) {
+    return false;
+  }
+  const updatedAt = Date.parse(snapshot.updatedAt || "");
+  if (Number.isFinite(updatedAt) && updatedAt + 500 < requestStartedAt) {
+    return false;
+  }
+
+  const inputCtx = estimateContextTokensFromRawBody(snapshot.originalBody);
+  const optimizedCtx = estimateContextTokensFromRawBody(snapshot.optimizedBody);
+  contextSize.update((current) => {
+    if (current.modelId !== modelId) {
+      return current;
+    }
+    return {
+      ...current,
+      inputCtx: inputCtx > 0 ? inputCtx : fallbackInputCtx,
+      optimizedCtx: optimizedCtx > 0 ? optimizedCtx : current.optimizedCtx,
+    };
+  });
+  return optimizedCtx > 0;
+}
+
 export function cancelChatStreaming(): void {
   abortController?.abort();
 }
@@ -101,8 +214,15 @@ export function newChatSession(): void {
     cancelChatStreaming();
   }
   chatMessagesStore.set([]);
+  contextSize.update((current) => ({
+    ...current,
+    inputCtx: 0,
+    optimizedCtx: 0,
+  }));
   chatIsReasoningStore.set(false);
   reasoningStartTime = 0;
+  generationStartTime = 0;
+  liveGenerationTokens = 0;
 }
 
 export async function regenerateFromIndex(
@@ -116,15 +236,19 @@ export async function regenerateFromIndex(
 
   const current = get(chatMessagesStore);
   let messages = current.slice(0, idx + 1);
-  messages = [...messages, { role: "assistant", content: "" }];
+  messages = [...messages, { role: "assistant", content: "", generationTokens: 0, generationTokensPerSecond: 0 }];
   chatMessagesStore.set(messages);
 
   chatIsStreamingStore.set(true);
   chatIsReasoningStore.set(false);
   reasoningStartTime = 0;
+  generationStartTime = 0;
+  liveGenerationTokens = 0;
   abortController = new AbortController();
 
   try {
+    const requestStartedAt = Date.now();
+    let lastSnapshotSyncAt = 0;
     const apiMessages: ChatMessage[] = [];
     if (systemPrompt.trim()) {
       apiMessages.push({ role: "system", content: systemPrompt.trim() });
@@ -135,6 +259,20 @@ export async function regenerateFromIndex(
       interactiveApproval: requestHeaders?.interactiveApproval ?? false,
       approval: requestHeaders?.approval ?? false,
       approvalHeaderName: requestHeaders?.approvalHeaderName,
+    });
+    const estimatedInputCtx = estimateContextTokensFromMessages(apiMessages);
+    const modelCtx = getModelCtxSize(model);
+    contextSize.set({
+      modelId: model,
+      modelCtx,
+      inputCtx: estimatedInputCtx,
+      optimizedCtx: 0,
+    });
+    void ensureModelCtx(model);
+    void syncPromptOptimizationSnapshot(model, requestStartedAt, estimatedInputCtx).then((hasOptimized) => {
+      if (hasOptimized) {
+        lastSnapshotSyncAt = Date.now();
+      }
     });
 
     for await (const chunk of stream) {
@@ -159,9 +297,19 @@ export async function regenerateFromIndex(
           updateLastAssistant((msg) => ({ ...msg, reasoningTimeMs }));
         }
 
+        if (generationStartTime === 0) {
+          generationStartTime = Date.now();
+        }
+        liveGenerationTokens += estimateStreamTokens(chunk.content);
+        const liveElapsedMs = Math.max(1, Date.now() - generationStartTime);
+        const liveGenerationTokensPerSecond = liveGenerationTokens / (liveElapsedMs / 1000);
+
         updateLastAssistant((msg) => ({
           ...msg,
           content: (typeof msg.content === "string" ? msg.content : "") + chunk.content,
+          generationTokens: liveGenerationTokens,
+          generationTokensPerSecond: liveGenerationTokensPerSecond,
+          totalDurationMs: liveElapsedMs,
         }));
       }
       if (chunk.sources && chunk.sources.length > 0) {
@@ -170,7 +318,47 @@ export async function regenerateFromIndex(
           sources: mergeSources(msg.sources, chunk.sources),
         }));
       }
+      if (chunk.usage || chunk.timings) {
+        const promptTokens =
+          chunk.timings?.prompt_n ??
+          chunk.usage?.prompt_tokens ??
+          chunk.usage?.input_tokens ??
+          0;
+        const outputTokens =
+          chunk.timings?.predicted_n ??
+          chunk.usage?.completion_tokens ??
+          chunk.usage?.output_tokens ??
+          liveGenerationTokens;
+        const promptTokensPerSecond = chunk.timings?.prompt_per_second ?? 0;
+        const generationTokensPerSecond = chunk.timings?.predicted_per_second ?? 0;
+        const totalDurationMs = Math.round((chunk.timings?.prompt_ms ?? 0) + (chunk.timings?.predicted_ms ?? 0));
+
+        updateLastAssistant((msg) => ({
+          ...msg,
+          promptTokens: promptTokens > 0 ? promptTokens : msg.promptTokens,
+          promptTokensPerSecond: promptTokensPerSecond > 0 ? promptTokensPerSecond : msg.promptTokensPerSecond,
+          generationTokens: outputTokens > 0 ? outputTokens : (msg.generationTokens ?? 0),
+          generationTokensPerSecond: generationTokensPerSecond > 0 ? generationTokensPerSecond : (msg.generationTokensPerSecond ?? 0),
+          totalDurationMs: totalDurationMs > 0 ? totalDurationMs : msg.totalDurationMs,
+        }));
+
+        if (promptTokens > 0) {
+          contextSize.update((current) => ({
+            modelId: model,
+            modelCtx: current.modelId === model && current.modelCtx > 0 ? current.modelCtx : modelCtx,
+            inputCtx: current.modelId === model ? current.inputCtx : estimatedInputCtx,
+            optimizedCtx: promptTokens,
+          }));
+        } else {
+          const now = Date.now();
+          if (now - lastSnapshotSyncAt > 300) {
+            lastSnapshotSyncAt = now;
+            void syncPromptOptimizationSnapshot(model, requestStartedAt, estimatedInputCtx);
+          }
+        }
+      }
     }
+    void syncPromptOptimizationSnapshot(model, requestStartedAt, estimatedInputCtx);
     applyReasoningFallbackIfNeeded();
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
@@ -204,6 +392,8 @@ export async function regenerateFromIndex(
   } finally {
     chatIsStreamingStore.set(false);
     chatIsReasoningStore.set(false);
+    generationStartTime = 0;
+    liveGenerationTokens = 0;
     abortController = null;
   }
 }

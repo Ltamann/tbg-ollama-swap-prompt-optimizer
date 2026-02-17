@@ -937,6 +937,21 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	var nextHandler func(modelID string, w http.ResponseWriter, r *http.Request) error
 
 	modelID, found := pm.config.RealModelName(requestedModel)
+	if !found && pm.compatibilityMode() != "strict_openai" {
+		trimmedModel := strings.TrimSpace(requestedModel)
+		if strings.EqualFold(trimmedModel, "localhost") {
+			if fallbackModel, ok := pm.resolveResponsesFallbackModel(); ok && fallbackModel != "" && fallbackModel != requestedModel {
+				bodyBytes, err = sjson.SetBytes(bodyBytes, "model", fallbackModel)
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting fallback model in JSON: %s", err.Error()))
+					return
+				}
+				pm.proxyLogger.Warnf("Model placeholder '%s' mapped to '%s'", requestedModel, fallbackModel)
+				requestedModel = fallbackModel
+				modelID, found = pm.config.RealModelName(requestedModel)
+			}
+		}
+	}
 	if !found && isResponsesEndpoint {
 		peerHasModel := false
 		if pm.peerProxy != nil {

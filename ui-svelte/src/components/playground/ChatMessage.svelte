@@ -11,6 +11,11 @@
     sources?: ChatSource[];
     reasoning_content?: string;
     reasoningTimeMs?: number;
+    promptTokens?: number;
+    promptTokensPerSecond?: number;
+    generationTokens?: number;
+    generationTokensPerSecond?: number;
+    totalDurationMs?: number;
     isStreaming?: boolean;
     isReasoning?: boolean;
     onEdit?: (newContent: string) => void;
@@ -18,7 +23,23 @@
     onRegenerate?: () => void;
   }
 
-  let { role, content, sources = [], reasoning_content = "", reasoningTimeMs = 0, isStreaming = false, isReasoning = false, onEdit, onDelete, onRegenerate }: Props = $props();
+  let {
+    role,
+    content,
+    sources = [],
+    reasoning_content = "",
+    reasoningTimeMs = 0,
+    promptTokens = 0,
+    promptTokensPerSecond = 0,
+    generationTokens = 0,
+    generationTokensPerSecond = 0,
+    totalDurationMs = 0,
+    isStreaming = false,
+    isReasoning = false,
+    onEdit,
+    onDelete,
+    onRegenerate,
+  }: Props = $props();
 
   let textContent = $derived(getTextContent(content));
   let imageUrls = $derived(getImageUrls(content));
@@ -46,6 +67,13 @@
       return `${ms.toFixed(0)}ms`;
     }
     return `${(ms / 1000).toFixed(1)}s`;
+  }
+
+  function formatSpeed(tokensPerSecond: number): string {
+    if (!Number.isFinite(tokensPerSecond) || tokensPerSecond <= 0) {
+      return "0.0";
+    }
+    return tokensPerSecond >= 100 ? tokensPerSecond.toFixed(0) : tokensPerSecond.toFixed(1);
   }
 
   async function copyToClipboard() {
@@ -221,6 +249,22 @@
           {@html renderedContent}
           {#if isStreaming && !isReasoning}
             <span class="inline-block w-2 h-4 bg-current animate-pulse ml-0.5"></span>
+          {/if}
+        </div>
+      {/if}
+      {#if generationTokens > 0 || promptTokens > 0 || isStreaming}
+        <div class="mt-2 text-[11px] font-mono text-txtsecondary">
+          {#if promptTokens > 0}
+            <span>prompt {promptTokens} tok @ {formatSpeed(promptTokensPerSecond)} tok/s</span>
+            <span class="mx-1">|</span>
+          {/if}
+          <span>gen {Math.max(0, generationTokens)} tok @ {formatSpeed(generationTokensPerSecond)} tok/s</span>
+          {#if totalDurationMs > 0}
+            <span class="mx-1">|</span>
+            <span>{formatDuration(totalDurationMs)}</span>
+          {/if}
+          {#if isStreaming}
+            <span class="ml-2">live</span>
           {/if}
         </div>
       {/if}
