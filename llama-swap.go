@@ -14,9 +14,9 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
-	"github.com/mostlygeek/llama-swap/proxy"
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 )
 
 var (
@@ -219,3 +219,4 @@ func debounce(interval time.Duration, f func()) func() {
 		timer = time.AfterFunc(interval, f)
 	}
 }
+

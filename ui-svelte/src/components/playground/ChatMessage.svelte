@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import { renderMarkdown, escapeHtml } from "../../lib/markdown";
-  import { Copy, Check, Pencil, X, Save, RefreshCw, ChevronDown, ChevronRight, Brain, Code, Trash2 } from "lucide-svelte";
+  import { Copy, Check, Pencil, X, Save, RefreshCw, ChevronDown, ChevronRight, Brain, Code, Trash2, Globe } from "lucide-svelte";
   import { getTextContent, getImageUrls } from "../../lib/types";
   import type { ContentPart, ChatSource } from "../../lib/types";
 
@@ -37,6 +38,8 @@
   let editContent = $state("");
   let showReasoning = $state(false);
   let modalImageUrl = $state<string | null>(null);
+  let showSourcesPopup = $state(false);
+  let sourcesPopupEl = $state<HTMLDivElement | null>(null);
 
   function formatDuration(ms: number): string {
     if (ms < 1000) {
@@ -114,6 +117,29 @@
     }
   }
 
+  function toggleSourcesPopup() {
+    showSourcesPopup = !showSourcesPopup;
+  }
+
+  function onDocumentClick(event: MouseEvent) {
+    if (!showSourcesPopup) return;
+    const target = event.target as Node | null;
+    if (!target) return;
+    if (sourcesPopupEl && !sourcesPopupEl.contains(target)) {
+      showSourcesPopup = false;
+    }
+  }
+
+  if (typeof document !== "undefined") {
+    document.addEventListener("click", onDocumentClick);
+  }
+
+  onDestroy(() => {
+    if (typeof document !== "undefined") {
+      document.removeEventListener("click", onDocumentClick);
+    }
+  });
+
   function sourceLabel(source: ChatSource): string {
     return source.title || source.domain || source.url;
   }
@@ -133,11 +159,13 @@
   }
 </script>
 
-<div class="flex {role === 'user' ? 'justify-end' : 'justify-start'} mb-4">
+<div class="flex {role === 'user' ? 'justify-end' : 'justify-start'} mb-6">
   <div
-    class="relative group max-w-[85%] rounded-lg px-4 py-2 {role === 'user'
-      ? 'bg-primary text-btn-primary-text'
-      : 'bg-surface border border-gray-200 dark:border-white/10'}"
+    class="relative group w-full {role === 'user'
+      ? 'max-w-[78%] rounded-[1.35rem] px-4 py-3 bg-surface border border-gray-200 dark:border-white/10 shadow-sm'
+      : role === 'assistant'
+        ? 'max-w-full rounded-xl px-0 py-0 bg-transparent border-0'
+        : 'max-w-full rounded-xl px-4 py-3 bg-surface border border-gray-200 dark:border-white/10'}"
   >
     {#if role === "assistant"}
       {#if reasoning_content || isReasoning}
@@ -198,18 +226,27 @@
       {/if}
       {#if !isStreaming}
         {#if hasSources}
-          <div class="sources-tray mt-2 mb-1" title="Sources">
-            {#each sources as source, idx (source.url + idx)}
-              <a
-                class="source-badge"
-                href={source.url}
-                target="_blank"
-                rel="noreferrer noopener"
-                title={sourceLabel(source)}
-              >
-                <img src={sourceFavicon(source)} alt={sourceDomain(source)} />
-              </a>
-            {/each}
+          <div class="sources-wrap mt-2 mb-1" bind:this={sourcesPopupEl}>
+            <button class="source-www-btn" title="Sources" onclick={toggleSourcesPopup}>
+              <Globe class="w-3.5 h-3.5" />
+            </button>
+            {#if showSourcesPopup}
+              <div class="sources-popup">
+                <div class="sources-popup-title">Sources</div>
+                {#each sources as source, idx (source.url + idx)}
+                  <a
+                    class="sources-popup-link"
+                    href={source.url}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    title={sourceLabel(source)}
+                  >
+                    <img src={sourceFavicon(source)} alt={sourceDomain(source)} />
+                    <span>{sourceLabel(source)}</span>
+                  </a>
+                {/each}
+              </div>
+            {/if}
           </div>
         {/if}
         <div class="flex gap-1 mt-2 pt-1 border-t border-gray-200 dark:border-white/10">
@@ -436,48 +473,76 @@
     background: transparent;
   }
 
-  .sources-tray {
-    display: flex;
+  .sources-wrap {
+    position: relative;
+    display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
-    overflow: hidden;
-    max-width: 30px;
-    transition: max-width 220ms ease;
   }
 
-  .sources-tray:hover {
-    max-width: 420px;
-  }
-
-  .source-badge {
+  .source-www-btn {
     width: 24px;
     height: 24px;
     min-width: 24px;
     border-radius: 9999px;
     border: 1px solid var(--color-border, rgba(128, 128, 128, 0.2));
     background: var(--color-surface);
-    display: inline-flex;
+    display: flex;
     align-items: center;
     justify-content: center;
-    overflow: hidden;
-    margin-left: -6px;
-    transition: margin-left 220ms ease, transform 120ms ease;
+    color: var(--color-txtsecondary);
+    cursor: pointer;
   }
 
-  .source-badge:first-child {
-    margin-left: 0;
+  .source-www-btn:hover {
+    color: var(--color-txtmain);
   }
 
-  .sources-tray:hover .source-badge {
-    margin-left: 0;
+  .sources-popup {
+    position: absolute;
+    left: 0;
+    bottom: 30px;
+    z-index: 15;
+    min-width: 260px;
+    max-width: 420px;
+    max-height: 240px;
+    overflow: auto;
+    border: 1px solid var(--color-border, rgba(128, 128, 128, 0.2));
+    background: var(--color-surface);
+    border-radius: 10px;
+    padding: 8px;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15);
   }
 
-  .source-badge:hover {
-    transform: translateY(-1px);
+  .sources-popup-title {
+    font-size: 11px;
+    color: var(--color-txtsecondary);
+    margin-bottom: 6px;
   }
 
-  .source-badge img {
+  .sources-popup-link {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    color: var(--color-txtmain);
+    padding: 6px;
+    border-radius: 8px;
+    font-size: 12px;
+  }
+
+  .sources-popup-link:hover {
+    background: color-mix(in srgb, var(--color-surface), var(--color-txtmain) 7%);
+  }
+
+  .sources-popup-link img {
     width: 14px;
     height: 14px;
+    flex: 0 0 auto;
+  }
+
+  .sources-popup-link span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

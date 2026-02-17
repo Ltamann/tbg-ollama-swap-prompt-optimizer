@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mostlygeek/llama-swap/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
 )
 
 // circularBuffer is a fixed-size circular byte buffer that overwrites
@@ -267,3 +267,4 @@ func (l LogLevel) String() string {
 		return "UNKNOWN"
 	}
 }
+

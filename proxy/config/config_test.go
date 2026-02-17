@@ -1372,4 +1372,29 @@ models:
 		assert.Equal(t, []string{"real-value"}, config.RequiredAPIKeys)
 	})
 
+	t.Run("compatibility mode defaults to legacy", func(t *testing.T) {
+		content := `
+models:
+  test:
+    cmd: "server"
+    proxy: "http://localhost:8080"
+`
+		cfg, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, "legacy", cfg.CompatibilityMode)
+	})
+
+	t.Run("invalid compatibility mode fails", func(t *testing.T) {
+		content := `
+compatibilityMode: unsupported_mode
+models:
+  test:
+    cmd: "server"
+    proxy: "http://localhost:8080"
+`
+		_, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "compatibilityMode must be one of")
+	})
+
 }

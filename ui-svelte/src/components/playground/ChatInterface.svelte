@@ -1,23 +1,25 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { get } from "svelte/store";
-  import { models, listTools, getToolRuntimeSettings } from "../../stores/api";
+  import { models, upstreamLogs, listTools, updateTool, loadModel, type RuntimeTool } from "../../stores/api";
   import { persistentStore } from "../../stores/persistent";
   import {
     chatMessagesStore,
     chatIsStreamingStore,
     chatIsReasoningStore,
+    pendingToolApprovalStore,
     type SamplingSettings,
     type UploadedAttachment,
     cancelChatStreaming,
     newChatSession,
     regenerateFromIndex,
+    approvePendingToolExecution,
+    denyPendingToolExecution,
     sendUserMessage,
     editUserMessage,
     deleteUserMessageWithReply,
   } from "../../stores/playgroundChat";
   import ChatMessageComponent from "./ChatMessage.svelte";
-  import ModelSelector from "./ModelSelector.svelte";
   import ExpandableTextarea from "./ExpandableTextarea.svelte";
 
   const selectedModelStore = persistentStore<string>("playground-selected-model", "");
@@ -29,6 +31,7 @@
   const presencePenaltyByModelStore = persistentStore<Record<string, number>>("playground-presence-penalty-by-model", {});
   const frequencyPenaltyByModelStore = persistentStore<Record<string, number>>("playground-frequency-penalty-by-model", {});
   const maxTokensByModelStore = persistentStore<Record<string, number>>("playground-max-tokens-by-model", {});
+  const chatScrollTopStore = persistentStore<number>("playground-chat-scroll-top", 0);
   let currentTemperature = $state(0.8);
   let currentTopP = $state(0.95);
   let currentTopK = $state(40);
@@ -44,12 +47,74 @@
   let fileInput = $state<HTMLInputElement | null>(null);
   let attachmentError = $state<string | null>(null);
   let isDraggingFiles = $state(false);
-  let toolStatusText = $state("");
+  let showAttachMenu = $state(false);
+  let showModelMenu = $state(false);
+  let settingsButtonEl: HTMLButtonElement | null = $state(null);
+  let settingsPanelEl: HTMLDivElement | null = $state(null);
+  let attachButtonEl: HTMLButtonElement | null = $state(null);
+  let attachMenuEl: HTMLDivElement | null = $state(null);
+  let modelButtonEl: HTMLButtonElement | null = $state(null);
+  let modelMenuEl: HTMLDivElement | null = $state(null);
+  let attachTools = $state<RuntimeTool[]>([]);
+  let toolsLoading = $state(false);
+  let toolToggleBusy = $state<Record<string, boolean>>({});
+  let toolApprovalNote = $state("");
+  let hasRestoredScroll = $state(false);
+  let forceScrollToBottom = $state(false);
 
   let hasModels = $derived($models.some((m) => !m.unlisted));
   let selectableModels = $derived(
     $models.filter((m) => !m.unlisted && !m.peerID)
   );
+  let selectedModelLabel = $derived(
+    selectableModels.find((m) => m.id === $selectedModelStore)?.name ||
+    selectableModels.find((m) => m.id === $selectedModelStore)?.id ||
+    "Model"
+  );
+  let selectedModelState = $derived(
+    selectableModels.find((m) => m.id === $selectedModelStore)?.state || "unknown"
+  );
+  let isModelLoading = $derived(selectedModelState === "starting" || selectedModelState === "stopping");
+
+  type LoadStage = { pct: number; label: string; patterns: string[] };
+
+  const LOAD_STAGES: LoadStage[] = [
+    { pct: 8, label: "Starting model process", patterns: ["srv    load_model: loading model", "main: loading model"] },
+    { pct: 18, label: "Reading model metadata", patterns: ["llama_model_loader: loaded meta data"] },
+    { pct: 36, label: "Loading tensors", patterns: ["load_tensors: loading model tensors"] },
+    { pct: 56, label: "Offloading layers to GPU", patterns: ["load_tensors: offloaded"] },
+    { pct: 72, label: "Building context", patterns: ["llama_context: constructing llama_context"] },
+    { pct: 84, label: "Allocating compute buffers", patterns: ["sched_reserve: reserve took", "sched_reserve:"] },
+    { pct: 92, label: "Warming up model", patterns: ["warming up the model"] },
+    { pct: 100, label: "Model ready", patterns: ["main: model loaded", "srv    load_model: initialized slots"] },
+  ];
+
+  function parseModelLoadProgress(logs: string): { pct: number; label: string } {
+    const raw = (logs || "").toLowerCase();
+    if (!raw) {
+      return { pct: 4, label: "Waiting for load logs..." };
+    }
+
+    // Focus on latest load block.
+    const markerA = raw.lastIndexOf("srv    load_model: loading model");
+    const markerB = raw.lastIndexOf("main: loading model");
+    const start = Math.max(markerA, markerB, 0);
+    const section = raw.slice(start);
+
+    let pct = 4;
+    let label = "Starting model process";
+    for (const stage of LOAD_STAGES) {
+      if (stage.patterns.some((p) => section.includes(p.toLowerCase()))) {
+        if (stage.pct >= pct) {
+          pct = stage.pct;
+          label = stage.label;
+        }
+      }
+    }
+    return { pct, label };
+  }
+
+  let loadProgress = $derived(parseModelLoadProgress($upstreamLogs));
 
   function configuredTemperatureForModel(modelID: string): number {
     const model = $models.find((m) => m.id === modelID);
@@ -60,22 +125,70 @@
   }
 
   onMount(() => {
-    void refreshToolStatus();
+    void loadAttachTools();
+    void restoreChatScrollPosition();
   });
 
-  async function refreshToolStatus(): Promise<void> {
-    try {
-      const [settings, tools] = await Promise.all([getToolRuntimeSettings(), listTools()]);
-      if (!settings.enabled) {
-        toolStatusText = "Tools: Off";
-        return;
+  function handleGlobalPointerDown(event: MouseEvent) {
+    const target = event.target as Node | null;
+    if (!target) return;
+
+    if (showAttachMenu) {
+      const insideAttach = (attachMenuEl && attachMenuEl.contains(target)) || (attachButtonEl && attachButtonEl.contains(target));
+      if (!insideAttach) {
+        showAttachMenu = false;
       }
-      const enabledTools = tools.filter((t) => t.enabled && (t.policy || "auto") !== "never");
-      const names = enabledTools.slice(0, 3).map((t) => t.name);
-      const suffix = enabledTools.length > 3 ? ` +${enabledTools.length - 3}` : "";
-      toolStatusText = `Tools: ${enabledTools.length === 0 ? "none" : names.join(", ")}${suffix} | mode=${settings.webSearchMode}`;
-    } catch {
-      toolStatusText = "Tools: status unavailable";
+    }
+    if (showModelMenu) {
+      const insideModel = (modelMenuEl && modelMenuEl.contains(target)) || (modelButtonEl && modelButtonEl.contains(target));
+      if (!insideModel) {
+        showModelMenu = false;
+      }
+    }
+    if (showSettings) {
+      const insideSettings = (settingsPanelEl && settingsPanelEl.contains(target)) || (settingsButtonEl && settingsButtonEl.contains(target));
+      if (!insideSettings) {
+        showSettings = false;
+      }
+    }
+  }
+
+  async function restoreChatScrollPosition(): Promise<void> {
+    await tick();
+    if (!messagesContainer) return;
+    const saved = $chatScrollTopStore;
+    if (Number.isFinite(saved) && saved > 0) {
+      messagesContainer.scrollTop = saved;
+    }
+    hasRestoredScroll = true;
+  }
+
+  async function loadAttachTools(): Promise<void> {
+    toolsLoading = true;
+    try {
+      attachTools = await listTools();
+    } catch (error) {
+      console.error("Failed to load tools for chat menu", error);
+      attachTools = [];
+    } finally {
+      toolsLoading = false;
+    }
+  }
+
+  async function toggleAttachTool(toolId: string, nextEnabled: boolean): Promise<void> {
+    const current = attachTools.find((t) => t.id === toolId);
+    if (!current) return;
+    toolToggleBusy = { ...toolToggleBusy, [toolId]: true };
+    const prev = attachTools;
+    attachTools = attachTools.map((t) => (t.id === toolId ? { ...t, enabled: nextEnabled } : t));
+    try {
+      const saved = await updateTool({ ...current, enabled: nextEnabled });
+      attachTools = attachTools.map((t) => (t.id === toolId ? saved : t));
+    } catch (error) {
+      console.error("Failed to toggle tool", error);
+      attachTools = prev;
+    } finally {
+      toolToggleBusy = { ...toolToggleBusy, [toolId]: false };
     }
   }
 
@@ -196,21 +309,48 @@
 
   // Auto-scroll when messages change
   $effect(() => {
-    if ($chatMessagesStore.length > 0 && messagesContainer) {
+    if ($chatMessagesStore.length > 0 && messagesContainer && hasRestoredScroll && (forceScrollToBottom || $chatIsStreamingStore)) {
       messagesContainer.scrollTo({
         top: messagesContainer.scrollHeight,
-        behavior: "smooth",
+        behavior: forceScrollToBottom ? "smooth" : "auto",
       });
+      forceScrollToBottom = false;
     }
   });
+
+  function handleMessagesScroll() {
+    if (!messagesContainer) return;
+    chatScrollTopStore.set(messagesContainer.scrollTop);
+  }
 
   async function sendMessage() {
     const sent = await sendUserMessage(userInput, attachments, $selectedModelStore, $systemPromptStore, currentSamplingSettings());
     if (sent) {
+      forceScrollToBottom = true;
       userInput = "";
       attachments = [];
       attachmentError = null;
     }
+  }
+
+  function approveToolCall() {
+    toolApprovalNote = "";
+    void approvePendingToolExecution();
+  }
+
+  function denyToolCall() {
+    denyPendingToolExecution(toolApprovalNote);
+    toolApprovalNote = "";
+  }
+
+  async function sendNoteAsUserMessage() {
+    const note = toolApprovalNote.trim();
+    if (!note) return;
+    denyPendingToolExecution("User sent manual follow-up instead of executing tool.");
+    const model = $selectedModelStore;
+    if (!model) return;
+    await sendUserMessage(note, [], model, $systemPromptStore, currentSamplingSettings());
+    toolApprovalNote = "";
   }
 
   function cancelStreaming() {
@@ -400,6 +540,27 @@
     attachmentError = null;
   }
 
+  function openAttachPicker() {
+    showAttachMenu = false;
+    fileInput?.click();
+  }
+
+  async function chooseModel(modelId: string) {
+    if (!modelId) return;
+    if (modelId === $selectedModelStore) {
+      showModelMenu = false;
+      return;
+    }
+    selectedModelStore.set(modelId);
+    initializedSamplingModelID = "";
+    showModelMenu = false;
+    try {
+      await loadModel(modelId);
+    } catch (error) {
+      console.error("Failed to load model from chat dropdown:", error);
+    }
+  }
+
   function handleDragOver(event: DragEvent) {
     event.preventDefault();
     if ($chatIsStreamingStore || !$selectedModelStore) {
@@ -427,31 +588,45 @@
   }
 </script>
 
-<div class="flex flex-col h-full">
-  <div class="shrink-0 sticky top-0 z-20 bg-card pb-3">
-    <!-- Model selector and controls -->
-    <div class="flex flex-wrap gap-2 mb-3">
-      <ModelSelector bind:value={$selectedModelStore} placeholder="Select a model..." disabled={$chatIsStreamingStore} />
-      <div class="flex gap-2">
+<svelte:window onmousedown={handleGlobalPointerDown} />
+<div class="h-full flex flex-col">
+  <div class="shrink-0 sticky top-0 z-20 border-b border-gray-200/70 dark:border-white/10 bg-background/92 backdrop-blur">
+    <div class="max-w-4xl mx-auto w-full px-4 py-2">
+      <div class="flex items-center gap-2">
+        <div class="flex-1"></div>
         <button
-          class="btn"
+          bind:this={settingsButtonEl}
+          class="btn px-2.5 py-2 rounded-lg"
           onclick={() => (showSettings = !showSettings)}
           title="Settings"
+          aria-label="Settings"
         >
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
             <path fill-rule="evenodd" d="M8.34 1.804A1 1 0 0 1 9.32 1h1.36a1 1 0 0 1 .98.804l.295 1.473c.497.144.971.342 1.416.587l1.25-.834a1 1 0 0 1 1.262.125l.962.962a1 1 0 0 1 .125 1.262l-.834 1.25c.245.445.443.919.587 1.416l1.473.295a1 1 0 0 1 .804.98v1.36a1 1 0 0 1-.804.98l-1.473.295a6.95 6.95 0 0 1-.587 1.416l.834 1.25a1 1 0 0 1-.125 1.262l-.962.962a1 1 0 0 1-1.262.125l-1.25-.834a6.953 6.953 0 0 1-1.416.587l-.295 1.473a1 1 0 0 1-.98.804H9.32a1 1 0 0 1-.98-.804l-.295-1.473a6.957 6.957 0 0 1-1.416-.587l-1.25.834a1 1 0 0 1-1.262-.125l-.962-.962a1 1 0 0 1-.125-1.262l.834-1.25a6.957 6.957 0 0 1-.587-1.416l-1.473-.295A1 1 0 0 1 1 10.68V9.32a1 1 0 0 1 .804-.98l1.473-.295c.144-.497.342-.971.587-1.416l-.834-1.25a1 1 0 0 1 .125-1.262l.962-.962A1 1 0 0 1 5.38 3.03l1.25.834a6.957 6.957 0 0 1 1.416-.587l.294-1.473ZM13 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" clip-rule="evenodd" />
           </svg>
         </button>
-        <button class="btn" onclick={newChat} disabled={$chatMessagesStore.length === 0 && !$chatIsStreamingStore}>
-          New Chat
+        <button class="btn px-2.5 py-2 rounded-lg" onclick={newChat} disabled={$chatMessagesStore.length === 0 && !$chatIsStreamingStore} title="New chat" aria-label="New chat">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
+            <path d="M5.25 4.5A2.25 2.25 0 0 1 7.5 2.25h9A2.25 2.25 0 0 1 18.75 4.5v7.5A2.25 2.25 0 0 1 16.5 14.25h-9A2.25 2.25 0 0 1 5.25 12v-7.5Z" />
+            <path d="M3.75 8.25a.75.75 0 0 1 .75.75v8.25A2.25 2.25 0 0 0 6.75 19.5H15a.75.75 0 0 1 0 1.5H6.75A3.75 3.75 0 0 1 3 17.25V9a.75.75 0 0 1 .75-.75Z" />
+          </svg>
         </button>
       </div>
-    </div>
-    <div class="text-xs text-txtsecondary mb-2">{toolStatusText}</div>
+      {#if isModelLoading}
+        <div class="mt-2 min-w-[260px] max-w-[440px] px-3 py-2 rounded border border-gray-200 dark:border-white/10 bg-surface">
+          <div class="flex items-center justify-between text-xs text-txtsecondary mb-1">
+            <span>Model loading</span>
+            <span>{Math.min(100, Math.max(0, Math.round(loadProgress.pct)))}%</span>
+          </div>
+          <div class="h-2 rounded bg-gray-200 dark:bg-white/10 overflow-hidden">
+            <div class="h-full bg-primary transition-all duration-300 ease-out" style={`width: ${Math.min(100, Math.max(0, loadProgress.pct))}%`}></div>
+          </div>
+          <div class="text-[11px] text-txtsecondary mt-1">{loadProgress.label}</div>
+        </div>
+      {/if}
 
-    <!-- Settings panel -->
-    {#if showSettings}
-      <div class="p-4 bg-surface border border-gray-200 dark:border-white/10 rounded">
+      {#if showSettings}
+      <div bind:this={settingsPanelEl} class="mt-2 p-4 bg-surface border border-gray-200 dark:border-white/10 rounded-xl">
         <div class="mb-4">
           <label class="block text-sm font-medium mb-1" for="system-prompt">System Prompt</label>
           <textarea
@@ -508,23 +683,26 @@
           <input id="max-tokens" type="range" min="0" max="8192" step="64" class="w-full" bind:value={currentMaxTokens} oninput={(e) => handleMaxTokensInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
         </div>
       </div>
-    {/if}
+      {/if}
+    </div>
   </div>
 
   <!-- Messages area -->
   <div
-    class="flex-1 overflow-y-auto mb-4 px-2"
+    class="flex-1 overflow-y-auto px-2"
     bind:this={messagesContainer}
+    onscroll={handleMessagesScroll}
   >
-    {#if $chatMessagesStore.length === 0}
-      <div class="h-full flex items-center justify-center text-txtsecondary">
+    <div class="max-w-4xl mx-auto w-full py-6 px-2">
+      {#if $chatMessagesStore.length === 0}
+      <div class="h-full min-h-[50vh] flex items-center justify-center text-txtsecondary">
         {#if !hasModels}
           <p>No models configured. Add models to your configuration to start chatting.</p>
         {:else}
           <p>Start a conversation by typing a message below.</p>
         {/if}
       </div>
-    {:else}
+      {:else}
       {#each $chatMessagesStore as message, idx (idx)}
         <ChatMessageComponent
           role={message.role}
@@ -541,11 +719,13 @@
             : undefined}
         />
       {/each}
-    {/if}
+      {/if}
+    </div>
   </div>
 
   <!-- Input area -->
-  <div class="shrink-0">
+  <div class="shrink-0 sticky bottom-0 z-20 bg-background/95 backdrop-blur border-t border-gray-200/70 dark:border-white/10">
+    <div class="max-w-4xl mx-auto w-full px-4 py-3">
       <!-- Attachment strip -->
       {#if attachments.length > 0}
         <div class="mb-2 flex flex-wrap gap-2">
@@ -576,7 +756,7 @@
       <div
         role="group"
         aria-label="Message input and attachments"
-        class={`flex gap-2 rounded ${isDraggingFiles ? "ring-2 ring-primary/60 bg-secondary-hover" : ""}`}
+        class={`flex items-end gap-2 rounded-[1.6rem] border border-gray-300/80 dark:border-white/10 bg-surface px-2.5 py-2 shadow-sm ${isDraggingFiles ? "ring-2 ring-primary/60 bg-secondary-hover" : ""}`}
         ondragover={handleDragOver}
         ondragleave={handleDragLeave}
         ondrop={handleDrop}
@@ -591,48 +771,132 @@
           onchange={handleFileSelect}
         />
 
-        <ExpandableTextarea
-          bind:value={userInput}
-          placeholder="Type a message..."
-          rows={3}
-          onkeydown={handleKeyDown}
-          disabled={$chatIsStreamingStore || !$selectedModelStore}
-        />
-        <div class="flex flex-col gap-2">
-          {#if $chatIsStreamingStore}
-            <button
-              class="btn bg-red-500 hover:bg-red-600 text-white px-3"
-              onclick={cancelStreaming}
-              title="Stop generation"
-              aria-label="Stop generation"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4">
-                <path d="M7 7.75A.75.75 0 0 1 7.75 7h8.5a.75.75 0 0 1 .75.75v8.5a.75.75 0 0 1-.75.75h-8.5a.75.75 0 0 1-.75-.75v-8.5Z" />
-              </svg>
-            </button>
-          {:else}
-            <button
-              class="btn px-3"
-              onclick={() => fileInput?.click()}
-              disabled={$chatIsStreamingStore || !$selectedModelStore}
-              title="Add files or images"
-              aria-label="Add files or images"
-            >
-              +
-            </button>
-            <button
-              class="btn bg-primary text-btn-primary-text hover:opacity-90 px-3"
-              onclick={sendMessage}
-              disabled={(!userInput.trim() && attachments.length === 0) || !$selectedModelStore}
-              title="Send message"
-              aria-label="Send message"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4">
-                <path d="M3.32 2.43a.75.75 0 0 1 .78-.1l16.5 8.25a.75.75 0 0 1 0 1.34L4.1 20.17a.75.75 0 0 1-1.06-.83l1.44-6.1a.75.75 0 0 1 .55-.55l8.88-2.22-8.88-2.22a.75.75 0 0 1-.55-.55l-1.44-6.1a.75.75 0 0 1 .28-.77Z" />
-              </svg>
-            </button>
+        <div class="relative shrink-0">
+          <button
+            bind:this={attachButtonEl}
+            class="btn w-9 h-9 rounded-full p-0 flex items-center justify-center"
+            onclick={() => { showAttachMenu = !showAttachMenu; showModelMenu = false; if (!showAttachMenu) { void loadAttachTools(); } }}
+            disabled={$chatIsStreamingStore || !$selectedModelStore || isModelLoading}
+            title="Add files"
+            aria-label="Add files"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4">
+              <path d="M11.25 5.25a.75.75 0 0 1 1.5 0v6h6a.75.75 0 0 1 0 1.5h-6v6a.75.75 0 0 1-1.5 0v-6h-6a.75.75 0 0 1 0-1.5h6v-6Z" />
+            </svg>
+          </button>
+          {#if showAttachMenu}
+            <div bind:this={attachMenuEl} class="absolute left-0 bottom-11 z-30 min-w-[260px] rounded-xl border border-gray-200 dark:border-white/10 bg-surface shadow-lg p-1">
+              <button class="w-full text-left px-3 py-2 rounded-lg hover:bg-secondary-hover text-sm" onclick={openAttachPicker}>
+                Upload files or images
+              </button>
+              <div class="my-1 border-t border-gray-200 dark:border-white/10"></div>
+              <div class="px-3 pt-1 pb-1 text-[11px] text-txtsecondary">Tools</div>
+              {#if toolsLoading}
+                <div class="px-3 py-2 text-xs text-txtsecondary">Loading tools...</div>
+              {:else if attachTools.length === 0}
+                <div class="px-3 py-2 text-xs text-txtsecondary">No tools configured</div>
+              {:else}
+                {#each attachTools as tool (tool.id)}
+                  <label class="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg hover:bg-secondary-hover text-sm">
+                    <span class="truncate" title={tool.name}>{tool.name}</span>
+                    <input
+                      type="checkbox"
+                      checked={tool.enabled}
+                      disabled={toolToggleBusy[tool.id] === true || $chatIsStreamingStore}
+                      onchange={(e) => toggleAttachTool(tool.id, (e.currentTarget as HTMLInputElement).checked)}
+                    />
+                  </label>
+                {/each}
+              {/if}
+            </div>
           {/if}
         </div>
+
+        <ExpandableTextarea
+          bind:value={userInput}
+          placeholder="Ask anything..."
+          rows={3}
+          onkeydown={handleKeyDown}
+          disabled={$chatIsStreamingStore || !$selectedModelStore || isModelLoading}
+        />
+
+        <div class="relative shrink-0">
+          <button
+            bind:this={modelButtonEl}
+            class="btn px-3 h-9 rounded-full text-xs max-w-[180px] truncate"
+            onclick={() => { showModelMenu = !showModelMenu; showAttachMenu = false; }}
+            disabled={$chatIsStreamingStore}
+            title={selectedModelLabel}
+          >
+            {selectedModelLabel}
+          </button>
+          {#if showModelMenu}
+            <div bind:this={modelMenuEl} class="absolute right-0 bottom-11 z-30 w-[320px] max-h-64 overflow-auto rounded-xl border border-gray-200 dark:border-white/10 bg-surface shadow-lg p-1">
+              {#each selectableModels as m (m.id)}
+                <button
+                  class={`w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-secondary-hover ${m.id === $selectedModelStore ? "bg-secondary-hover" : ""}`}
+                  onclick={() => chooseModel(m.id)}
+                >
+                  <div class="truncate">{m.name || m.id}</div>
+                  <div class="text-xs text-txtsecondary truncate">{m.id}</div>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        {#if $chatIsStreamingStore}
+          <button
+            class="btn bg-red-500 hover:bg-red-600 text-white w-9 h-9 rounded-full p-0 flex items-center justify-center"
+            onclick={cancelStreaming}
+            title="Stop generation"
+            aria-label="Stop generation"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4">
+              <path d="M7 7.75A.75.75 0 0 1 7.75 7h8.5a.75.75 0 0 1 .75.75v8.5a.75.75 0 0 1-.75.75h-8.5a.75.75 0 0 1-.75-.75v-8.5Z" />
+            </svg>
+          </button>
+        {:else}
+          <button
+            class="btn bg-primary text-btn-primary-text hover:opacity-90 w-9 h-9 rounded-full p-0 flex items-center justify-center"
+            onclick={sendMessage}
+            disabled={(!userInput.trim() && attachments.length === 0) || !$selectedModelStore || isModelLoading}
+            title="Send message"
+            aria-label="Send message"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4">
+              <path d="M12 4l6.5 8h-4v8h-5v-8h-4L12 4Z" />
+            </svg>
+          </button>
+        {/if}
       </div>
+    </div>
   </div>
 </div>
+
+{#if $pendingToolApprovalStore}
+  <div class="fixed inset-0 z-50 bg-black/45 flex items-center justify-center p-4">
+    <div class="w-full max-w-2xl rounded-2xl border border-gray-200 dark:border-white/10 bg-surface shadow-xl p-4">
+      <h3 class="text-base font-semibold mb-2">Tool execution requested</h3>
+      <p class="text-sm text-txtsecondary mb-3">Model requested a tool call. Approve, deny, or write a manual message.</p>
+      <div class="max-h-64 overflow-auto rounded border border-gray-200 dark:border-white/10 bg-card p-3 text-xs space-y-3">
+        {#each $pendingToolApprovalStore.toolCalls as call, i (call.call_id || `${call.name}-${i}`)}
+          <div class="space-y-1">
+            <div><span class="font-semibold">Tool:</span> {call.name}</div>
+            <div><span class="font-semibold">Arguments:</span></div>
+            <pre class="whitespace-pre-wrap break-all text-[11px] bg-surface rounded p-2">{JSON.stringify(call.args || {}, null, 2)}</pre>
+          </div>
+        {/each}
+      </div>
+      <div class="mt-3">
+        <label class="block text-xs text-txtsecondary mb-1" for="tool-note">Optional note (or send as your own message)</label>
+        <textarea id="tool-note" rows="3" class="w-full px-3 py-2 rounded border border-gray-200 dark:border-white/10 bg-card focus:outline-none focus:ring-2 focus:ring-primary resize-none" bind:value={toolApprovalNote} placeholder="Write note, correction, or tool argument hint..."></textarea>
+      </div>
+      <div class="mt-4 flex flex-wrap gap-2 justify-end">
+        <button class="btn" onclick={sendNoteAsUserMessage}>Write Instead</button>
+        <button class="btn" onclick={denyToolCall}>Deny</button>
+        <button class="btn bg-primary text-btn-primary-text" onclick={approveToolCall}>Approve & Execute</button>
+      </div>
+    </div>
+  </div>
+{/if}

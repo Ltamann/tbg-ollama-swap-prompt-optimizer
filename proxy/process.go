@@ -18,8 +18,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mostlygeek/llama-swap/event"
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 )
 
 type ProcessState string
@@ -1066,3 +1066,4 @@ func (s *statusResponseWriter) Flush() {
 		flusher.Flush()
 	}
 }
+

@@ -2,7 +2,7 @@
 
 # TBG (O)llama Swap + Prompt Optimizer
 
-Based on Benson Wong's upstream project: [mostlygeek/llama-swap](https://github.com/mostlygeek/llama-swap).
+Forked from Benson Wong's upstream project: [mostlygeek/llama-swap](https://github.com/mostlygeek/llama-swap).
 
 TBG (O)llama Swap + Prompt Optimizer is focused on local agent workflows (for example Claude Code CLI) where prompts become very large, repetitive, and unstable for low-VRAM local inference.
 
@@ -302,6 +302,54 @@ Access UI from Windows browser:
 
 - `http://localhost:8080/ui/`
 
+### Known-Good WSL Update + Restart Workflow
+
+Use this exact sequence when you run the app from WSL but build from Windows workspace.
+
+Build backend + UI in repo:
+
+```powershell
+go build ./...
+cd ui-svelte
+npm install
+npm run build
+cd ..
+```
+
+Build Linux binary explicitly (important):
+
+```powershell
+$env:GOOS='linux'
+$env:GOARCH='amd64'
+$env:CGO_ENABLED='0'
+go build -o build/llama-swap-linux-amd64 .
+```
+
+Install into WSL:
+
+```powershell
+$repoWslPath = wsl wslpath -a .
+wsl -d Ubuntu -- bash -lc "install -Dm755 '$repoWslPath/build/llama-swap-linux-amd64' /home/admmin/bin/llama-swap"
+```
+
+Restart cleanly in WSL (detached):
+
+```powershell
+wsl -d Ubuntu -- bash -lc 'pkill -9 -f llama-swap || true; pkill -9 -f llama-server || true; setsid /home/admmin/bin/llama-swap --config /home/admmin/llama-swap/config.yaml --listen 0.0.0.0:8080 >/tmp/llama-swap.log 2>&1 < /dev/null &'
+```
+
+Verify:
+
+```powershell
+wsl -d Ubuntu -- bash -lc 'file /home/admmin/bin/llama-swap; ss -ltnp | sed -n "1p;/:8080/p"; curl -sS http://127.0.0.1:8080/health'
+```
+
+Expected:
+
+- binary is `ELF 64-bit` (Linux), not Windows PE
+- listener on `*:8080`
+- health response `OK`
+
 ## Quick Build Matrix
 
 - `make linux` -> `build/llama-swap-linux-amd64` and `build/llama-swap-linux-arm64`
@@ -444,6 +492,14 @@ Notes:
 - `http` (example: `searxng_web_search`)
 - `mcp` (example: Playwright MCP endpoint)
 
+MCP argument behavior:
+
+- For fixed MCP tools (`remoteName` set): model passes tool arguments directly.
+- For MCP gateway tools (`remoteName` empty): model should pass:
+  - `name`: remote MCP tool name (example: `browser_navigate`)
+  - `arguments`: object for that remote tool
+- HTTP tools support `{query}` and additional endpoint placeholders from tool arguments.
+
 ### Tool Policies
 
 Per tool:
@@ -470,6 +526,20 @@ Global runtime settings:
 - Optional global approval header gate.
 - Per-tool timeout control.
 - Tool execution is audit-logged in proxy logs (name/type/duration/error status).
+
+### Playwright MCP Troubleshooting
+
+If tool execution returns a browser launch error like:
+
+- `Chromium distribution 'chrome' is not found ...`
+
+install the expected browser channel in the runtime where MCP server runs:
+
+```bash
+npx playwright install chrome
+```
+
+If you run MCP in WSL, run the install in WSL. If you run MCP on Windows, run it on Windows.
 
 ### Tool API Endpoints
 

@@ -17,6 +17,26 @@ export interface ChatOptions {
   max_tokens?: number;
 }
 
+export class ChatAPIError extends Error {
+  status: number;
+  body: string;
+  jsonBody: any;
+
+  constructor(status: number, body: string, jsonBody: any = null) {
+    super(`Chat API error: ${status} - ${body}`);
+    this.name = "ChatAPIError";
+    this.status = status;
+    this.body = body;
+    this.jsonBody = jsonBody;
+  }
+}
+
+export interface ChatRequestHeaders {
+  approval?: boolean;
+  interactiveApproval?: boolean;
+  approvalHeaderName?: string;
+}
+
 function parseSSELine(line: string): StreamChunk | null {
   const trimmed = line.trim();
   if (!trimmed || !trimmed.startsWith("data: ")) {
@@ -48,7 +68,8 @@ export async function* streamChatCompletion(
   model: string,
   messages: ChatMessage[],
   signal?: AbortSignal,
-  options?: ChatOptions
+  options?: ChatOptions,
+  requestHeaders?: ChatRequestHeaders
 ): AsyncGenerator<StreamChunk> {
   const request: ChatCompletionRequest = {
     model,
@@ -63,18 +84,33 @@ export async function* streamChatCompletion(
     max_tokens: options?.max_tokens,
   };
 
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (requestHeaders?.interactiveApproval) {
+    headers["X-LlamaSwap-Tool-Approval-Interactive"] = "true";
+  }
+  if (requestHeaders?.approval) {
+    const headerName = (requestHeaders.approvalHeaderName || "X-LlamaSwap-Tool-Approval").trim() || "X-LlamaSwap-Tool-Approval";
+    headers[headerName] = "true";
+  }
+
   const response = await fetch("/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers,
     body: JSON.stringify(request),
     signal,
   });
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Chat API error: ${response.status} - ${errorText}`);
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(errorText);
+    } catch {
+      parsed = null;
+    }
+    throw new ChatAPIError(response.status, errorText, parsed);
   }
 
   const reader = response.body?.getReader();

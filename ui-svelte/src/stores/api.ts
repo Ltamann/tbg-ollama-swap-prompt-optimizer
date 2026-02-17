@@ -289,7 +289,7 @@ export interface PromptOptimizationSnapshot {
 }
 
 export type RuntimeToolType = "http" | "mcp";
-export type RuntimeToolPolicy = "auto" | "always" | "never";
+export type RuntimeToolPolicy = "auto" | "always" | "watchdog" | "never";
 export interface RuntimeTool {
   id: string;
   name: string;
@@ -306,6 +306,7 @@ export interface RuntimeTool {
 export interface ToolRuntimeSettings {
   enabled: boolean;
   webSearchMode: "off" | "auto" | "force";
+  watchdogMode: "off" | "auto";
   requireApprovalHeader: boolean;
   approvalHeaderName: string;
   blockNonLocalEndpoints: boolean;

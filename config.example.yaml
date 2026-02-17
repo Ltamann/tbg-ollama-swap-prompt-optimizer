@@ -1,5 +1,5 @@
 # add this modeline for validation in vscode
-# yaml-language-server: $schema=https://raw.githubusercontent.com/mostlygeek/llama-swap/refs/heads/main/config-schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Ltamann/tbg-ollama-swap-prompt-optimizer/refs/heads/main/config-schema.json
 #
 # llama-swap YAML configuration example
 # -------------------------------------
@@ -74,6 +74,13 @@ sendLoadingState: true
 # - when true, model aliases will be output to the API model listing duplicating
 #   all fields except for Id so chat UIs can use the alias equivalent to the original.
 includeAliasesInList: false
+
+# compatibilityMode: OpenAI protocol compatibility behavior
+# - optional, default: "legacy"
+# - valid values:
+#   - "legacy": preserve existing behavior, but still apply safe normalization
+#   - "strict_openai": enforce endpoint capability checks and OpenAI-style errors
+compatibilityMode: "legacy"
 
 # macros: a dictionary of string substitutions
 # - optional, default: empty dictionary

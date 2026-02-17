@@ -295,6 +295,9 @@ func (pm *ProxyManager) proxyOllamaRequest(modelID string, w http.ResponseWriter
 			w.Header().Add(key, value)
 		}
 	}
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		w.Header().Set("X-Accel-Buffering", "no")
+	}
 	w.WriteHeader(resp.StatusCode)
 
 	_, copyErr := io.Copy(w, resp.Body)

@@ -151,6 +151,9 @@ type Config struct {
 
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
+
+	// openai compatibility behavior: "legacy" or "strict_openai"
+	CompatibilityMode string `yaml:"compatibilityMode"`
 }
 
 func (c *Config) RealModelName(search string) (string, bool) {
@@ -220,6 +223,15 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 	case LogToStdoutProxy, LogToStdoutUpstream, LogToStdoutBoth, LogToStdoutNone:
 	default:
 		return Config{}, fmt.Errorf("logToStdout must be one of: proxy, upstream, both, none")
+	}
+
+	if strings.TrimSpace(config.CompatibilityMode) == "" {
+		config.CompatibilityMode = "legacy"
+	}
+	switch strings.ToLower(strings.TrimSpace(config.CompatibilityMode)) {
+	case "legacy", "strict_openai":
+	default:
+		return Config{}, fmt.Errorf("compatibilityMode must be one of: legacy, strict_openai")
 	}
 
 	// Populate the aliases map

@@ -23,14 +23,16 @@ const (
 	RuntimeToolHTTP RuntimeToolType = "http"
 	RuntimeToolMCP  RuntimeToolType = "mcp"
 
-	ToolPolicyAuto   RuntimeToolPolicy = "auto"
-	ToolPolicyAlways RuntimeToolPolicy = "always"
-	ToolPolicyNever  RuntimeToolPolicy = "never"
+	ToolPolicyAuto     RuntimeToolPolicy = "auto"
+	ToolPolicyAlways   RuntimeToolPolicy = "always"
+	ToolPolicyWatchdog RuntimeToolPolicy = "watchdog"
+	ToolPolicyNever    RuntimeToolPolicy = "never"
 )
 
 type ToolRuntimeSettings struct {
 	Enabled                bool   `json:"enabled"`
 	WebSearchMode          string `json:"webSearchMode"` // off|auto|force
+	WatchdogMode           string `json:"watchdogMode"`  // off|auto
 	RequireApprovalHeader  bool   `json:"requireApprovalHeader"`
 	ApprovalHeaderName     string `json:"approvalHeaderName"`
 	BlockNonLocalEndpoints bool   `json:"blockNonLocalEndpoints"`
@@ -47,9 +49,27 @@ type RuntimeTool struct {
 	Enabled         bool              `json:"enabled"`
 	Description     string            `json:"description,omitempty"`
 	RemoteName      string            `json:"remoteName,omitempty"`
-	Policy          RuntimeToolPolicy `json:"policy,omitempty"` // auto|always|never
+	Policy          RuntimeToolPolicy `json:"policy,omitempty"` // auto|always|watchdog|never
 	RequireApproval bool              `json:"requireApproval,omitempty"`
 	TimeoutSeconds  int               `json:"timeoutSeconds,omitempty"`
+}
+
+type ToolApprovalCall struct {
+	Name   string         `json:"name"`
+	CallID string         `json:"call_id,omitempty"`
+	Args   map[string]any `json:"args,omitempty"`
+}
+
+type ToolApprovalRequiredError struct {
+	HeaderName string             `json:"header_name"`
+	ToolCalls  []ToolApprovalCall `json:"tool_calls"`
+}
+
+func (e *ToolApprovalRequiredError) Error() string {
+	if e == nil {
+		return "tool approval required"
+	}
+	return fmt.Sprintf("tool approval required for %d call(s)", len(e.ToolCalls))
 }
 
 type toolsDiskState struct {
@@ -61,6 +81,7 @@ func defaultToolRuntimeSettings() ToolRuntimeSettings {
 	return ToolRuntimeSettings{
 		Enabled:                true,
 		WebSearchMode:          "auto",
+		WatchdogMode:           "off",
 		RequireApprovalHeader:  false,
 		ApprovalHeaderName:     "X-LlamaSwap-Tool-Approval",
 		BlockNonLocalEndpoints: true,
@@ -75,6 +96,10 @@ func normalizeToolRuntimeSettings(in ToolRuntimeSettings) ToolRuntimeSettings {
 	out.WebSearchMode = strings.ToLower(strings.TrimSpace(out.WebSearchMode))
 	if out.WebSearchMode != "off" && out.WebSearchMode != "auto" && out.WebSearchMode != "force" {
 		out.WebSearchMode = "auto"
+	}
+	out.WatchdogMode = strings.ToLower(strings.TrimSpace(out.WatchdogMode))
+	if out.WatchdogMode != "off" && out.WatchdogMode != "auto" {
+		out.WatchdogMode = "auto"
 	}
 	if strings.TrimSpace(out.ApprovalHeaderName) == "" {
 		out.ApprovalHeaderName = "X-LlamaSwap-Tool-Approval"
@@ -103,6 +128,8 @@ func normalizeRuntimeTool(t RuntimeTool) RuntimeTool {
 	switch strings.ToLower(strings.TrimSpace(string(t.Policy))) {
 	case string(ToolPolicyAlways):
 		t.Policy = ToolPolicyAlways
+	case string(ToolPolicyWatchdog):
+		t.Policy = ToolPolicyWatchdog
 	case string(ToolPolicyNever):
 		t.Policy = ToolPolicyNever
 	default:
@@ -138,6 +165,9 @@ func (pm *ProxyManager) loadToolsFromDisk() {
 		}
 		if !gjson.GetBytes(b, "settings.maxRunningModels").Exists() {
 			settings.MaxRunningModels = 1
+		}
+		if !gjson.GetBytes(b, "settings.watchdogMode").Exists() {
+			settings.WatchdogMode = "off"
 		}
 		tools = state.Tools
 	} else {
@@ -222,25 +252,65 @@ func (pm *ProxyManager) toolSchemas() []map[string]any {
 		if description == "" {
 			description = fmt.Sprintf("Tool endpoint: %s", t.Endpoint)
 		}
+		parameters := toolParametersSchema(t)
 		result = append(result, map[string]any{
 			"type": "function",
 			"function": map[string]any{
 				"name":        t.Name,
 				"description": description,
-				"parameters": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"query": map[string]any{
-							"type":        "string",
-							"description": "Search query or tool input",
-						},
-					},
-					"required": []string{"query"},
-				},
+				"parameters":  parameters,
 			},
 		})
 	}
 	return result
+}
+
+func toolParametersSchema(t RuntimeTool) map[string]any {
+	// HTTP tools keep query compatibility but also allow named placeholders.
+	if t.Type == RuntimeToolHTTP {
+		return map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{
+					"type":        "string",
+					"description": "Primary search/input text. Also used for {query} placeholder.",
+				},
+			},
+			"additionalProperties": true,
+		}
+	}
+
+	// MCP tools can run in two modes:
+	// - fixed remoteName: pass arguments directly
+	// - gateway mode: caller provides remote tool name and arguments object
+	if strings.TrimSpace(t.RemoteName) != "" {
+		return map[string]any{
+			"type":                 "object",
+			"additionalProperties": true,
+			"properties": map[string]any{
+				"query": map[string]any{
+					"type":        "string",
+					"description": "Optional free-text input for the remote MCP tool.",
+				},
+			},
+		}
+	}
+
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{
+				"type":        "string",
+				"description": "Remote MCP tool name to execute (for example: browser_navigate).",
+			},
+			"arguments": map[string]any{
+				"type":                 "object",
+				"description":          "Arguments object for the selected MCP tool.",
+				"additionalProperties": true,
+			},
+		},
+		"required": []string{"name"},
+	}
 }
 
 func (pm *ProxyManager) executeToolCall(toolName string, args map[string]any, headers http.Header) (string, error) {
@@ -252,12 +322,8 @@ func (pm *ProxyManager) executeToolCall(toolName string, args map[string]any, he
 	if !settings.Enabled {
 		return "", fmt.Errorf("tool runtime disabled")
 	}
-	if tool.RequireApproval || settings.RequireApprovalHeader {
-		headerName := settings.ApprovalHeaderName
-		val := strings.ToLower(strings.TrimSpace(headers.Get(headerName)))
-		if val != "1" && val != "true" && val != "yes" && val != "on" {
-			return "", fmt.Errorf("tool %s requires approval header %s=true", toolName, headerName)
-		}
+	if required, headerName := toolApprovalRequired(tool, settings, headers); required {
+		return "", fmt.Errorf("tool %s requires approval header %s=true", toolName, headerName)
 	}
 	if err := validateToolEndpoint(tool.Endpoint, settings); err != nil {
 		return "", err
@@ -275,24 +341,79 @@ func (pm *ProxyManager) executeToolCall(toolName string, args map[string]any, he
 	switch tool.Type {
 	case RuntimeToolHTTP:
 		out, err := pm.executeHTTPTool(tool, args, timeout)
-		pm.proxyLogger.Infof("tool call name=%s type=%s duration_ms=%d err=%v", tool.Name, tool.Type, time.Since(start).Milliseconds(), err != nil)
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		pm.proxyLogger.Infof("tool call name=%s type=%s duration_ms=%d err=%v err_msg=%q", tool.Name, tool.Type, time.Since(start).Milliseconds(), err != nil, errMsg)
 		return out, err
 	case RuntimeToolMCP:
 		out, err := pm.executeMCPTool(tool, args, timeout)
-		pm.proxyLogger.Infof("tool call name=%s type=%s duration_ms=%d err=%v", tool.Name, tool.Type, time.Since(start).Milliseconds(), err != nil)
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		pm.proxyLogger.Infof("tool call name=%s type=%s duration_ms=%d err=%v err_msg=%q", tool.Name, tool.Type, time.Since(start).Milliseconds(), err != nil, errMsg)
 		return out, err
 	default:
 		return "", fmt.Errorf("unsupported tool type %s", tool.Type)
 	}
 }
 
-func (pm *ProxyManager) executeHTTPTool(tool RuntimeTool, args map[string]any, timeoutSeconds int) (string, error) {
-	query := normalizeToolQuery(fmt.Sprintf("%v", args["query"]))
-	if query == "" {
-		return "", fmt.Errorf("missing query argument")
+func toolApprovalRequired(tool RuntimeTool, settings ToolRuntimeSettings, headers http.Header) (bool, string) {
+	if !(tool.RequireApproval || settings.RequireApprovalHeader) {
+		return false, settings.ApprovalHeaderName
 	}
+	headerName := strings.TrimSpace(settings.ApprovalHeaderName)
+	if headerName == "" {
+		headerName = "X-LlamaSwap-Tool-Approval"
+	}
+	val := strings.ToLower(strings.TrimSpace(headers.Get(headerName)))
+	if val == "1" || val == "true" || val == "yes" || val == "on" {
+		return false, headerName
+	}
+	return true, headerName
+}
 
-	raw := strings.ReplaceAll(tool.Endpoint, "{query}", url.QueryEscape(query))
+func isTruthyHeader(headers http.Header, key string) bool {
+	v := strings.ToLower(strings.TrimSpace(headers.Get(key)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func asMap(v any) (map[string]any, bool) {
+	if v == nil {
+		return nil, false
+	}
+	if m, ok := v.(map[string]any); ok {
+		return m, true
+	}
+	if m, ok := v.(map[string]interface{}); ok {
+		out := make(map[string]any, len(m))
+		for k, val := range m {
+			out[k] = val
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+func decodeJSONStringMap(v any) (map[string]any, bool) {
+	raw := strings.TrimSpace(fmt.Sprintf("%v", v))
+	if raw == "" || raw == "<nil>" {
+		return nil, false
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func (pm *ProxyManager) executeHTTPTool(tool RuntimeTool, args map[string]any, timeoutSeconds int) (string, error) {
+	raw, err := renderHTTPEndpoint(tool.Endpoint, normalizeHTTPArgs(args))
+	if err != nil {
+		return "", err
+	}
 	client := &http.Client{Timeout: time.Duration(timeoutSeconds) * time.Second}
 	resp, err := client.Get(raw)
 	if err != nil {
@@ -331,6 +452,67 @@ func (pm *ProxyManager) executeHTTPTool(tool RuntimeTool, args map[string]any, t
 	return string(body), nil
 }
 
+func normalizeHTTPArgs(args map[string]any) map[string]any {
+	if len(args) == 0 {
+		return args
+	}
+	out := map[string]any{}
+	for k, v := range args {
+		out[k] = v
+	}
+
+	// Unwrap common nested wrappers from model tool calls.
+	for _, key := range []string{"arguments", "args", "input"} {
+		if raw, ok := out[key]; ok {
+			if m, ok := asMap(raw); ok {
+				for mk, mv := range m {
+					if _, exists := out[mk]; !exists {
+						out[mk] = mv
+					}
+				}
+			} else if m, ok := decodeJSONStringMap(raw); ok {
+				for mk, mv := range m {
+					if _, exists := out[mk]; !exists {
+						out[mk] = mv
+					}
+				}
+			} else {
+				// Some models send a plain string in "arguments"/"input".
+				// Treat that as the primary query when no explicit query exists.
+				rawText := normalizeToolQuery(fmt.Sprintf("%v", raw))
+				if rawText != "" {
+					if _, exists := out["query"]; !exists {
+						out["query"] = rawText
+					}
+				}
+			}
+		}
+	}
+
+	// Query aliases often produced by smaller models.
+	if _, hasQuery := out["query"]; !hasQuery {
+		for _, k := range []string{"q", "search", "search_query", "text", "prompt", "term"} {
+			if v, ok := out[k]; ok {
+				out["query"] = v
+				break
+			}
+		}
+	}
+	if _, hasQuery := out["query"]; !hasQuery {
+		for k, v := range out {
+			if strings.EqualFold(k, "name") || strings.EqualFold(k, "tool") || strings.EqualFold(k, "tool_name") {
+				continue
+			}
+			raw := normalizeToolQuery(fmt.Sprintf("%v", v))
+			if raw != "" {
+				out["query"] = raw
+				break
+			}
+		}
+	}
+	return out
+}
+
 func normalizeToolQuery(raw string) string {
 	q := strings.TrimSpace(raw)
 	// Some models return {query} or "query" wrappers in function args.
@@ -341,10 +523,46 @@ func normalizeToolQuery(raw string) string {
 	return strings.TrimSpace(q)
 }
 
+func renderHTTPEndpoint(endpoint string, args map[string]any) (string, error) {
+	out := strings.TrimSpace(endpoint)
+	if out == "" {
+		return "", fmt.Errorf("tool endpoint is empty")
+	}
+
+	query := normalizeToolQuery(fmt.Sprintf("%v", args["query"]))
+	if query != "" {
+		out = strings.ReplaceAll(out, "{query}", url.QueryEscape(query))
+	}
+
+	for k, v := range args {
+		key := strings.TrimSpace(k)
+		if key == "" || strings.EqualFold(key, "query") {
+			continue
+		}
+		placeholder := "{" + key + "}"
+		value := strings.TrimSpace(fmt.Sprintf("%v", v))
+		if value == "" || strings.EqualFold(value, "<nil>") {
+			continue
+		}
+		out = strings.ReplaceAll(out, placeholder, url.QueryEscape(value))
+	}
+
+	if strings.Contains(out, "{") && strings.Contains(out, "}") {
+		return "", fmt.Errorf("missing tool args for endpoint template placeholders")
+	}
+	return out, nil
+}
+
 func (pm *ProxyManager) executeMCPTool(tool RuntimeTool, args map[string]any, timeoutSeconds int) (string, error) {
-	remoteName := strings.TrimSpace(tool.RemoteName)
-	if remoteName == "" {
-		remoteName = tool.Name
+	remoteName, callArgs, err := resolveMCPCall(tool, args)
+	if err != nil {
+		return "", err
+	}
+
+	client := &http.Client{Timeout: time.Duration(timeoutSeconds) * time.Second}
+	sessionID, err := mcpInitializeSession(client, tool.Endpoint)
+	if err != nil {
+		return "", err
 	}
 
 	reqBody := map[string]any{
@@ -353,31 +571,193 @@ func (pm *ProxyManager) executeMCPTool(tool RuntimeTool, args map[string]any, ti
 		"method":  "tools/call",
 		"params": map[string]any{
 			"name":      remoteName,
-			"arguments": args,
+			"arguments": callArgs,
 		},
 	}
-	b, _ := json.Marshal(reqBody)
-	client := &http.Client{Timeout: time.Duration(timeoutSeconds) * time.Second}
-	resp, err := client.Post(tool.Endpoint, "application/json", bytes.NewReader(b))
+	body, err := mcpPostJSONRPC(client, tool.Endpoint, sessionID, reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	payload := extractMCPPayload(body)
+	if len(payload) == 0 {
+		payload = body
+	}
+
+	if txt := gjson.GetBytes(payload, "result.content.0.text").String(); strings.TrimSpace(txt) != "" {
+		return txt, nil
+	}
+	if txt := gjson.GetBytes(payload, "result.text").String(); strings.TrimSpace(txt) != "" {
+		return txt, nil
+	}
+	if errMsg := strings.TrimSpace(gjson.GetBytes(payload, "error.message").String()); errMsg != "" {
+		return "", fmt.Errorf("mcp error: %s", errMsg)
+	}
+	return string(payload), nil
+}
+
+func resolveMCPCall(tool RuntimeTool, args map[string]any) (string, map[string]any, error) {
+	remoteName := strings.TrimSpace(tool.RemoteName)
+	callArgs := args
+
+	if remoteName != "" {
+		for _, key := range []string{"arguments", "args", "input"} {
+			if v, ok := args[key]; ok {
+				if m, ok := asMap(v); ok {
+					return remoteName, m, nil
+				}
+				if m, ok := decodeJSONStringMap(v); ok {
+					return remoteName, m, nil
+				}
+			}
+		}
+		return remoteName, callArgs, nil
+	}
+
+	for _, key := range []string{"name", "tool", "tool_name"} {
+		if v, ok := args[key]; ok {
+			name := strings.TrimSpace(fmt.Sprintf("%v", v))
+			if name != "" && !strings.EqualFold(name, "<nil>") {
+				remoteName = name
+				break
+			}
+		}
+	}
+	if remoteName == "" {
+		return "", nil, fmt.Errorf("mcp tool requires remote tool name (set remoteName or pass args.name)")
+	}
+
+	for _, key := range []string{"arguments", "args", "input"} {
+		if v, ok := args[key]; ok {
+			if m, ok := asMap(v); ok {
+				callArgs = m
+				return remoteName, callArgs, nil
+			}
+			if m, ok := decodeJSONStringMap(v); ok {
+				callArgs = m
+				return remoteName, callArgs, nil
+			}
+		}
+	}
+
+	// If arguments wrapper isn't present, pass through all fields except selector keys.
+	callArgs = make(map[string]any, len(args))
+	for k, v := range args {
+		lk := strings.ToLower(strings.TrimSpace(k))
+		if lk == "name" || lk == "tool" || lk == "tool_name" || lk == "arguments" || lk == "args" || lk == "input" {
+			continue
+		}
+		callArgs[k] = v
+	}
+	return remoteName, callArgs, nil
+}
+
+func mcpInitializeSession(client *http.Client, endpoint string) (string, error) {
+	initReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{},
+			"clientInfo": map[string]any{
+				"name":    "tbg-ollama-swap",
+				"version": "1.0.0",
+			},
+		},
+	}
+	initBody, err := json.Marshal(initReq)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(initBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("mcp status %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("mcp initialize status %d: %s", resp.StatusCode, string(respBody))
+	}
+	sessionID := strings.TrimSpace(resp.Header.Get("mcp-session-id"))
+	if sessionID == "" {
+		return "", fmt.Errorf("mcp initialize missing session id")
 	}
 
-	if txt := gjson.GetBytes(body, "result.content.0.text").String(); strings.TrimSpace(txt) != "" {
-		return txt, nil
+	notifyReq := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+		"params":  map[string]any{},
 	}
-	if txt := gjson.GetBytes(body, "result.text").String(); strings.TrimSpace(txt) != "" {
-		return txt, nil
+	if _, err := mcpPostJSONRPC(client, endpoint, sessionID, notifyReq); err != nil {
+		return "", err
 	}
-	return string(body), nil
+	return sessionID, nil
+}
+
+func mcpPostJSONRPC(client *http.Client, endpoint string, sessionID string, reqBody map[string]any) ([]byte, error) {
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	if strings.TrimSpace(sessionID) != "" {
+		req.Header.Set("mcp-session-id", sessionID)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("mcp status %d: %s", resp.StatusCode, string(body))
+	}
+	return body, nil
+}
+
+func extractMCPPayload(raw []byte) []byte {
+	body := bytes.TrimSpace(raw)
+	if len(body) == 0 {
+		return body
+	}
+	if json.Valid(body) {
+		return body
+	}
+	lines := strings.Split(string(body), "\n")
+	lastValid := []byte{}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			continue
+		}
+		candidate := []byte(data)
+		if json.Valid(candidate) {
+			lastValid = candidate
+		}
+	}
+	return lastValid
 }
 
 func isLocalHost(host string) bool {

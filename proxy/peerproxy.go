@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 )
 
 type peerProxyMember struct {
@@ -139,3 +139,4 @@ func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, re
 	pp.reverseProxy.ServeHTTP(writer, request)
 	return nil
 }
+

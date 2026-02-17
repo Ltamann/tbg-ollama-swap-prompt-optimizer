@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -117,3 +117,4 @@ func TestProcessGroup_ProxyRequestSwapIsFalse(t *testing.T) {
 		assert.Equal(t, StateReady, process.CurrentState())
 	}
 }
+

@@ -108,6 +108,15 @@
             "default": false,
             "description": "Present aliases within the /v1/models OpenAI API listing. when true, model aliases will be output to the API model listing duplicating all fields except for Id so chat UIs can use the alias equivalent to the original."
         },
+        "compatibilityMode": {
+            "type": "string",
+            "enum": [
+                "legacy",
+                "strict_openai"
+            ],
+            "default": "legacy",
+            "description": "OpenAI protocol compatibility behavior. legacy preserves existing behavior; strict_openai enforces capability checks and OpenAI-style error envelopes."
+        },
         "macros": {
             "$ref": "#/definitions/macros"
         },

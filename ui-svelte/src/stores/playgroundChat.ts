@@ -1,11 +1,28 @@
 import { get, writable } from "svelte/store";
 import type { ChatMessage, ContentPart, ChatSource } from "../lib/types";
-import { streamChatCompletion } from "../lib/chatApi";
+import { ChatAPIError, streamChatCompletion, type ChatRequestHeaders } from "../lib/chatApi";
 import { persistentStore } from "./persistent";
 
 export const chatMessagesStore = persistentStore<ChatMessage[]>("playground-chat-messages", []);
 export const chatIsStreamingStore = writable(false);
 export const chatIsReasoningStore = writable(false);
+
+export interface ToolApprovalCall {
+  name: string;
+  call_id?: string;
+  args?: Record<string, any>;
+}
+
+export interface PendingToolApproval {
+  headerName: string;
+  toolCalls: ToolApprovalCall[];
+  userIndex: number;
+  model: string;
+  systemPrompt: string;
+  settings: SamplingSettings;
+}
+
+export const pendingToolApprovalStore = writable<PendingToolApproval | null>(null);
 
 export interface SamplingSettings {
   temperature: number;
@@ -52,6 +69,29 @@ function updateLastAssistant(mutator: (msg: ChatMessage) => ChatMessage): void {
   chatMessagesStore.set(messages.map((msg, i) => (i === lastIndex ? mutator(msg) : msg)));
 }
 
+function applyReasoningFallbackIfNeeded(): void {
+  const messages = get(chatMessagesStore);
+  if (messages.length === 0) return;
+  const lastIndex = messages.length - 1;
+  const last = messages[lastIndex];
+  if (!last || last.role !== "assistant") return;
+
+  const content = typeof last.content === "string" ? last.content.trim() : "";
+  const reasoning = (last.reasoning_content || "").trim();
+  if (content === "" && reasoning !== "") {
+    chatMessagesStore.set(
+      messages.map((msg, i) =>
+        i === lastIndex
+          ? {
+              ...msg,
+              content: reasoning,
+            }
+          : msg
+      )
+    );
+  }
+}
+
 export function cancelChatStreaming(): void {
   abortController?.abort();
 }
@@ -69,7 +109,8 @@ export async function regenerateFromIndex(
 	idx: number,
 	model: string,
 	systemPrompt: string,
-	settings: SamplingSettings
+	settings: SamplingSettings,
+  requestHeaders?: ChatRequestHeaders
 ): Promise<void> {
   if (!model || get(chatIsStreamingStore)) return;
 
@@ -90,7 +131,11 @@ export async function regenerateFromIndex(
     }
     apiMessages.push(...messages.slice(0, -1));
 
-	const stream = streamChatCompletion(model, apiMessages, abortController.signal, settings);
+	const stream = streamChatCompletion(model, apiMessages, abortController.signal, settings, {
+      interactiveApproval: requestHeaders?.interactiveApproval ?? false,
+      approval: requestHeaders?.approval ?? false,
+      approvalHeaderName: requestHeaders?.approvalHeaderName,
+    });
 
     for await (const chunk of stream) {
       if (chunk.done) break;
@@ -126,12 +171,29 @@ export async function regenerateFromIndex(
         }));
       }
     }
+    applyReasoningFallbackIfNeeded();
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
       if (get(chatIsReasoningStore) && reasoningStartTime > 0) {
         const reasoningTimeMs = Date.now() - reasoningStartTime;
         updateLastAssistant((msg) => ({ ...msg, reasoningTimeMs }));
       }
+    } else if (error instanceof ChatAPIError && error.status === 409 && error.jsonBody?.error?.code === "tool_approval_required") {
+      const payload = error.jsonBody?.error || {};
+      const headerName = String(payload.header_name || "X-LlamaSwap-Tool-Approval");
+      const toolCalls = Array.isArray(payload.tool_calls) ? payload.tool_calls : [];
+      pendingToolApprovalStore.set({
+        headerName,
+        toolCalls,
+        userIndex: idx,
+        model,
+        systemPrompt,
+        settings: { ...settings },
+      });
+      updateLastAssistant((msg) => ({
+        ...msg,
+        content: "Tool execution requested. Please approve or deny in the dialog.",
+      }));
     } else {
       const errorMessage = error instanceof Error ? error.message : "An error occurred";
       updateLastAssistant((msg) => ({
@@ -184,8 +246,37 @@ export async function sendUserMessage(
   const userIndex = messages.length;
   chatMessagesStore.set([...messages, { role: "user", content }]);
 
-	await regenerateFromIndex(userIndex, model, systemPrompt, settings);
+	// Fire-and-forget so UI can clear input immediately after submit.
+	void regenerateFromIndex(userIndex, model, systemPrompt, settings);
   return true;
+}
+
+export async function approvePendingToolExecution(): Promise<void> {
+  const pending = get(pendingToolApprovalStore);
+  if (!pending || get(chatIsStreamingStore)) return;
+  pendingToolApprovalStore.set(null);
+  await regenerateFromIndex(
+    pending.userIndex,
+    pending.model,
+    pending.systemPrompt,
+    pending.settings,
+    { approval: true, interactiveApproval: true, approvalHeaderName: pending.headerName }
+  );
+}
+
+export function denyPendingToolExecution(reason?: string): void {
+  const pending = get(pendingToolApprovalStore);
+  if (!pending) return;
+  pendingToolApprovalStore.set(null);
+  const messages = get(chatMessagesStore);
+  if (messages.length === 0) return;
+  const denial = reason?.trim() ? `Tool execution denied by user. ${reason.trim()}` : "Tool execution denied by user.";
+  const lastIndex = messages.length - 1;
+  chatMessagesStore.set(messages.map((m, i) => (
+    i === lastIndex && m.role === "assistant"
+      ? { ...m, content: denial }
+      : m
+  )));
 }
 
 export async function editUserMessage(

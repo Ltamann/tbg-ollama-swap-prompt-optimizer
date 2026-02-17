@@ -6,7 +6,7 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 )
 
 type ProcessGroup struct {
@@ -155,3 +155,4 @@ func (pg *ProcessGroup) Shutdown() {
 	}
 	wg.Wait()
 }
+

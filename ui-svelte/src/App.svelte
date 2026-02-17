@@ -44,7 +44,7 @@
 <div class="flex flex-col h-screen">
   <Header />
 
-  <main class="flex-1 overflow-auto p-4">
+  <main class="flex-1 overflow-auto">
     <Router {routes} />
   </main>
 </div>

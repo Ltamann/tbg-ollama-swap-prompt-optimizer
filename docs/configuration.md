@@ -86,11 +86,11 @@ llama-swap supports many more features to customize how you want to manage your 
 ## Full Configuration Example
 
 > [!NOTE]
-> Always check [config.example.yaml](https://github.com/mostlygeek/llama-swap/blob/main/config.example.yaml) for the most up to date reference for all example configurations.
+> Always check [config.example.yaml](https://github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/blob/main/config.example.yaml) for the most up to date reference for all example configurations.
 
 ```yaml
 # add this modeline for validation in vscode
-# yaml-language-server: $schema=https://raw.githubusercontent.com/mostlygeek/llama-swap/refs/heads/main/config-schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Ltamann/tbg-ollama-swap-prompt-optimizer/refs/heads/main/config-schema.json
 #
 # llama-swap YAML configuration example
 # -------------------------------------

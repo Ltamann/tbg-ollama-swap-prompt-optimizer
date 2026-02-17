@@ -176,7 +176,8 @@ groups:
 				Preload: []string{"model1", "model2"},
 			},
 		},
-		SendLoadingState: false,
+		SendLoadingState:  false,
+		CompatibilityMode: "legacy",
 		Models: map[string]ModelConfig{
 			"model1": {
 				Cmd:              "path/to/cmd --arg1 one",

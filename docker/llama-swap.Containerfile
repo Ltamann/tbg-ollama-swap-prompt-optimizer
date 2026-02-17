@@ -4,7 +4,7 @@ FROM ${BASE_IMAGE}:${BASE_TAG}
 
 # has to be after the FROM
 ARG LS_VER=170
-ARG LS_REPO=mostlygeek/llama-swap
+ARG LS_REPO=Ltamann/tbg-ollama-swap-prompt-optimizer
 
 # Set default UID/GID arguments
 ARG UID=10001

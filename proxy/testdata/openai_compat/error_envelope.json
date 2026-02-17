@@ -1,0 +1,7 @@
+{
+  "error": {
+    "message": "missing or invalid 'model' key",
+    "type": "invalid_request_error",
+    "code": "bad_request"
+  }
+}

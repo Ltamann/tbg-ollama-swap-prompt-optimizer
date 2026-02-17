@@ -2,9 +2,12 @@ package proxy
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -12,15 +15,18 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/compat"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -36,6 +42,8 @@ type chatSource struct {
 	Title  string `json:"title,omitempty"`
 	Domain string `json:"domain,omitempty"`
 }
+
+var toolCallTagRegex = regexp.MustCompile(`(?is)<tool_call>\s*(\{.*?\})\s*</tool_call>`)
 
 type ProxyManager struct {
 	sync.Mutex
@@ -93,6 +101,7 @@ type ProxyManager struct {
 	activityCurrentUserSignature string
 	activityCurrentTurn          int
 	activityNextPromptID         int
+	compatCapabilities           compat.Registry
 }
 
 type PromptOptimizationPolicy string
@@ -245,6 +254,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 		tools:                     make([]RuntimeTool, 0),
 		toolSettings:              defaultToolRuntimeSettings(),
 		activityPromptPreviews:    make([]ActivityPromptPreview, 0),
+		compatCapabilities:        compat.NewDefaultRegistry(),
 	}
 	pm.loadToolsFromDisk()
 
@@ -866,13 +876,58 @@ func (pm *ProxyManager) proxyToUpstream(c *gin.Context) {
 }
 
 func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
-	bodyBytes, err := io.ReadAll(c.Request.Body)
+	rawBodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		pm.sendErrorResponse(c, http.StatusBadRequest, "could not ready request body")
 		return
 	}
+	bodyBytes := rawBodyBytes
+	if decoded, err := decodeRequestByContentEncoding(rawBodyBytes, c.Request.Header.Get("Content-Encoding")); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("invalid compressed request body: %s", err.Error()))
+		return
+	} else {
+		bodyBytes = decoded
+	}
+	pm.proxyLogger.Warnf(
+		"Incoming API request: method=%s path=%s headers=%s body=%s",
+		c.Request.Method,
+		c.Request.URL.Path,
+		safeHeadersJSON(c.Request.Header),
+		truncateForLog(string(bodyBytes), 120000),
+	)
+
+	norm, err := compat.NormalizeInferenceRequest(c.Request, bodyBytes)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	bodyBytes = norm.Body
+	pm.proxyLogger.Warnf("compat endpoint=%s path=%s", norm.Endpoint, c.Request.URL.Path)
+	isResponsesEndpoint := norm.Endpoint == compat.EndpointResponses
+	if pm.compatibilityMode() == "strict_openai" {
+		if err := pm.compatCapabilities.Validate(norm.Canonical); err != nil {
+			pm.sendErrorResponse(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	c.Set("compat_endpoint", string(norm.Endpoint))
+	c.Set("compat_canonical_model", norm.Canonical.Model)
 
 	requestedModel := gjson.GetBytes(bodyBytes, "model").String()
+	if requestedModel == "" {
+		if isResponsesEndpoint {
+			if fallbackModel, ok := pm.resolveResponsesFallbackModel(); ok {
+				requestedModel = fallbackModel
+				bodyBytes, err = sjson.SetBytes(bodyBytes, "model", fallbackModel)
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting fallback model in JSON: %s", err.Error()))
+					return
+				}
+				pm.proxyLogger.Warnf("Responses request missing model; falling back to '%s'", fallbackModel)
+			}
+		}
+	}
+
 	if requestedModel == "" {
 		pm.sendErrorResponse(c, http.StatusBadRequest, "missing or invalid 'model' key")
 		return
@@ -882,6 +937,26 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	var nextHandler func(modelID string, w http.ResponseWriter, r *http.Request) error
 
 	modelID, found := pm.config.RealModelName(requestedModel)
+	if !found && isResponsesEndpoint {
+		peerHasModel := false
+		if pm.peerProxy != nil {
+			peerHasModel = pm.peerProxy.HasPeerModel(requestedModel)
+		}
+		_, ollamaHasModel := pm.GetOllamaModelByID(requestedModel)
+		if !peerHasModel && !ollamaHasModel {
+			if fallbackModel, ok := pm.resolveResponsesFallbackModel(); ok && fallbackModel != requestedModel {
+				bodyBytes, err = sjson.SetBytes(bodyBytes, "model", fallbackModel)
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting fallback model in JSON: %s", err.Error()))
+					return
+				}
+				pm.proxyLogger.Warnf("Responses request model '%s' not found; falling back to '%s'", requestedModel, fallbackModel)
+				requestedModel = fallbackModel
+				modelID, found = pm.config.RealModelName(requestedModel)
+			}
+		}
+	}
+
 	if found {
 		processGroup, err := pm.swapProcessGroup(modelID)
 		if err != nil {
@@ -998,9 +1073,38 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 		return
 	}
 
-	if strings.HasPrefix(c.Request.URL.Path, "/v1/chat/completions") {
+	bridgeResponses := isResponsesEndpoint
+	responsesRequestedStream := false
+	if bridgeResponses {
+		acceptHeader := strings.ToLower(strings.TrimSpace(c.Request.Header.Get("Accept")))
+		acceptsEventStream := strings.Contains(acceptHeader, "text/event-stream")
+		responsesRequestedStream = gjson.GetBytes(bodyBytes, "stream").Bool() || acceptsEventStream
+		translated, err := translateResponsesToChatCompletionsRequest(bodyBytes)
+		if err != nil {
+			pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("invalid responses request: %s", err.Error()))
+			return
+		}
+		bodyBytes = translated
+		// Most local backends (including llama.cpp OpenAI server) are chat-completions-first.
+		c.Request.URL.Path = "/v1/chat/completions"
+	}
+
+	if !bridgeResponses && strings.HasPrefix(c.Request.URL.Path, "/v1/chat/completions") {
 		handled, err := pm.proxyWithToolsIfNeeded(c, modelID, nextHandler, bodyBytes)
 		if err != nil {
+			var approvalErr *ToolApprovalRequiredError
+			if errors.As(err, &approvalErr) {
+				c.JSON(http.StatusConflict, gin.H{
+					"error": gin.H{
+						"type":        "tool_approval_required",
+						"code":        "tool_approval_required",
+						"message":     "Tool execution requires user approval",
+						"header_name": approvalErr.HeaderName,
+						"tool_calls":  approvalErr.ToolCalls,
+					},
+				})
+				return
+			}
 			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("tool execution failed: %s", err.Error()))
 			return
 		}
@@ -1013,6 +1117,13 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 
 	// dechunk it as we already have all the body bytes see issue #11
 	c.Request.Header.Del("transfer-encoding")
+	c.Request.Header.Del("Transfer-Encoding")
+	// Body is rewritten as plain JSON in proxy, so remove any inbound encoding marker.
+	c.Request.Header.Del("content-encoding")
+	c.Request.Header.Del("Content-Encoding")
+	// Some clients send non-JSON content types to OpenAI-compatible endpoints.
+	// We always forward a JSON body, so normalize this header to avoid upstream 415s.
+	c.Request.Header.Set("Content-Type", "application/json")
 	c.Request.Header.Set("content-length", strconv.Itoa(len(bodyBytes)))
 	c.Request.ContentLength = int64(len(bodyBytes))
 
@@ -1022,6 +1133,111 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	ctx = context.WithValue(ctx, proxyCtxKey("model"), modelID)
 	c.Request = c.Request.WithContext(ctx)
 	pm.recordActivityPromptPreview(modelID, c.Request.URL.Path, bodyBytes, c.Request.Header)
+
+	if bridgeResponses {
+		pm.proxyLogger.Warnf("Responses bridge active for model=%s stream=%v", modelID, responsesRequestedStream)
+		pm.proxyLogger.Warnf("Responses bridge request payload: %s", truncateForLog(string(bodyBytes), 8000))
+		pm.proxyLogger.Warnf(
+			"Responses bridge request headers: %s path=%s",
+			safeHeadersJSON(c.Request.Header),
+			c.Request.URL.Path,
+		)
+		var (
+			statusCode int
+			respBody   []byte
+		)
+		// Reuse the existing tool loop for bridged responses so tool_calls are executed
+		// instead of being dropped during chat->responses translation.
+		if len(pm.getEnabledTools()) > 0 && gjson.GetBytes(bodyBytes, "messages").IsArray() {
+			working, err := sjson.SetBytes(bodyBytes, "stream", false)
+			if err != nil {
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error preparing bridged request: %s", err.Error()))
+				return
+			}
+			working, err = pm.injectToolSchemas(working)
+			if err != nil {
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error injecting tool schemas: %s", err.Error()))
+				return
+			}
+			maxIterations := pm.getToolRuntimeSettings().MaxToolRounds
+			respBody, statusCode, err = pm.runToolLoop(modelID, nextHandler, c.Request, working, maxIterations)
+			if err != nil {
+				var approvalErr *ToolApprovalRequiredError
+				if errors.As(err, &approvalErr) {
+					c.JSON(http.StatusConflict, gin.H{
+						"error": gin.H{
+							"type":        "tool_approval_required",
+							"code":        "tool_approval_required",
+							"message":     "Tool execution requires user approval",
+							"header_name": approvalErr.HeaderName,
+							"tool_calls":  approvalErr.ToolCalls,
+						},
+					})
+					return
+				}
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
+				pm.proxyLogger.Errorf("Error Proxying Bridged Responses Tool Request for model %s", modelID)
+				return
+			}
+		} else {
+			rr := &bridgeResponseRecorder{
+				ResponseRecorder: httptest.NewRecorder(),
+				closeChannel:     make(chan bool, 1),
+			}
+			if err := nextHandler(modelID, rr, c.Request); err != nil {
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
+				pm.proxyLogger.Errorf("Error Proxying Bridged Responses Request for model %s", modelID)
+				return
+			}
+			statusCode = rr.Code
+			if statusCode == 0 {
+				statusCode = http.StatusOK
+			}
+			respBody = rr.Body.Bytes()
+		}
+		if statusCode < 200 || statusCode >= 300 {
+			pm.proxyLogger.Warnf(
+				"Responses bridge upstream error: status=%d content-type=%q body=%s",
+				statusCode,
+				"",
+				truncateForLog(string(respBody), 8000),
+			)
+			c.Data(statusCode, "application/json", respBody)
+			return
+		}
+		respBody = bytes.TrimSpace(respBody)
+		if len(respBody) == 0 {
+			pm.proxyLogger.Warn("Responses bridge upstream returned empty body with success status")
+			pm.sendErrorResponse(c, http.StatusBadGateway, "responses bridge upstream returned empty body")
+			return
+		}
+		if !json.Valid(respBody) {
+			pm.proxyLogger.Warnf(
+				"Responses bridge upstream returned invalid JSON body: %s",
+				truncateForLog(string(respBody), 8000),
+			)
+			pm.sendErrorResponse(c, http.StatusBadGateway, "responses bridge upstream returned invalid JSON")
+			return
+		}
+		pm.proxyLogger.Warnf(
+			"Responses bridge upstream success: status=%d content-type=%q body=%s",
+			statusCode,
+			"",
+			truncateForLog(string(respBody), 120000),
+		)
+		out, err := translateChatCompletionToResponsesResponse(respBody)
+		if err != nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error translating response: %s", err.Error()))
+			return
+		}
+		pm.proxyLogger.Warnf("Responses bridge translated output: %s", truncateForLog(string(out), 120000))
+		if responsesRequestedStream {
+			writeResponsesStream(c, out)
+			return
+		}
+		c.Data(statusCode, "application/json", out)
+		return
+	}
 
 	if pm.metricsMonitor != nil && c.Request.Method == "POST" {
 		if err := pm.metricsMonitor.wrapHandler(modelID, c.Writer, c.Request, nextHandler); err != nil {
@@ -1036,6 +1252,719 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 			return
 		}
 	}
+}
+
+type bridgeResponseRecorder struct {
+	*httptest.ResponseRecorder
+	closeChannel chan bool
+}
+
+func (r *bridgeResponseRecorder) CloseNotify() <-chan bool {
+	return r.closeChannel
+}
+
+func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, err
+	}
+
+	out := map[string]any{}
+	copyField := func(key string) {
+		if v, ok := req[key]; ok {
+			out[key] = v
+		}
+	}
+	for _, key := range []string{
+		"model",
+		"temperature",
+		"top_p",
+		"presence_penalty",
+		"frequency_penalty",
+		"stop",
+		"n",
+		"tool_choice",
+		"parallel_tool_calls",
+		"metadata",
+	} {
+		copyField(key)
+	}
+	// Responses API tool entries can differ from chat/completions.
+	// Normalize to OpenAI chat format: {type:"function", function:{...}}.
+	if toolsRaw, ok := req["tools"].([]any); ok {
+		if normalized := normalizeChatTools(toolsRaw); len(normalized) > 0 {
+			out["tools"] = normalized
+		}
+	}
+
+	if v, ok := req["max_output_tokens"]; ok {
+		out["max_tokens"] = v
+	} else if v, ok := req["max_tokens"]; ok {
+		out["max_tokens"] = v
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	if len(messages) == 0 {
+		userText := extractResponsesInputText(req["input"])
+		userText = strings.TrimSpace(cleanFallbackInput(req["input"], userText))
+		messages = []map[string]any{{"role": "user", "content": userText}}
+	}
+	for _, m := range messages {
+		content, _ := m["content"].(string)
+		if strings.TrimSpace(content) == "" {
+			m["content"] = " "
+		}
+	}
+	out["messages"] = messages
+
+	// Keep this non-streaming for now; we translate to a stable JSON response object.
+	out["stream"] = false
+	return json.Marshal(out)
+}
+
+func normalizeChatTools(toolsRaw []any) []any {
+	out := make([]any, 0, len(toolsRaw))
+	for _, t := range toolsRaw {
+		m, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		// Already in chat format.
+		if fn, ok := m["function"].(map[string]any); ok {
+			if name, _ := fn["name"].(string); strings.TrimSpace(name) != "" {
+				out = append(out, map[string]any{
+					"type":     "function",
+					"function": fn,
+				})
+			}
+			continue
+		}
+
+		typ, _ := m["type"].(string)
+		if strings.TrimSpace(typ) != "" && typ != "function" {
+			// Drop tool kinds unsupported by chat/completions backends.
+			continue
+		}
+
+		name, _ := m["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+
+		fn := map[string]any{"name": name}
+		if desc, ok := m["description"].(string); ok && strings.TrimSpace(desc) != "" {
+			fn["description"] = desc
+		}
+		if params, ok := m["parameters"]; ok {
+			fn["parameters"] = params
+		}
+		if strict, ok := m["strict"]; ok {
+			fn["strict"] = strict
+		}
+
+		out = append(out, map[string]any{
+			"type":     "function",
+			"function": fn,
+		})
+	}
+	return out
+}
+
+func extractResponsesInputText(input any) string {
+	parts := make([]string, 0)
+	collectResponseText(input, &parts)
+	return strings.Join(parts, "\n")
+}
+
+func collectResponseText(v any, out *[]string) {
+	switch x := v.(type) {
+	case string:
+		s := strings.TrimSpace(x)
+		if s != "" {
+			*out = append(*out, s)
+		}
+	case []any:
+		for _, item := range x {
+			collectResponseText(item, out)
+		}
+	case map[string]any:
+		for _, key := range []string{"input_text", "text", "content", "value"} {
+			if child, ok := x[key]; ok {
+				collectResponseText(child, out)
+			}
+		}
+	}
+}
+
+func responsesRequestToChatMessages(req map[string]any) []map[string]any {
+	out := make([]map[string]any, 0)
+
+	if instructions, ok := req["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
+		out = append(out, map[string]any{
+			"role":    "system",
+			"content": strings.TrimSpace(instructions),
+		})
+	}
+
+	convertOne := func(role string, content any) {
+		if content == nil {
+			return
+		}
+		r := normalizeChatCompletionRole(role)
+		txt := extractResponsesInputText(content)
+		txt = strings.TrimSpace(cleanFallbackInput(content, txt))
+		if txt == "" {
+			return
+		}
+		out = append(out, map[string]any{
+			"role":    r,
+			"content": txt,
+		})
+	}
+
+	appendAssistantToolCall := func(name string, arguments any, callID string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		args := encodeAnyAsJSONString(arguments)
+		callID = strings.TrimSpace(callID)
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(out))
+		}
+		out = append(out, map[string]any{
+			"role":    "assistant",
+			"content": "",
+			"tool_calls": []any{
+				map[string]any{
+					"id":   callID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      name,
+						"arguments": args,
+					},
+				},
+			},
+		})
+	}
+
+	appendToolResult := func(callID string, output any) {
+		callID = strings.TrimSpace(callID)
+		if callID == "" {
+			return
+		}
+		txt := extractResponsesInputText(output)
+		txt = strings.TrimSpace(txt)
+		if txt == "" {
+			txt = encodeAnyAsJSONString(output)
+		}
+		txt = strings.TrimSpace(cleanFallbackInput(output, txt))
+		if txt == "" {
+			txt = " "
+		}
+		out = append(out, map[string]any{
+			"role":         "tool",
+			"tool_call_id": callID,
+			"content":      txt,
+		})
+	}
+
+	if messages, ok := req["messages"].([]any); ok {
+		for _, m := range messages {
+			obj, ok := m.(map[string]any)
+			if !ok {
+				continue
+			}
+			role, _ := obj["role"].(string)
+			if strings.EqualFold(strings.TrimSpace(role), "assistant") {
+				if tc, ok := obj["tool_calls"]; ok {
+					assistantText := extractResponsesInputText(obj["content"])
+					assistantText = strings.TrimSpace(cleanFallbackInput(obj["content"], assistantText))
+					out = append(out, map[string]any{
+						"role":       "assistant",
+						"content":    assistantText,
+						"tool_calls": tc,
+					})
+					continue
+				}
+			}
+			if strings.EqualFold(strings.TrimSpace(role), "tool") {
+				appendToolResult(
+					strings.TrimSpace(fmt.Sprintf("%v", obj["tool_call_id"])),
+					obj["content"],
+				)
+				continue
+			}
+			convertOne(role, obj["content"])
+		}
+		return out
+	}
+
+	if inputArr, ok := req["input"].([]any); ok {
+		for _, it := range inputArr {
+			obj, ok := it.(map[string]any)
+			if !ok {
+				continue
+			}
+			inputType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", obj["type"])))
+			switch inputType {
+			case "function_call":
+				appendAssistantToolCall(
+					strings.TrimSpace(fmt.Sprintf("%v", obj["name"])),
+					obj["arguments"],
+					strings.TrimSpace(fmt.Sprintf("%v", obj["call_id"])),
+				)
+				continue
+			case "function_call_output":
+				appendToolResult(
+					strings.TrimSpace(fmt.Sprintf("%v", obj["call_id"])),
+					obj["output"],
+				)
+				continue
+			case "message":
+				role, _ := obj["role"].(string)
+				convertOne(role, obj["content"])
+				continue
+			}
+			role, _ := obj["role"].(string)
+			if c, ok := obj["content"]; ok {
+				convertOne(role, c)
+			} else {
+				convertOne(role, obj)
+			}
+		}
+		return out
+	}
+
+	if input, ok := req["input"]; ok {
+		convertOne("user", input)
+	}
+	return out
+}
+
+func normalizeChatCompletionRole(role string) string {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "system", "user", "assistant", "tool":
+		return strings.ToLower(strings.TrimSpace(role))
+	case "developer":
+		// Local chat-completions backends often don't support "developer".
+		// Preserve intent by mapping it to system instructions.
+		return "system"
+	default:
+		return "user"
+	}
+}
+
+func cleanFallbackInput(raw any, preferred string) string {
+	if strings.TrimSpace(preferred) != "" {
+		return preferred
+	}
+	if raw == nil {
+		return ""
+	}
+	s := strings.TrimSpace(fmt.Sprintf("%v", raw))
+	lower := strings.ToLower(s)
+	if s == "" || lower == "<nil>" || lower == "null" || lower == "[]" || lower == "{}" {
+		return ""
+	}
+	return s
+}
+
+func encodeAnyAsJSONString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(x)
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return strings.TrimSpace(fmt.Sprintf("%v", v))
+		}
+		return strings.TrimSpace(string(b))
+	}
+}
+
+func translateChatCompletionToResponsesResponse(body []byte) ([]byte, error) {
+	message := gjson.GetBytes(body, "choices.0.message")
+	if !message.Exists() || strings.TrimSpace(message.Raw) == "" || message.Type == gjson.Null {
+		return nil, errors.New("chat completion missing choices[0].message")
+	}
+
+	id := strings.TrimSpace(gjson.GetBytes(body, "id").String())
+	if id == "" {
+		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	text := message.Get("content").String()
+	output := make([]any, 0, 2)
+
+	toolCalls := message.Get("tool_calls")
+	functionCall := message.Get("function_call")
+	hasToolCalls := toolCalls.IsArray() && len(toolCalls.Array()) > 0
+	hasFunctionCall := functionCall.Exists() && strings.TrimSpace(functionCall.Get("name").String()) != ""
+
+	if strings.TrimSpace(text) != "" || (!hasToolCalls && !hasFunctionCall) {
+		output = append(output, map[string]any{
+			"id":   "msg_" + id,
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{
+					"type": "output_text",
+					"text": text,
+				},
+			},
+		})
+	}
+
+	appendFunctionCall := func(callID, name, arguments string, index int) {
+		callID = strings.TrimSpace(callID)
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), index)
+		}
+		output = append(output, map[string]any{
+			"id":        fmt.Sprintf("fc_%s", callID),
+			"type":      "function_call",
+			"call_id":   callID,
+			"name":      strings.TrimSpace(name),
+			"arguments": arguments,
+			"status":    "completed",
+		})
+	}
+
+	if hasToolCalls {
+		idx := 0
+		toolCalls.ForEach(func(_, tc gjson.Result) bool {
+			appendFunctionCall(
+				tc.Get("id").String(),
+				tc.Get("function.name").String(),
+				tc.Get("function.arguments").String(),
+				idx,
+			)
+			idx++
+			return true
+		})
+	} else if hasFunctionCall {
+		appendFunctionCall(
+			"",
+			functionCall.Get("name").String(),
+			functionCall.Get("arguments").String(),
+			0,
+		)
+	}
+
+	resp := map[string]any{
+		"id":          "resp_" + id,
+		"object":      "response",
+		"created_at":  time.Now().Unix(),
+		"status":      "completed",
+		"model":       model,
+		"output":      output,
+		"output_text": text,
+	}
+	if created := gjson.GetBytes(body, "created").Int(); created > 0 {
+		resp["created_at"] = created
+	}
+
+	usage := gjson.GetBytes(body, "usage")
+	if usage.Exists() {
+		resp["usage"] = map[string]any{
+			"input_tokens":  usage.Get("prompt_tokens").Int(),
+			"output_tokens": usage.Get("completion_tokens").Int(),
+			"total_tokens":  usage.Get("total_tokens").Int(),
+		}
+	}
+	return json.Marshal(resp)
+}
+
+func truncateForLog(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "...<truncated>"
+}
+
+func safeHeadersJSON(h http.Header) string {
+	clone := make(map[string][]string, len(h))
+	for k, v := range h {
+		keyLower := strings.ToLower(strings.TrimSpace(k))
+		if keyLower == "authorization" || keyLower == "x-api-key" {
+			clone[k] = []string{"<redacted>"}
+			continue
+		}
+		clone[k] = append([]string(nil), v...)
+	}
+	b, err := json.Marshal(clone)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+func decodeRequestByContentEncoding(body []byte, encodingHeader string) ([]byte, error) {
+	encoding := strings.ToLower(strings.TrimSpace(encodingHeader))
+	if encoding == "" || encoding == "identity" {
+		return body, nil
+	}
+
+	// Handle headers such as "zstd, br" by taking the first encoding token.
+	if idx := strings.Index(encoding, ","); idx > 0 {
+		encoding = strings.TrimSpace(encoding[:idx])
+	}
+
+	switch encoding {
+	case "gzip":
+		r, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		return io.ReadAll(r)
+	case "deflate":
+		r := flate.NewReader(bytes.NewReader(body))
+		defer r.Close()
+		return io.ReadAll(r)
+	case "zstd":
+		r, err := zstd.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		return io.ReadAll(r)
+	default:
+		return nil, fmt.Errorf("unsupported content-encoding: %s", encoding)
+	}
+}
+
+func writeResponsesStream(c *gin.Context, responseJSON []byte) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	sequence := 0
+	writeEvent := func(eventType string, payload map[string]any) {
+		if _, ok := payload["type"]; !ok {
+			payload["type"] = eventType
+		}
+		payload["sequence_number"] = sequence
+		sequence++
+		data, _ := json.Marshal(payload)
+		_, _ = c.Writer.Write([]byte("event: " + eventType + "\n"))
+		_, _ = c.Writer.Write([]byte("data: " + string(data) + "\n\n"))
+		c.Writer.Flush()
+	}
+
+	var full map[string]any
+	if err := json.Unmarshal(responseJSON, &full); err != nil {
+		full = map[string]any{}
+	}
+
+	respID := strings.TrimSpace(gjson.GetBytes(responseJSON, "id").String())
+	if respID == "" {
+		respID = fmt.Sprintf("resp_%d", time.Now().UnixNano())
+	}
+	createdAt := gjson.GetBytes(responseJSON, "created_at").Int()
+	if createdAt == 0 {
+		createdAt = time.Now().Unix()
+	}
+	model := strings.TrimSpace(gjson.GetBytes(responseJSON, "model").String())
+	responseSkeleton := map[string]any{
+		"id":         respID,
+		"object":     "response",
+		"created_at": createdAt,
+		"model":      model,
+		"status":     "in_progress",
+		"output":     []any{},
+	}
+
+	writeEvent("response.created", map[string]any{
+		"type":     "response.created",
+		"response": responseSkeleton,
+	})
+	writeEvent("response.in_progress", map[string]any{
+		"type":     "response.in_progress",
+		"response": responseSkeleton,
+	})
+
+	emitMessagePart := func(itemID string, outputIndex int, contentIndex int, part map[string]any) {
+		partType := strings.TrimSpace(fmt.Sprintf("%v", part["type"]))
+		if partType == "" {
+			partType = "output_text"
+		}
+		text := strings.TrimSpace(fmt.Sprintf("%v", part["text"]))
+		partAdded := map[string]any{"type": partType}
+		partDone := map[string]any{"type": partType}
+		if partType == "output_text" {
+			partAdded["text"] = ""
+			partDone["text"] = text
+		} else if text != "" {
+			partAdded["text"] = text
+			partDone["text"] = text
+		}
+		writeEvent("response.content_part.added", map[string]any{
+			"type":          "response.content_part.added",
+			"response_id":   respID,
+			"item_id":       itemID,
+			"output_index":  outputIndex,
+			"content_index": contentIndex,
+			"part":          partAdded,
+		})
+		if partType == "output_text" && text != "" {
+			writeEvent("response.output_text.delta", map[string]any{
+				"type":          "response.output_text.delta",
+				"response_id":   respID,
+				"item_id":       itemID,
+				"output_index":  outputIndex,
+				"content_index": contentIndex,
+				"delta":         text,
+			})
+		}
+		if partType == "output_text" {
+			writeEvent("response.output_text.done", map[string]any{
+				"type":          "response.output_text.done",
+				"response_id":   respID,
+				"item_id":       itemID,
+				"output_index":  outputIndex,
+				"content_index": contentIndex,
+				"text":          text,
+			})
+		}
+		writeEvent("response.content_part.done", map[string]any{
+			"type":          "response.content_part.done",
+			"response_id":   respID,
+			"item_id":       itemID,
+			"output_index":  outputIndex,
+			"content_index": contentIndex,
+			"part":          partDone,
+		})
+	}
+
+	output := gjson.GetBytes(responseJSON, "output").Array()
+	if len(output) == 0 {
+		// Fallback for text-only responses missing output array.
+		text := gjson.GetBytes(responseJSON, "output_text").String()
+		if strings.TrimSpace(text) != "" {
+			fallbackItemID := "msg_" + respID
+			item := map[string]any{
+				"id":      fallbackItemID,
+				"type":    "message",
+				"role":    "assistant",
+				"status":  "completed",
+				"content": []any{map[string]any{"type": "output_text", "text": text}},
+			}
+			writeEvent("response.output_item.added", map[string]any{
+				"type":         "response.output_item.added",
+				"response_id":  respID,
+				"output_index": 0,
+				"item":         item,
+			})
+			emitMessagePart(fallbackItemID, 0, 0, map[string]any{
+				"type": "output_text",
+				"text": text,
+			})
+			writeEvent("response.output_item.done", map[string]any{
+				"type":         "response.output_item.done",
+				"response_id":  respID,
+				"output_index": 0,
+				"item":         item,
+			})
+		}
+	}
+
+	for i, itemResult := range output {
+		itemRaw := strings.TrimSpace(itemResult.Raw)
+		if itemRaw == "" {
+			continue
+		}
+		item := map[string]any{}
+		if err := json.Unmarshal([]byte(itemRaw), &item); err != nil {
+			continue
+		}
+		itemType := strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
+		itemID := strings.TrimSpace(fmt.Sprintf("%v", item["id"]))
+		if itemID == "" {
+			if itemType == "function_call" {
+				itemID = fmt.Sprintf("fc_%s_%d", respID, i)
+			} else {
+				itemID = fmt.Sprintf("msg_%s_%d", respID, i)
+			}
+			item["id"] = itemID
+		}
+
+		writeEvent("response.output_item.added", map[string]any{
+			"type":         "response.output_item.added",
+			"response_id":  respID,
+			"output_index": i,
+			"item":         item,
+		})
+
+		if itemType == "message" {
+			if content, ok := item["content"].([]any); ok {
+				for contentIndex, contentPart := range content {
+					part, ok := contentPart.(map[string]any)
+					if !ok {
+						continue
+					}
+					emitMessagePart(itemID, i, contentIndex, part)
+				}
+			}
+		}
+
+		if itemType == "function_call" {
+			args := encodeAnyAsJSONString(item["arguments"])
+			callID := strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))
+			if callID == "" {
+				callID = itemID
+			}
+			if args != "" {
+				writeEvent("response.function_call_arguments.delta", map[string]any{
+					"type":         "response.function_call_arguments.delta",
+					"response_id":  respID,
+					"output_index": i,
+					"item_id":      itemID,
+					"delta":        args,
+				})
+			}
+			writeEvent("response.function_call_arguments.done", map[string]any{
+				"type":         "response.function_call_arguments.done",
+				"response_id":  respID,
+				"output_index": i,
+				"item_id":      itemID,
+				"call_id":      callID,
+				"arguments":    args,
+			})
+		}
+
+		writeEvent("response.output_item.done", map[string]any{
+			"type":         "response.output_item.done",
+			"response_id":  respID,
+			"output_index": i,
+			"item":         item,
+		})
+	}
+
+	if len(full) > 0 {
+		writeEvent("response.completed", map[string]any{
+			"type":     "response.completed",
+			"response": full,
+		})
+	} else {
+		writeEvent("response.completed", map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id":     respID,
+				"object": "response",
+				"status": "completed",
+			},
+		})
+	}
+
+	_, _ = c.Writer.Write([]byte("data: [DONE]\n\n"))
+	c.Writer.Flush()
 }
 
 func (pm *ProxyManager) proxyWithToolsIfNeeded(
@@ -1175,8 +2104,16 @@ func (pm *ProxyManager) invokeInferenceOnce(
 	pm.recordActivityPromptPreview(modelID, req.URL.Path, body, req.Header)
 
 	rr := httptest.NewRecorder()
-	if err := nextHandler(modelID, rr, req); err != nil {
-		return nil, 0, err
+	testCtx, _ := gin.CreateTestContext(rr)
+	testCtx.Request = req
+	if pm.metricsMonitor != nil && req.Method == http.MethodPost {
+		if err := pm.metricsMonitor.wrapHandler(modelID, testCtx.Writer, req, nextHandler); err != nil {
+			return nil, 0, err
+		}
+	} else {
+		if err := nextHandler(modelID, testCtx.Writer, req); err != nil {
+			return nil, 0, err
+		}
 	}
 	status := rr.Code
 	if status == 0 {
@@ -1196,6 +2133,30 @@ func (pm *ProxyManager) runToolLoop(
 	finalBody := initialBody
 	finalStatus := http.StatusOK
 	sourceMap := map[string]chatSource{}
+	attachSources := func(body []byte, status int) []byte {
+		if len(sourceMap) == 0 || status < 200 || status >= 300 {
+			return body
+		}
+		sources := make([]chatSource, 0, len(sourceMap))
+		for _, src := range sourceMap {
+			sources = append(sources, src)
+		}
+		sort.Slice(sources, func(i, j int) bool {
+			return sources[i].URL < sources[j].URL
+		})
+		if b, err := json.Marshal(sources); err == nil {
+			if withSources, err := sjson.SetRawBytes(body, "choices.0.message.sources", b); err == nil {
+				return withSources
+			}
+		}
+		return body
+	}
+	interactiveApproval := isTruthyHeader(orig.Header, "X-LlamaSwap-Tool-Approval-Interactive")
+	approvalHeaderName := pm.getToolRuntimeSettings().ApprovalHeaderName
+	if strings.TrimSpace(approvalHeaderName) == "" {
+		approvalHeaderName = "X-LlamaSwap-Tool-Approval"
+	}
+	approvedNow := isTruthyHeader(orig.Header, approvalHeaderName)
 
 	for i := 0; i < maxIterations; i++ {
 		respBody, statusCode, err := pm.invokeInferenceOnce(modelID, nextHandler, orig, working)
@@ -1205,15 +2166,37 @@ func (pm *ProxyManager) runToolLoop(
 		finalBody = respBody
 		finalStatus = statusCode
 		if statusCode < 200 || statusCode >= 300 {
-			return finalBody, finalStatus, nil
+			return attachSources(finalBody, finalStatus), finalStatus, nil
 		}
 
 		toolCalls := gjson.GetBytes(respBody, "choices.0.message.tool_calls")
 		hasToolCalls := toolCalls.IsArray() && len(toolCalls.Array()) > 0
 		functionCall := gjson.GetBytes(respBody, "choices.0.message.function_call")
 		hasFunctionCall := functionCall.Exists() && strings.TrimSpace(functionCall.Get("name").String()) != ""
-		if !hasToolCalls && !hasFunctionCall {
-			return finalBody, finalStatus, nil
+		settings := pm.getToolRuntimeSettings()
+		embeddedCalls := make([]ToolApprovalCall, 0)
+		if !hasToolCalls && !hasFunctionCall && settings.WatchdogMode != "off" {
+			assistantText := strings.TrimSpace(gjson.GetBytes(respBody, "choices.0.message.content").String())
+			embeddedCalls = parseEmbeddedToolCalls(assistantText)
+		} else if !hasToolCalls && !hasFunctionCall {
+			assistantText := strings.TrimSpace(gjson.GetBytes(respBody, "choices.0.message.content").String())
+			parsed := parseEmbeddedToolCalls(assistantText)
+			for _, call := range parsed {
+				name := strings.TrimSpace(call.Name)
+				if name == "" {
+					continue
+				}
+				tool, ok := pm.toolByName(name)
+				if !ok {
+					continue
+				}
+				if tool.Policy == ToolPolicyWatchdog {
+					embeddedCalls = append(embeddedCalls, call)
+				}
+			}
+		}
+		if !hasToolCalls && !hasFunctionCall && len(embeddedCalls) == 0 {
+			return attachSources(finalBody, finalStatus), finalStatus, nil
 		}
 
 		var reqMap map[string]any
@@ -1227,6 +2210,7 @@ func (pm *ProxyManager) runToolLoop(
 			rawMessages = append(rawMessages, assistantMsg)
 		}
 
+		pendingCalls := make([]ToolApprovalCall, 0)
 		if hasToolCalls {
 			toolCalls.ForEach(func(_, tc gjson.Result) bool {
 				callID := strings.TrimSpace(tc.Get("id").String())
@@ -1236,30 +2220,33 @@ func (pm *ProxyManager) runToolLoop(
 				if strings.TrimSpace(argText) != "" {
 					_ = json.Unmarshal([]byte(argText), &args)
 				}
-				out, execErr := pm.executeToolCall(toolName, args, orig.Header)
-				if execErr != nil {
-					out = fmt.Sprintf("tool error: %v", execErr)
-				}
-				for _, src := range extractSourcesFromToolOutput(out) {
-					if strings.TrimSpace(src.URL) == "" {
-						continue
-					}
-					sourceMap[src.URL] = src
-				}
-				rawMessages = append(rawMessages, map[string]any{
-					"role":         "tool",
-					"tool_call_id": callID,
-					"name":         toolName,
-					"content":      out,
-				})
+				pendingCalls = append(pendingCalls, ToolApprovalCall{Name: toolName, CallID: callID, Args: args})
 				return true
 			})
-		} else {
+		} else if hasFunctionCall {
 			toolName := strings.TrimSpace(functionCall.Get("name").String())
 			argText := functionCall.Get("arguments").String()
 			args := map[string]any{}
 			if strings.TrimSpace(argText) != "" {
 				_ = json.Unmarshal([]byte(argText), &args)
+			}
+			pendingCalls = append(pendingCalls, ToolApprovalCall{Name: toolName, Args: args})
+		} else if len(embeddedCalls) > 0 {
+			pendingCalls = append(pendingCalls, embeddedCalls...)
+		}
+
+		if interactiveApproval && !approvedNow && len(pendingCalls) > 0 {
+			return nil, 0, &ToolApprovalRequiredError{
+				HeaderName: approvalHeaderName,
+				ToolCalls:  pendingCalls,
+			}
+		}
+
+		for _, call := range pendingCalls {
+			toolName := strings.TrimSpace(call.Name)
+			args := call.Args
+			if args == nil {
+				args = map[string]any{}
 			}
 			out, execErr := pm.executeToolCall(toolName, args, orig.Header)
 			if execErr != nil {
@@ -1271,11 +2258,15 @@ func (pm *ProxyManager) runToolLoop(
 				}
 				sourceMap[src.URL] = src
 			}
-			rawMessages = append(rawMessages, map[string]any{
+			msg := map[string]any{
 				"role":    "tool",
 				"name":    toolName,
 				"content": out,
-			})
+			}
+			if strings.TrimSpace(call.CallID) != "" {
+				msg["tool_call_id"] = call.CallID
+			}
+			rawMessages = append(rawMessages, msg)
 		}
 
 		reqMap["messages"] = rawMessages
@@ -1289,22 +2280,49 @@ func (pm *ProxyManager) runToolLoop(
 		}
 		working = nextBody
 	}
-	if len(sourceMap) > 0 && finalStatus >= 200 && finalStatus < 300 {
-		sources := make([]chatSource, 0, len(sourceMap))
-		for _, src := range sourceMap {
-			sources = append(sources, src)
+	return attachSources(finalBody, finalStatus), finalStatus, nil
+}
+
+func parseEmbeddedToolCalls(content string) []ToolApprovalCall {
+	text := strings.TrimSpace(content)
+	if text == "" {
+		return nil
+	}
+	matches := toolCallTagRegex.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make([]ToolApprovalCall, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
 		}
-		sort.Slice(sources, func(i, j int) bool {
-			return sources[i].URL < sources[j].URL
-		})
-		if b, err := json.Marshal(sources); err == nil {
-			if withSources, err := sjson.SetRawBytes(finalBody, "choices.0.message.sources", b); err == nil {
-				finalBody = withSources
+		raw := strings.TrimSpace(match[1])
+		if raw == "" {
+			continue
+		}
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+			continue
+		}
+		name := strings.TrimSpace(fmt.Sprintf("%v", obj["name"]))
+		if name == "" || strings.EqualFold(name, "<nil>") {
+			continue
+		}
+		args := map[string]any{}
+		if v, ok := obj["arguments"]; ok {
+			if m, ok := asMap(v); ok {
+				args = m
+			} else if m, ok := decodeJSONStringMap(v); ok {
+				args = m
 			}
 		}
+		out = append(out, ToolApprovalCall{
+			Name: name,
+			Args: args,
+		})
 	}
-
-	return finalBody, finalStatus, nil
+	return out
 }
 
 func extractSourcesFromToolOutput(out string) []chatSource {
@@ -1804,12 +2822,26 @@ func (pm *ProxyManager) proxyGETModelHandler(c *gin.Context) {
 
 func (pm *ProxyManager) sendErrorResponse(c *gin.Context, statusCode int, message string) {
 	acceptHeader := c.GetHeader("Accept")
+	isInference := compat.IsInferencePath(c.Request.URL.Path)
 
-	if strings.Contains(acceptHeader, "application/json") {
-		c.JSON(statusCode, gin.H{"error": message})
+	if isInference && pm.compatibilityMode() == "strict_openai" {
+		c.JSON(statusCode, compat.NewErrorEnvelope(statusCode, message, ""))
+		return
+	}
+
+	if strings.Contains(acceptHeader, "application/json") || isInference {
+		c.JSON(statusCode, compat.NewErrorEnvelope(statusCode, message, ""))
 	} else {
 		c.String(statusCode, message)
 	}
+}
+
+func (pm *ProxyManager) compatibilityMode() string {
+	mode := strings.ToLower(strings.TrimSpace(pm.config.CompatibilityMode))
+	if mode == "" {
+		return "legacy"
+	}
+	return mode
 }
 
 // apiKeyAuth returns a middleware that validates API keys if configured.
@@ -1913,6 +2945,35 @@ func (pm *ProxyManager) findGroupByModelName(modelName string) *ProcessGroup {
 		}
 	}
 	return nil
+}
+
+func (pm *ProxyManager) resolveResponsesFallbackModel() (string, bool) {
+	pm.Lock()
+	defer pm.Unlock()
+
+	readyModels := make([]string, 0)
+	for _, processGroup := range pm.processGroups {
+		for _, process := range processGroup.processes {
+			if process.CurrentState() == StateReady {
+				readyModels = append(readyModels, process.ID)
+			}
+		}
+	}
+	if len(readyModels) > 0 {
+		sort.Strings(readyModels)
+		return readyModels[0], true
+	}
+
+	if len(pm.config.Models) == 0 {
+		return "", false
+	}
+
+	modelIDs := make([]string, 0, len(pm.config.Models))
+	for modelID := range pm.config.Models {
+		modelIDs = append(modelIDs, modelID)
+	}
+	sort.Strings(modelIDs)
+	return modelIDs[0], true
 }
 
 func (pm *ProxyManager) SetVersion(buildDate string, commit string, version string) {

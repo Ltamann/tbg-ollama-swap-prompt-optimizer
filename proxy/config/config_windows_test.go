@@ -163,7 +163,8 @@ groups:
 		Macros: MacroList{
 			{"svr-path", "path/to/server"},
 		},
-		SendLoadingState: false,
+		SendLoadingState:  false,
+		CompatibilityMode: "legacy",
 		Models: map[string]ModelConfig{
 			"model1": {
 				Cmd:              "path/to/cmd --arg1 one",

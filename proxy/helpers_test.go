@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -60,9 +61,19 @@ func getTestPort() int {
 	portMutex.Lock()
 	defer portMutex.Unlock()
 
+	// Prefer an actually available ephemeral port to reduce flaky collisions
+	// with local services on developer machines/CI workers.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err == nil {
+		defer l.Close()
+		if addr, ok := l.Addr().(*net.TCPAddr); ok && addr.Port > 0 {
+			return addr.Port
+		}
+	}
+
+	// Fallback to deterministic sequence if ephemeral allocation fails.
 	port := nextTestPort
 	nextTestPort++
-
 	return port
 }
 
@@ -88,3 +99,4 @@ proxy: "http://127.0.0.1:%d"
 
 	return cfg
 }
+

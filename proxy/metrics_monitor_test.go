@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -1126,3 +1126,4 @@ func TestMetricsMonitor_WrapHandler_Capture(t *testing.T) {
 		assert.Nil(t, capture)
 	})
 }
+

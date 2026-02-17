@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
 	"github.com/tidwall/gjson"
 )
 
@@ -513,3 +513,4 @@ func filterAcceptEncoding(acceptEncoding string) string {
 
 	return strings.Join(filtered, ", ")
 }
+

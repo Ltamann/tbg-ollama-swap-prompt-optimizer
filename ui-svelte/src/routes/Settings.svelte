@@ -66,6 +66,7 @@
   let toolSettings = $state<ToolRuntimeSettings>({
     enabled: true,
     webSearchMode: "auto",
+    watchdogMode: "off",
     requireApprovalHeader: false,
     approvalHeaderName: "X-LlamaSwap-Tool-Approval",
     blockNonLocalEndpoints: true,
@@ -197,7 +198,11 @@
 
   async function loadToolSettings(): Promise<void> {
     try {
-      toolSettings = await getToolRuntimeSettings();
+      const loaded = await getToolRuntimeSettings();
+      toolSettings = {
+        ...loaded,
+        watchdogMode: loaded.watchdogMode || "off",
+      };
     } catch (error) {
       console.error("Failed to load tool runtime settings", error);
     }
@@ -376,7 +381,7 @@
           </td>
           <td class="py-2">
             <select
-              class="w-full rounded border border-gray-300 dark:border-white/20 bg-surface px-2 py-1 text-sm"
+              class="settings-select w-full rounded border border-gray-300 dark:border-white/20 px-2 py-1 text-sm"
               value={selected}
               disabled={loading[model.id]}
               onchange={(e) => onPolicyChange(model, (e.currentTarget as HTMLSelectElement).value)}
@@ -426,10 +431,17 @@
       </label>
       <label class="text-sm">
         Web Search Routing
-        <select class="w-full mt-1 rounded border border-gray-300 dark:border-white/20 bg-card px-2 py-1 text-sm" bind:value={toolSettings.webSearchMode} onchange={() => void persistToolSettings()}>
+        <select class="settings-select w-full mt-1 rounded border border-gray-300 dark:border-white/20 px-2 py-1 text-sm" bind:value={toolSettings.webSearchMode} onchange={() => void persistToolSettings()}>
           <option value="off">Off</option>
           <option value="auto">Auto</option>
           <option value="force">Force First (search-like prompts)</option>
+        </select>
+      </label>
+      <label class="text-sm">
+        Watchdog
+        <select class="settings-select w-full mt-1 rounded border border-gray-300 dark:border-white/20 px-2 py-1 text-sm" bind:value={toolSettings.watchdogMode} onchange={() => void persistToolSettings()}>
+          <option value="off">off</option>
+          <option value="auto">auto (global)</option>
         </select>
       </label>
       <label class="text-sm">
@@ -443,14 +455,6 @@
       <label class="text-sm">
         Max Running Models
         <input class="w-full mt-1 rounded border border-gray-300 dark:border-white/20 bg-card px-2 py-1 text-sm" type="number" min="1" max="64" bind:value={toolSettings.maxRunningModels} onchange={() => void persistToolSettings()} />
-      </label>
-      <label class="flex items-center gap-2 text-sm">
-        <input type="checkbox" checked={toolSettings.requireApprovalHeader} onchange={(e) => { toolSettings = { ...toolSettings, requireApprovalHeader: (e.currentTarget as HTMLInputElement).checked }; void persistToolSettings(); }} />
-        Require Approval Header
-      </label>
-      <label class="text-sm">
-        Approval Header Name
-        <input class="w-full mt-1 rounded border border-gray-300 dark:border-white/20 bg-card px-2 py-1 text-sm" bind:value={toolSettings.approvalHeaderName} onchange={() => void persistToolSettings()} />
       </label>
     </div>
   </div>
@@ -467,7 +471,7 @@
       bind:value={draftToolName}
     />
     <select
-      class="rounded border border-gray-300 dark:border-white/20 bg-surface px-2 py-1 text-sm"
+      class="settings-select rounded border border-gray-300 dark:border-white/20 px-2 py-1 text-sm"
       bind:value={draftToolType}
     >
       <option value="http">http</option>
@@ -531,7 +535,7 @@
             </td>
             <td class="py-2">
               <select
-                class="rounded border border-gray-300 dark:border-white/20 bg-card px-2 py-1 text-xs"
+                class="settings-select rounded border border-gray-300 dark:border-white/20 px-2 py-1 text-xs"
                 value={edit.type}
                 onchange={(e) => setToolEdit(tool.id, { type: (e.currentTarget as HTMLSelectElement).value as RuntimeToolType })}
               >
@@ -541,12 +545,13 @@
             </td>
             <td class="py-2">
               <select
-                class="rounded border border-gray-300 dark:border-white/20 bg-card px-2 py-1 text-xs"
+                class="settings-select rounded border border-gray-300 dark:border-white/20 px-2 py-1 text-xs"
                 value={edit.policy || "auto"}
                 onchange={(e) => setToolEdit(tool.id, { policy: (e.currentTarget as HTMLSelectElement).value as RuntimeToolPolicy })}
               >
                 <option value="auto">auto</option>
                 <option value="always">always</option>
+                <option value="watchdog">watchdog</option>
                 <option value="never">never</option>
               </select>
             </td>
@@ -564,10 +569,6 @@
               />
             </td>
             <td class="py-2 text-xs">
-              <label class="flex items-center gap-1 mb-1">
-                <input type="checkbox" checked={edit.requireApproval === true} onchange={(e) => setToolEdit(tool.id, { requireApproval: (e.currentTarget as HTMLInputElement).checked })} />
-                approval
-              </label>
               <label class="flex items-center gap-1">
                 timeout
                 <input class="w-16 rounded border border-gray-300 dark:border-white/20 bg-card px-1 py-0.5 text-xs" type="number" min="1" max="300" value={edit.timeoutSeconds || (edit.type === "mcp" ? 30 : 20)} onchange={(e) => setToolEdit(tool.id, { timeoutSeconds: parseInt((e.currentTarget as HTMLInputElement).value, 10) })} />
@@ -585,3 +586,15 @@
     </tbody>
   </table>
 </div>
+
+<style>
+  .settings-select {
+    background-color: var(--color-surface);
+    color: var(--color-txtmain);
+  }
+
+  .settings-select option {
+    background-color: var(--color-surface);
+    color: var(--color-txtmain);
+  }
+</style>

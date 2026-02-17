@@ -16,8 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mostlygeek/llama-swap/event"
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/tidwall/gjson"
 )
@@ -44,6 +45,13 @@ func CreateTestResponseRecorder() *TestResponseRecorder {
 	}
 }
 
+func disableToolDrivenSwapPolicy(pm *ProxyManager) {
+	pm.Lock()
+	pm.toolSettings.KillPreviousOnSwap = false
+	pm.toolSettings.MaxRunningModels = 64
+	pm.Unlock()
+}
+
 func TestProxyManager_SwapProcessCorrectly(t *testing.T) {
 	config := config.AddDefaultGroupToConfig(config.Config{
 		HealthCheckTimeout: 15,
@@ -55,6 +63,7 @@ func TestProxyManager_SwapProcessCorrectly(t *testing.T) {
 	})
 
 	proxy := New(config)
+	disableToolDrivenSwapPolicy(proxy)
 	defer proxy.StopProcesses(StopWaitForInflightRequest)
 
 	for _, modelName := range []string{"model1", "model2"} {
@@ -90,6 +99,7 @@ func TestProxyManager_SwapMultiProcess(t *testing.T) {
 	})
 
 	proxy := New(config)
+	disableToolDrivenSwapPolicy(proxy)
 	defer proxy.StopProcesses(StopWaitForInflightRequest)
 
 	tests := []string{"model1", "model2"}
@@ -132,6 +142,7 @@ func TestProxyManager_PersistentGroupsAreNotSwapped(t *testing.T) {
 	})
 
 	proxy := New(config)
+	disableToolDrivenSwapPolicy(proxy)
 	defer proxy.StopProcesses(StopWaitForInflightRequest)
 
 	// make requests to load all models, loading model1 should not affect model2
@@ -526,13 +537,13 @@ func TestProxyManager_Shutdown(t *testing.T) {
 
 	// make broken model configurations
 	model1Config := getTestSimpleResponderConfigPort("model1", 9991)
-	model1Config.Proxy = "http://localhost:10001/"
+	model1Config.Proxy = "http://203.0.113.1:10001/"
 
 	model2Config := getTestSimpleResponderConfigPort("model2", 9992)
-	model2Config.Proxy = "http://localhost:10002/"
+	model2Config.Proxy = "http://203.0.113.1:10002/"
 
 	model3Config := getTestSimpleResponderConfigPort("model3", 9993)
-	model3Config.Proxy = "http://localhost:10003/"
+	model3Config.Proxy = "http://203.0.113.1:10003/"
 
 	config := config.AddDefaultGroupToConfig(config.Config{
 		HealthCheckTimeout: 15,
@@ -625,6 +636,7 @@ func TestProxyManager_UnloadSingleModel(t *testing.T) {
 	})
 
 	proxy := New(config)
+	disableToolDrivenSwapPolicy(proxy)
 	defer proxy.StopProcesses(StopImmediately)
 
 	// start both model
@@ -684,6 +696,7 @@ func TestProxyManager_RunningEndpoint(t *testing.T) {
 
 	// Create proxy once for all tests
 	proxy := New(config)
+	disableToolDrivenSwapPolicy(proxy)
 	defer proxy.StopProcesses(StopWaitForInflightRequest)
 
 	t.Run("no models loaded", func(t *testing.T) {
@@ -1127,6 +1140,7 @@ models:
 
 	// Create the proxy which should trigger preloading
 	proxy := New(config)
+	disableToolDrivenSwapPolicy(proxy)
 	defer proxy.StopProcesses(StopWaitForInflightRequest)
 
 	for i := 0; i < 2; i++ {
@@ -1433,6 +1447,269 @@ models:
 		assert.Contains(t, w.Body.String(), "from-peer")
 	})
 
+	t.Run("inference endpoint normalizes content-type to application/json", func(t *testing.T) {
+		var gotContentType string
+		peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotContentType = r.Header.Get("Content-Type")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"response":"ok","model":"peer-model"}`))
+		}))
+		defer peerServer.Close()
+
+		configStr := fmt.Sprintf(`
+logLevel: error
+peers:
+  test-peer:
+    proxy: %s
+    models:
+      - peer-model
+models:
+  local-model:
+    cmd: %s -port ${PORT} -silent -respond local-model
+`, peerServer.URL, getSimpleResponderPath())
+
+		testConfig, err := config.LoadConfigFromReader(strings.NewReader(configStr))
+		assert.NoError(t, err)
+
+		proxy := New(testConfig)
+		defer proxy.StopProcesses(StopImmediately)
+
+		reqBody := `{"model":"peer-model","messages":[{"role":"user","content":"hello"}]}`
+		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "text/plain")
+		w := CreateTestResponseRecorder()
+
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, "application/json", gotContentType)
+	})
+
+	t.Run("responses endpoint bridges to chat completions for peers", func(t *testing.T) {
+		var gotPath string
+		var gotContentType string
+		peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			gotContentType = r.Header.Get("Content-Type")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","model":"peer-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
+		}))
+		defer peerServer.Close()
+
+		configStr := fmt.Sprintf(`
+logLevel: error
+peers:
+  test-peer:
+    proxy: %s
+    models:
+      - peer-model
+models:
+  local-model:
+    cmd: %s -port ${PORT} -silent -respond local-model
+`, peerServer.URL, getSimpleResponderPath())
+
+		testConfig, err := config.LoadConfigFromReader(strings.NewReader(configStr))
+		assert.NoError(t, err)
+
+		proxy := New(testConfig)
+		defer proxy.StopProcesses(StopImmediately)
+
+		reqBody := `{"model":"peer-model","input":"hello from responses"}`
+		req := httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(reqBody))
+		req.Header.Set("Content-Type", "text/plain")
+		w := CreateTestResponseRecorder()
+
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, "/v1/chat/completions", gotPath)
+		assert.Equal(t, "application/json", gotContentType)
+		assert.Equal(t, "response", gjson.Get(w.Body.String(), "object").String())
+		assert.Equal(t, "ok", gjson.Get(w.Body.String(), "output_text").String())
+	})
+
+	t.Run("responses endpoint stream includes response.completed event", func(t *testing.T) {
+		peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","model":"peer-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
+		}))
+		defer peerServer.Close()
+
+		configStr := fmt.Sprintf(`
+logLevel: error
+peers:
+  test-peer:
+    proxy: %s
+    models:
+      - peer-model
+models:
+  local-model:
+    cmd: %s -port ${PORT} -silent -respond local-model
+`, peerServer.URL, getSimpleResponderPath())
+
+		testConfig, err := config.LoadConfigFromReader(strings.NewReader(configStr))
+		assert.NoError(t, err)
+
+		proxy := New(testConfig)
+		defer proxy.StopProcesses(StopImmediately)
+
+		reqBody := `{"model":"peer-model","input":"hello from responses","stream":true}`
+		req := httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(reqBody))
+		w := CreateTestResponseRecorder()
+
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Header().Get("Content-Type"), "text/event-stream")
+		assert.Contains(t, w.Body.String(), `"type":"response.completed"`)
+		assert.Contains(t, w.Body.String(), "data: [DONE]")
+	})
+
+	t.Run("responses stream includes function call item events", func(t *testing.T) {
+		peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"chatcmpl-tools-stream-1","object":"chat.completion","model":"peer-model","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_stream_123","type":"function","function":{"name":"read_mcp_resource","arguments":"{\"server\":\"file-system\",\"uri\":\"proxy/process.go\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}`))
+		}))
+		defer peerServer.Close()
+
+		configStr := fmt.Sprintf(`
+logLevel: error
+peers:
+  test-peer:
+    proxy: %s
+    models:
+      - peer-model
+models:
+  local-model:
+    cmd: %s -port ${PORT} -silent -respond local-model
+`, peerServer.URL, getSimpleResponderPath())
+
+		testConfig, err := config.LoadConfigFromReader(strings.NewReader(configStr))
+		assert.NoError(t, err)
+
+		proxy := New(testConfig)
+		defer proxy.StopProcesses(StopImmediately)
+
+		reqBody := `{"model":"peer-model","input":"read process file","stream":true}`
+		req := httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(reqBody))
+		w := CreateTestResponseRecorder()
+
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Header().Get("Content-Type"), "text/event-stream")
+		assert.Contains(t, w.Body.String(), "event: response.output_item.added")
+		assert.Contains(t, w.Body.String(), `"type":"function_call"`)
+		assert.Contains(t, w.Body.String(), "event: response.function_call_arguments.done")
+		assert.Contains(t, w.Body.String(), "data: [DONE]")
+	})
+
+	t.Run("responses endpoint returns bad gateway for empty successful upstream body", func(t *testing.T) {
+		peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer peerServer.Close()
+
+		configStr := fmt.Sprintf(`
+logLevel: error
+peers:
+  test-peer:
+    proxy: %s
+    models:
+      - peer-model
+models:
+  local-model:
+    cmd: %s -port ${PORT} -silent -respond local-model
+`, peerServer.URL, getSimpleResponderPath())
+
+		testConfig, err := config.LoadConfigFromReader(strings.NewReader(configStr))
+		assert.NoError(t, err)
+
+		proxy := New(testConfig)
+		defer proxy.StopProcesses(StopImmediately)
+
+		reqBody := `{"model":"peer-model","input":"hello"}`
+		req := httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(reqBody))
+		w := CreateTestResponseRecorder()
+
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusBadGateway, w.Code)
+		assert.Contains(t, w.Body.String(), "responses bridge upstream returned empty body")
+	})
+
+	t.Run("responses endpoint returns bad gateway for invalid successful upstream body", func(t *testing.T) {
+		peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("not json"))
+		}))
+		defer peerServer.Close()
+
+		configStr := fmt.Sprintf(`
+logLevel: error
+peers:
+  test-peer:
+    proxy: %s
+    models:
+      - peer-model
+models:
+  local-model:
+    cmd: %s -port ${PORT} -silent -respond local-model
+`, peerServer.URL, getSimpleResponderPath())
+
+		testConfig, err := config.LoadConfigFromReader(strings.NewReader(configStr))
+		assert.NoError(t, err)
+
+		proxy := New(testConfig)
+		defer proxy.StopProcesses(StopImmediately)
+
+		reqBody := `{"model":"peer-model","input":"hello"}`
+		req := httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(reqBody))
+		w := CreateTestResponseRecorder()
+
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusBadGateway, w.Code)
+		assert.Contains(t, w.Body.String(), "responses bridge upstream returned invalid JSON")
+	})
+
+	t.Run("responses endpoint preserves function calls from tool_calls", func(t *testing.T) {
+		peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"chatcmpl-tools-1","object":"chat.completion","model":"peer-model","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_123","type":"function","function":{"name":"shell_command","arguments":"{\"command\":\"date\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}`))
+		}))
+		defer peerServer.Close()
+
+		configStr := fmt.Sprintf(`
+logLevel: error
+peers:
+  test-peer:
+    proxy: %s
+    models:
+      - peer-model
+models:
+  local-model:
+    cmd: %s -port ${PORT} -silent -respond local-model
+`, peerServer.URL, getSimpleResponderPath())
+
+		testConfig, err := config.LoadConfigFromReader(strings.NewReader(configStr))
+		assert.NoError(t, err)
+
+		proxy := New(testConfig)
+		defer proxy.StopProcesses(StopImmediately)
+
+		reqBody := `{"model":"peer-model","input":"please use shell tool"}`
+		req := httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(reqBody))
+		w := CreateTestResponseRecorder()
+
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, "response", gjson.Get(w.Body.String(), "object").String())
+		assert.Equal(t, "function_call", gjson.Get(w.Body.String(), "output.0.type").String())
+		assert.Equal(t, "call_123", gjson.Get(w.Body.String(), "output.0.call_id").String())
+		assert.Equal(t, "shell_command", gjson.Get(w.Body.String(), "output.0.name").String())
+		assert.Equal(t, "{\"command\":\"date\"}", gjson.Get(w.Body.String(), "output.0.arguments").String())
+	})
+
 	t.Run("local models take precedence over peer models", func(t *testing.T) {
 		// Create a test server to act as the peer - should NOT be called
 		peerCalled := false
@@ -1603,4 +1880,201 @@ models:
 		assert.Equal(t, http.StatusOK, w.Code)
 		assert.Equal(t, "no", w.Header().Get("X-Accel-Buffering"))
 	})
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_NormalizesFunctionTools(t *testing.T) {
+	in := `{
+  "model":"gpt-5.3-codex",
+  "instructions":"system text",
+  "tools":[
+    {
+      "type":"function",
+      "name":"shell_command",
+      "description":"Runs shell command",
+      "parameters":{"type":"object","properties":{"command":{"type":"string"}}},
+      "strict":false
+    }
+  ],
+  "input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+  "stream":true
+}`
+
+	out, err := translateResponsesToChatCompletionsRequest([]byte(in))
+	assert.NoError(t, err)
+	assert.Equal(t, "gpt-5.3-codex", gjson.GetBytes(out, "model").String())
+	assert.Equal(t, false, gjson.GetBytes(out, "stream").Bool())
+	assert.Equal(t, "shell_command", gjson.GetBytes(out, "tools.0.function.name").String())
+	assert.Equal(t, "function", gjson.GetBytes(out, "tools.0.type").String())
+	assert.Equal(t, "object", gjson.GetBytes(out, "tools.0.function.parameters.type").String())
+	assert.Equal(t, "hi", gjson.GetBytes(out, "messages.1.content").String())
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_MapsDeveloperRoleToSystem(t *testing.T) {
+	in := `{
+  "model":"gpt-5.3-codex",
+  "messages":[
+    {"role":"developer","content":"You are a coding agent."},
+    {"role":"user","content":"hello"}
+  ]
+}`
+
+	out, err := translateResponsesToChatCompletionsRequest([]byte(in))
+	assert.NoError(t, err)
+	assert.Equal(t, "system", gjson.GetBytes(out, "messages.0.role").String())
+	assert.Equal(t, "You are a coding agent.", gjson.GetBytes(out, "messages.0.content").String())
+	assert.Equal(t, "user", gjson.GetBytes(out, "messages.1.role").String())
+	assert.Equal(t, "hello", gjson.GetBytes(out, "messages.1.content").String())
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_PreservesFunctionCallRoundTripContext(t *testing.T) {
+	in := `{
+  "model":"gpt-5.3-codex",
+  "input":[
+    {"type":"message","role":"user","content":[{"type":"input_text","text":"read process.go"}]},
+    {"type":"function_call","name":"read_mcp_resource","arguments":"{\"server\":\"file-system\",\"uri\":\"proxy/process.go\"}","call_id":"call_1"},
+    {"type":"function_call_output","call_id":"call_1","output":"ok: file content"},
+    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}
+  ]
+}`
+
+	out, err := translateResponsesToChatCompletionsRequest([]byte(in))
+	assert.NoError(t, err)
+
+	assert.Equal(t, "user", gjson.GetBytes(out, "messages.0.role").String())
+	assert.Equal(t, "read process.go", gjson.GetBytes(out, "messages.0.content").String())
+
+	assert.Equal(t, "assistant", gjson.GetBytes(out, "messages.1.role").String())
+	assert.Equal(t, "call_1", gjson.GetBytes(out, "messages.1.tool_calls.0.id").String())
+	assert.Equal(t, "function", gjson.GetBytes(out, "messages.1.tool_calls.0.type").String())
+	assert.Equal(t, "read_mcp_resource", gjson.GetBytes(out, "messages.1.tool_calls.0.function.name").String())
+	assert.Equal(t, "{\"server\":\"file-system\",\"uri\":\"proxy/process.go\"}", gjson.GetBytes(out, "messages.1.tool_calls.0.function.arguments").String())
+
+	assert.Equal(t, "tool", gjson.GetBytes(out, "messages.2.role").String())
+	assert.Equal(t, "call_1", gjson.GetBytes(out, "messages.2.tool_call_id").String())
+	assert.Equal(t, "ok: file content", gjson.GetBytes(out, "messages.2.content").String())
+
+	assert.Equal(t, "assistant", gjson.GetBytes(out, "messages.3.role").String())
+	assert.Equal(t, "done", gjson.GetBytes(out, "messages.3.content").String())
+}
+
+func TestTranslateChatCompletionToResponsesResponse_PreservesToolCalls(t *testing.T) {
+	in := []byte(`{"id":"chatcmpl-abc","object":"chat.completion","model":"gpt-5.3-codex","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_789","type":"function","function":{"name":"shell_command","arguments":"{\"command\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}`)
+
+	out, err := translateChatCompletionToResponsesResponse(in)
+	assert.NoError(t, err)
+	assert.Equal(t, "response", gjson.GetBytes(out, "object").String())
+	assert.Equal(t, "function_call", gjson.GetBytes(out, "output.0.type").String())
+	assert.Equal(t, "call_789", gjson.GetBytes(out, "output.0.call_id").String())
+	assert.Equal(t, "shell_command", gjson.GetBytes(out, "output.0.name").String())
+	assert.Equal(t, "{\"command\":\"pwd\"}", gjson.GetBytes(out, "output.0.arguments").String())
+	assert.Equal(t, int64(10), gjson.GetBytes(out, "usage.input_tokens").Int())
+	assert.Equal(t, int64(4), gjson.GetBytes(out, "usage.output_tokens").Int())
+	assert.Equal(t, int64(14), gjson.GetBytes(out, "usage.total_tokens").Int())
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_EncodesStructuredToolPayloads(t *testing.T) {
+	in := `{
+  "model":"gpt-5.3-codex",
+  "input":[
+    {"type":"function_call","name":"shell_command","arguments":{"command":"pwd","justification":"check path"},"call_id":"call_obj"},
+    {"type":"function_call_output","call_id":"call_obj","output":{"exit_code":0,"stdout":"A:/repo"}}
+  ]
+}`
+
+	out, err := translateResponsesToChatCompletionsRequest([]byte(in))
+	assert.NoError(t, err)
+	assert.Equal(t, "{\"command\":\"pwd\",\"justification\":\"check path\"}", gjson.GetBytes(out, "messages.0.tool_calls.0.function.arguments").String())
+	assert.Equal(t, "{\"exit_code\":0,\"stdout\":\"A:/repo\"}", gjson.GetBytes(out, "messages.1.content").String())
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_AssistantToolCallsKeepStructuredText(t *testing.T) {
+	in := `{
+  "model":"gpt-5.3-codex",
+  "messages":[
+    {
+      "role":"assistant",
+      "content":[{"type":"output_text","text":"I will call a tool"}],
+      "tool_calls":[{"id":"call_22","type":"function","function":{"name":"shell_command","arguments":"{\"command\":\"pwd\"}"}}]
+    }
+  ]
+}`
+
+	out, err := translateResponsesToChatCompletionsRequest([]byte(in))
+	assert.NoError(t, err)
+	assert.Equal(t, "assistant", gjson.GetBytes(out, "messages.0.role").String())
+	assert.Equal(t, "I will call a tool", gjson.GetBytes(out, "messages.0.content").String())
+	assert.Equal(t, "call_22", gjson.GetBytes(out, "messages.0.tool_calls.0.id").String())
+}
+
+func TestTranslateChatCompletionToResponsesResponse_UsesCreatedAndFailsOnMalformedChoices(t *testing.T) {
+	okBody := []byte(`{"id":"chatcmpl-abc","object":"chat.completion","model":"gpt-5.3-codex","created":1771000000,"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
+	out, err := translateChatCompletionToResponsesResponse(okBody)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1771000000), gjson.GetBytes(out, "created_at").Int())
+
+	badBody := []byte(`{"id":"chatcmpl-bad","object":"chat.completion","choices":[{"index":0,"finish_reason":"stop"}]}`)
+	_, err = translateChatCompletionToResponsesResponse(badBody)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "choices[0].message")
+}
+
+func TestWriteResponsesStream_DoesNotEmitOutputTextEventsForNonTextParts(t *testing.T) {
+	w := CreateTestResponseRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(`{}`))
+
+	response := []byte(`{
+  "id":"resp_nontext_1",
+  "object":"response",
+  "created_at":1771001111,
+  "model":"test-model",
+  "status":"completed",
+  "output":[
+    {
+      "id":"msg_1",
+      "type":"message",
+      "role":"assistant",
+      "status":"completed",
+      "content":[{"type":"reasoning","text":"internal chain"}]
+    }
+  ]
+}`)
+	writeResponsesStream(c, response)
+
+	body := w.Body.String()
+	assert.Contains(t, body, "event: response.content_part.added")
+	assert.Contains(t, body, `"type":"reasoning"`)
+	assert.NotContains(t, body, "event: response.output_text.delta")
+	assert.NotContains(t, body, "event: response.output_text.done")
+	assert.Contains(t, body, "event: response.completed")
+	assert.Contains(t, body, "data: [DONE]")
+}
+
+func TestWriteResponsesStream_FunctionCallArgumentsFromObjectAreJSONString(t *testing.T) {
+	w := CreateTestResponseRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(`{}`))
+
+	response := []byte(`{
+  "id":"resp_tool_args_1",
+  "object":"response",
+  "created_at":1771002222,
+  "model":"test-model",
+  "status":"completed",
+  "output":[
+    {
+      "id":"fc_1",
+      "type":"function_call",
+      "call_id":"call_json_1",
+      "name":"shell_command",
+      "arguments":{"command":"pwd","justification":"check cwd"},
+      "status":"completed"
+    }
+  ]
+}`)
+	writeResponsesStream(c, response)
+
+	body := w.Body.String()
+	assert.Contains(t, body, "event: response.function_call_arguments.done")
+	assert.Contains(t, body, `"arguments":"{\"command\":\"pwd\",\"justification\":\"check cwd\"}"`)
 }

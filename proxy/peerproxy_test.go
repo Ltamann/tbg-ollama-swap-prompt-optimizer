@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -266,3 +266,4 @@ func TestProxyRequest_SSEHeaderModification(t *testing.T) {
 	// The X-Accel-Buffering header should be set to "no" for SSE
 	assert.Equal(t, "no", w.Header().Get("X-Accel-Buffering"))
 }
+

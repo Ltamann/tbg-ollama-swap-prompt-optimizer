@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -12,17 +13,59 @@ func selectEncoding(acceptEncoding string) (encoding, ext string) {
 		return "", ""
 	}
 
+	// Prefer brotli whenever it is listed at all. This keeps behavior stable
+	// across clients that send weighted encodings in different orders.
 	for _, part := range strings.Split(acceptEncoding, ",") {
-		enc := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
-		if enc == "gzip" {
-			return "gzip", ".gz"
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		pieces := strings.Split(token, ";")
+		enc := strings.TrimSpace(pieces[0])
+		if enc != "br" {
+			continue
+		}
+		q := 1.0
+		if len(pieces) > 1 {
+			for _, p := range pieces[1:] {
+				p = strings.TrimSpace(p)
+				if !strings.HasPrefix(strings.ToLower(p), "q=") {
+					continue
+				}
+				if parsed, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(p, "q=")), 64); err == nil {
+					q = parsed
+				}
+			}
+		}
+		if q > 0 {
+			return "br", ".br"
 		}
 	}
 
 	for _, part := range strings.Split(acceptEncoding, ",") {
-		enc := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
-		if enc == "br" {
-			return "br", ".br"
+		token := strings.TrimSpace(part)
+		if token == "" {
+			continue
+		}
+		pieces := strings.Split(token, ";")
+		enc := strings.TrimSpace(pieces[0])
+		if enc != "gzip" {
+			continue
+		}
+		q := 1.0
+		if len(pieces) > 1 {
+			for _, p := range pieces[1:] {
+				p = strings.TrimSpace(p)
+				if !strings.HasPrefix(strings.ToLower(p), "q=") {
+					continue
+				}
+				if parsed, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(p, "q=")), 64); err == nil {
+					q = parsed
+				}
+			}
+		}
+		if q > 0 {
+			return "gzip", ".gz"
 		}
 	}
 
