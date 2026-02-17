@@ -56,8 +56,6 @@ func (pm *ProxyManager) recordActivityPromptPreview(modelID, requestPath string,
 		return
 	}
 
-	lastUserPrompt = trimPreview(lastUserPrompt, 1200)
-	lastPreview = trimPreview(lastPreview, 1200)
 	userSignature := strings.TrimSpace(strings.ToLower(lastUserPrompt))
 
 	pm.Lock()

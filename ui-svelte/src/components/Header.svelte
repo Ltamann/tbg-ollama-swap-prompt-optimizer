@@ -1,7 +1,20 @@
 <script lang="ts">
   import { link, location } from "svelte-spa-router";
-  import { toggleTheme, isDarkMode, appTitle, isNarrow } from "../stores/theme";
+  import { models, metrics, getLatestPromptOptimization } from "../stores/api";
+  import { persistentStore } from "../stores/persistent";
+  import { toggleTheme, isDarkMode, appTitle, isNarrow, contextSize } from "../stores/theme";
   import ConnectionStatus from "./ConnectionStatus.svelte";
+  import ContextSizeBar from "./ContextSizeBar.svelte";
+
+  const selectedModelStore = persistentStore<string>("playground-selected-model", "");
+  let requestCounter = 0;
+  let lastRefreshTs = 0;
+  let modelBarData = $state({
+    modelId: "",
+    modelCtx: 0,
+    inputCtx: 0,
+    optimizedCtx: 0,
+  });
 
   function handleTitleChange(newTitle: string): void {
     const sanitized = newTitle.replace(/\n/g, "").trim().substring(0, 64) || "TBG (O) LlamA Swap";
@@ -34,12 +47,104 @@
   function isActive(path: string, currentLocation: string): boolean {
     return path === "/" ? currentLocation === "/" : currentLocation.startsWith(path);
   }
+
+  function estimateTokens(rawBody: string): number {
+    const fallback = Math.max(0, Math.round((rawBody || "").length / 4));
+    if (!rawBody || !rawBody.trim()) {
+      return 0;
+    }
+
+    try {
+      const parsed = JSON.parse(rawBody) as any;
+      let text = "";
+      const messages = Array.isArray(parsed?.messages) ? parsed.messages : [];
+      for (const message of messages) {
+        const content = message?.content;
+        if (typeof content === "string") {
+          text += content;
+          continue;
+        }
+        if (Array.isArray(content)) {
+          for (const part of content) {
+            if (part?.type === "text" && typeof part?.text === "string") {
+              text += part.text;
+            }
+          }
+        }
+      }
+      if (text.length > 0) {
+        return Math.max(0, Math.round(text.length / 4));
+      }
+    } catch {
+      // Keep fallback if payload is not valid JSON.
+    }
+
+    return fallback;
+  }
+
+  async function refreshContextBar(modelId: string, modelCtx: number): Promise<void> {
+    const currentRequest = ++requestCounter;
+    if (!modelId || modelCtx <= 0) {
+      modelBarData = { modelId: "", modelCtx: 0, inputCtx: 0, optimizedCtx: 0 };
+      contextSize.set(modelBarData);
+      return;
+    }
+
+    const latest = await getLatestPromptOptimization(modelId);
+    if (currentRequest !== requestCounter) {
+      return;
+    }
+    const inputCtx = latest ? estimateTokens(latest.originalBody) : 0;
+    const optimizedCtx = latest ? estimateTokens(latest.optimizedBody) : 0;
+    modelBarData = { modelId, modelCtx, inputCtx, optimizedCtx };
+    contextSize.set(modelBarData);
+  }
+
+  $effect(() => {
+    const selectedId = $selectedModelStore;
+    const localModels = $models.filter((m) => !m.peerID && !m.unlisted);
+    const selectedModel = localModels.find((m) => m.id === selectedId);
+    const readyModel = localModels.find((m) => m.state === "ready");
+    const activeModel = selectedModel || readyModel || localModels[0];
+    const modelId = activeModel?.id || "";
+    const modelCtx = activeModel?.ctxConfigured || activeModel?.ctxReference || 0;
+    void refreshContextBar(modelId, modelCtx);
+  });
+
+  // Re-fetch after each completed request (metrics stream) so the bar tracks
+  // the latest prompt optimization snapshot in near realtime.
+  $effect(() => {
+    const latestMetric = $metrics[0];
+    if (!latestMetric) {
+      return;
+    }
+
+    const selectedId = $selectedModelStore;
+    const localModels = $models.filter((m) => !m.peerID && !m.unlisted);
+    const selectedModel = localModels.find((m) => m.id === selectedId);
+    const readyModel = localModels.find((m) => m.state === "ready");
+    const activeModel = selectedModel || readyModel || localModels[0];
+    const modelId = activeModel?.id || "";
+    const modelCtx = activeModel?.ctxConfigured || activeModel?.ctxReference || 0;
+
+    if (!modelId || modelCtx <= 0) {
+      return;
+    }
+    if (latestMetric.model !== modelId) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastRefreshTs < 250) {
+      return;
+    }
+    lastRefreshTs = now;
+    void refreshContextBar(modelId, modelCtx);
+  });
 </script>
 
 <header
-  class="flex flex-col items-center bg-surface border-b border-border px-4 {$isNarrow
-    ? 'py-1 h-[75px]'
-    : 'py-2 h-[90px]'}"
+  class="flex flex-col items-center bg-surface border-b border-border px-4 {$isNarrow ? 'py-1' : 'py-2'}"
 >
   <h1
     contenteditable="true"
@@ -110,4 +215,13 @@
     </button>
     <ConnectionStatus />
   </menu>
+
+  <div class="mt-1 w-full flex justify-center">
+    <ContextSizeBar
+      modelCtx={modelBarData.modelCtx}
+      inputCtx={modelBarData.inputCtx}
+      optimizedCtx={modelBarData.optimizedCtx}
+      modelId={modelBarData.modelId}
+    />
+  </div>
 </header>

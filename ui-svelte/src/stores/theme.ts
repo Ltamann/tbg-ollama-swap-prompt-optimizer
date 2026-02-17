@@ -9,6 +9,19 @@ export const appTitle = persistentStore<string>("app-title", "TBG (O) LlamA Swap
 // Non-persistent stores
 export const screenWidth = writable<ScreenWidth>("md");
 export const connectionState = writable<"connected" | "connecting" | "disconnected">("disconnected");
+export interface ContextSizeState {
+  modelId: string;
+  modelCtx: number;
+  inputCtx: number;
+  optimizedCtx: number;
+}
+
+export const contextSize = writable<ContextSizeState>({
+  modelId: "",
+  modelCtx: 0,
+  inputCtx: 0,
+  optimizedCtx: 0,
+});
 
 // Derived store for narrow screens
 export const isNarrow = derived(screenWidth, ($screenWidth) => {
