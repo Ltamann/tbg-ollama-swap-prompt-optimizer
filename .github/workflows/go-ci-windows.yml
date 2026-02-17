@@ -1,66 +1,54 @@
-name: Windows CI
+name: Backend CI (Windows)
 
 on:
   push:
-    branches: [ "main" ]
-    # only run when backend source changes
-    # cmd/ is excluded because it contains utilities without tests
+    branches: ["main"]
     paths:
-      - '**/*.go'
-      - '!cmd/**'
-      - 'go.mod'
-      - 'go.sum'
-      - 'Makefile'
-      - '.github/workflows/go-ci-windows.yml'
-
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+      - ".github/workflows/go-ci-windows.yml"
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
     paths:
-      - '**/*.go'
-      - '!cmd/**'
-      - 'go.mod'
-      - 'go.sum'
-      - 'Makefile'
-      - '.github/workflows/go-ci-windows.yml'
-
-  # Allows manual triggering of the workflow
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+      - ".github/workflows/go-ci-windows.yml"
   workflow_dispatch:
 
 jobs:
-
-  run-tests:
+  test-windows:
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.23'
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
 
-    # cache simple-responder to save the build time
-    - name: Restore Simple Responder
-      id: restore-simple-responder
-      uses: actions/cache/restore@v4
-      with:
-        path: ./build
-        key: ${{ runner.os }}-simple-responder-${{ hashFiles('cmd/simple-responder/simple-responder.go') }}
+      - name: Restore simple-responder cache
+        id: restore-simple-responder
+        uses: actions/cache/restore@v4
+        with:
+          path: ./build
+          key: ${{ runner.os }}-simple-responder-${{ hashFiles('cmd/simple-responder/simple-responder.go') }}
 
-    # necessary for testing proxy/Process swapping
-    - name: Create simple-responder
-      if: steps.restore-simple-responder.outputs.cache-hit != 'true'
-      shell: bash
-      run: make simple-responder-windows
+      - name: Build simple-responder
+        if: steps.restore-simple-responder.outputs.cache-hit != 'true'
+        shell: bash
+        run: make simple-responder-windows
 
-    - name: Save Simple Responder
-      # nothing new to save ... skip this step
-      if: steps.restore-simple-responder.outputs.cache-hit != 'true'
-      id: save-simple-responder
-      uses: actions/cache/save@v4
-      with:
-        path: ./build
-        key: ${{ runner.os }}-simple-responder-${{ hashFiles('cmd/simple-responder/simple-responder.go') }}
+      - name: Save simple-responder cache
+        if: steps.restore-simple-responder.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ./build
+          key: ${{ runner.os }}-simple-responder-${{ hashFiles('cmd/simple-responder/simple-responder.go') }}
 
-    - name: Test all
-      shell: bash
-      run: make test-all
+      - name: Run tests
+        shell: bash
+        run: make test-all

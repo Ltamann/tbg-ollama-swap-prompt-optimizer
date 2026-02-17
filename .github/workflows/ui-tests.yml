@@ -1,42 +1,42 @@
-name: UI Tests
+name: UI CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
     paths:
-      - 'ui-svelte/**'
-      - '.github/workflows/ui-tests.yml'
-
+      - "ui-svelte/**"
+      - ".github/workflows/ui-tests.yml"
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
     paths:
-      - 'ui-svelte/**'
-      - '.github/workflows/ui-tests.yml'
-
+      - "ui-svelte/**"
+      - ".github/workflows/ui-tests.yml"
   workflow_dispatch:
 
 jobs:
-
-  run-tests:
+  ui-check:
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ui-svelte
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '24'
-        cache: 'npm'
-        cache-dependency-path: ui-svelte/package-lock.json
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui-svelte/package-lock.json
 
-    - name: Install dependencies
-      run: npm ci
+      - name: Install dependencies
+        run: npm ci
 
-    - name: Type check
-      run: npm run check
+      - name: Type check
+        run: npm run check
 
-    - name: Run tests
-      run: npm test
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
