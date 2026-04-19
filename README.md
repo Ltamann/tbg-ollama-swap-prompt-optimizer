@@ -2,6 +2,8 @@
 
 # TBG (O)llama Swap + Prompt Optimizer
 
+This enables Qwen 3.6 to run in Codex
+
 Based on Benson Wong's upstream project: [Ltamann/tbg-ollama-swap-prompt-optimizer](https://github.com/Ltamann/tbg-ollama-swap-prompt-optimizer).
 
 TBG (O)llama Swap + Prompt Optimizer is focused on local agent workflows (for example Claude Code CLI) where prompts become very large, repetitive, and unstable for low-VRAM local inference.
