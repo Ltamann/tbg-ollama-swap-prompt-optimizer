@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 )
 
 type peerProxyMember struct {

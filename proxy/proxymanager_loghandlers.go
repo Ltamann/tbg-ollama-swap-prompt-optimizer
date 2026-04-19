@@ -94,6 +94,9 @@ func (pm *ProxyManager) getLogger(logMonitorId string) (*LogMonitor, error) {
 	default:
 		// search for a models specific logger using findModelInPath
 		// to handle model names with slashes (e.g., "author/model")
+		if logMonitorId == "transform" {
+			return pm.transformLogger, nil
+		}
 		if _, name, _, found := pm.findModelInPath("/" + logMonitorId); found {
 			for _, group := range pm.processGroups {
 				if process, found := group.GetMember(name); found {
@@ -102,6 +105,6 @@ func (pm *ProxyManager) getLogger(logMonitorId string) (*LogMonitor, error) {
 			}
 		}
 
-		return nil, fmt.Errorf("invalid logger. Use 'proxy', 'upstream' or a model's ID")
+		return nil, fmt.Errorf("invalid logger. Use 'proxy', 'upstream', 'transform' or a model's ID")
 	}
 }

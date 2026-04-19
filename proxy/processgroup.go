@@ -6,7 +6,7 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 )
 
 type ProcessGroup struct {
@@ -18,36 +18,38 @@ type ProcessGroup struct {
 	exclusive  bool
 	persistent bool
 
-	proxyLogger    *LogMonitor
-	upstreamLogger *LogMonitor
+	proxyLogger     *LogMonitor
+	upstreamLogger  *LogMonitor
+	transformLogger *LogMonitor
 
 	// map of current processes
 	processes       map[string]*Process
 	lastUsedProcess string
 }
 
-func NewProcessGroup(id string, config config.Config, proxyLogger *LogMonitor, upstreamLogger *LogMonitor) *ProcessGroup {
+func NewProcessGroup(id string, config config.Config, proxyLogger *LogMonitor, upstreamLogger *LogMonitor, transformLogger *LogMonitor) *ProcessGroup {
 	groupConfig, ok := config.Groups[id]
 	if !ok {
 		panic("Unable to find configuration for group id: " + id)
 	}
 
 	pg := &ProcessGroup{
-		id:             id,
-		config:         config,
-		swap:           groupConfig.Swap,
-		exclusive:      groupConfig.Exclusive,
-		persistent:     groupConfig.Persistent,
-		proxyLogger:    proxyLogger,
-		upstreamLogger: upstreamLogger,
-		processes:      make(map[string]*Process),
+		id:              id,
+		config:          config,
+		swap:            groupConfig.Swap,
+		exclusive:       groupConfig.Exclusive,
+		persistent:      groupConfig.Persistent,
+		proxyLogger:     proxyLogger,
+		upstreamLogger:  upstreamLogger,
+		transformLogger: transformLogger,
+		processes:       make(map[string]*Process),
 	}
 
 	// Create a Process for each member in the group
 	for _, modelID := range groupConfig.Members {
 		modelConfig, modelID, _ := pg.config.FindConfig(modelID)
 		processLogger := NewLogMonitorWriter(upstreamLogger)
-		process := NewProcess(modelID, pg.config.HealthCheckTimeout, modelConfig, processLogger, pg.proxyLogger)
+		process := NewProcess(modelID, pg.config.HealthCheckTimeout, modelConfig, processLogger, pg.proxyLogger, pg.transformLogger)
 		pg.processes[modelID] = process
 	}
 
@@ -94,6 +96,23 @@ func (pg *ProcessGroup) GetMember(modelName string) (*Process, bool) {
 		return pg.processes[modelName], true
 	}
 	return nil, false
+}
+
+func (pg *ProcessGroup) EnsureStarted(modelID string) error {
+	if !pg.HasMember(modelID) {
+		return fmt.Errorf("model %s not part of group %s", modelID, pg.id)
+	}
+
+	process := pg.processes[modelID]
+	if process == nil {
+		return fmt.Errorf("process not found for model %s", modelID)
+	}
+
+	if process.CurrentState() == StateReady {
+		return nil
+	}
+
+	return process.start()
 }
 
 func (pg *ProcessGroup) StopProcess(modelID string, strategy StopStrategy) error {

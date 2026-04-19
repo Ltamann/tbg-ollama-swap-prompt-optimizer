@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
 	"github.com/tidwall/gjson"
 )
 
@@ -22,6 +24,7 @@ type TokenMetrics struct {
 	ID              int       `json:"id"`
 	Timestamp       time.Time `json:"timestamp"`
 	Model           string    `json:"model"`
+	StatusCode      int       `json:"status_code"`
 	CachedTokens    int       `json:"cache_tokens"`
 	InputTokens     int       `json:"input_tokens"`
 	OutputTokens    int       `json:"output_tokens"`
@@ -75,6 +78,10 @@ type metricsMonitor struct {
 	captureOrder   []int                  // track insertion order for FIFO eviction
 	captureSize    int                    // current total size in bytes
 	maxCaptureSize int                    // max bytes for captures
+
+	upstreamMu       sync.Mutex
+	upstreamStates   map[string]*upstreamLogState
+	maxUpstreamQueue int
 }
 
 // newMetricsMonitor creates a new metricsMonitor. captureBufferMB is the
@@ -82,13 +89,172 @@ type metricsMonitor struct {
 func newMetricsMonitor(logger *LogMonitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
 	return &metricsMonitor{
 		logger:         logger,
+		metrics:        make([]TokenMetrics, 0),
 		maxMetrics:     maxMetrics,
 		enableCaptures: captureBufferMB > 0,
 		captures:       make(map[int]ReqRespCapture),
 		captureOrder:   make([]int, 0),
 		captureSize:    0,
 		maxCaptureSize: captureBufferMB * 1024 * 1024,
+		upstreamStates: make(map[string]*upstreamLogState),
+		maxUpstreamQueue: 32,
 	}
+}
+
+type upstreamTimingCandidate struct {
+	InputTokens     int
+	OutputTokens    int
+	PromptPerSecond float64
+	TokensPerSecond float64
+	DurationMs      int
+}
+
+type upstreamRequestMetric struct {
+	Path       string
+	StatusCode int
+	Timestamp  time.Time
+	Metrics    upstreamTimingCandidate
+}
+
+type upstreamLogState struct {
+	buffer    string
+	pending   *upstreamTimingCandidate
+	completed []upstreamRequestMetric
+}
+
+var (
+	promptEvalTimingRegex = regexp.MustCompile(`prompt eval time =\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s+tokens.*?([0-9.]+)\s+tokens per second`)
+	evalTimingRegex       = regexp.MustCompile(`eval time =\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s+tokens.*?([0-9.]+)\s+tokens per second`)
+	totalTimingRegex      = regexp.MustCompile(`total time =\s*([0-9.]+)\s*ms\s*/\s*([0-9]+)\s+tokens`)
+	doneRequestRegex      = regexp.MustCompile(`done request:\s+[A-Z]+\s+(\S+)\s+\S+\s+([0-9]{3})`)
+)
+
+func (mp *metricsMonitor) registerModelLogMonitor(modelID string, monitor *LogMonitor) {
+	if mp == nil || monitor == nil || modelID == "" {
+		return
+	}
+	monitor.OnLogData(func(data []byte) {
+		mp.ingestUpstreamLog(modelID, data)
+	})
+}
+
+func (mp *metricsMonitor) ingestUpstreamLog(modelID string, data []byte) {
+	mp.upstreamMu.Lock()
+	defer mp.upstreamMu.Unlock()
+
+	state := mp.ensureUpstreamStateLocked(modelID)
+	state.buffer += string(data)
+
+	for {
+		idx := strings.IndexByte(state.buffer, '\n')
+		if idx == -1 {
+			break
+		}
+		line := strings.TrimRight(state.buffer[:idx], "\r")
+		state.buffer = state.buffer[idx+1:]
+		mp.parseUpstreamLogLineLocked(state, strings.TrimSpace(line))
+	}
+}
+
+func (mp *metricsMonitor) ensureUpstreamStateLocked(modelID string) *upstreamLogState {
+	state, ok := mp.upstreamStates[modelID]
+	if !ok {
+		state = &upstreamLogState{}
+		mp.upstreamStates[modelID] = state
+	}
+	return state
+}
+
+func (mp *metricsMonitor) parseUpstreamLogLineLocked(state *upstreamLogState, line string) {
+	if line == "" {
+		return
+	}
+
+	if matches := promptEvalTimingRegex.FindStringSubmatch(line); len(matches) == 4 {
+		promptMs, _ := strconv.ParseFloat(matches[1], 64)
+		inputTokens, _ := strconv.Atoi(matches[2])
+		promptTPS, _ := strconv.ParseFloat(matches[3], 64)
+		state.pending = &upstreamTimingCandidate{
+			InputTokens:     inputTokens,
+			PromptPerSecond: promptTPS,
+			DurationMs:      int(promptMs),
+		}
+		return
+	}
+
+	if state.pending != nil {
+		if matches := evalTimingRegex.FindStringSubmatch(line); len(matches) == 4 {
+			evalMs, _ := strconv.ParseFloat(matches[1], 64)
+			outputTokens, _ := strconv.Atoi(matches[2])
+			outputTPS, _ := strconv.ParseFloat(matches[3], 64)
+			state.pending.OutputTokens = outputTokens
+			state.pending.TokensPerSecond = outputTPS
+			state.pending.DurationMs += int(evalMs)
+			return
+		}
+
+		if matches := totalTimingRegex.FindStringSubmatch(line); len(matches) == 3 {
+			totalMs, _ := strconv.ParseFloat(matches[1], 64)
+			if int(totalMs) > state.pending.DurationMs {
+				state.pending.DurationMs = int(totalMs)
+			}
+			return
+		}
+	}
+
+	if matches := doneRequestRegex.FindStringSubmatch(line); len(matches) == 3 {
+		if state.pending == nil {
+			return
+		}
+		statusCode, _ := strconv.Atoi(matches[2])
+		state.completed = append(state.completed, upstreamRequestMetric{
+			Path:       matches[1],
+			StatusCode: statusCode,
+			Timestamp:  time.Now(),
+			Metrics:    *state.pending,
+		})
+		if len(state.completed) > mp.maxUpstreamQueue {
+			state.completed = state.completed[len(state.completed)-mp.maxUpstreamQueue:]
+		}
+		state.pending = nil
+	}
+}
+
+func (mp *metricsMonitor) consumeUpstreamMetric(modelID, path string, requestStart time.Time, wait time.Duration) *upstreamTimingCandidate {
+	deadline := time.Now().Add(wait)
+	for {
+		if metric := mp.tryConsumeUpstreamMetric(modelID, path, requestStart); metric != nil {
+			return metric
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (mp *metricsMonitor) tryConsumeUpstreamMetric(modelID, path string, requestStart time.Time) *upstreamTimingCandidate {
+	mp.upstreamMu.Lock()
+	defer mp.upstreamMu.Unlock()
+
+	state := mp.upstreamStates[modelID]
+	if state == nil || len(state.completed) == 0 {
+		return nil
+	}
+
+	cutoff := requestStart.Add(-1 * time.Second)
+	for idx, item := range state.completed {
+		if item.Path != path {
+			continue
+		}
+		if item.Timestamp.Before(cutoff) {
+			continue
+		}
+		metric := item.Metrics
+		state.completed = append(state.completed[:idx], state.completed[idx+1:]...)
+		return &metric
+	}
+	return nil
 }
 
 // addMetrics adds a new metric to the collection and publishes an event.
@@ -163,6 +329,9 @@ func (mp *metricsMonitor) getMetrics() []TokenMetrics {
 func (mp *metricsMonitor) getMetricsJSON() ([]byte, error) {
 	mp.mu.RLock()
 	defer mp.mu.RUnlock()
+	if mp.metrics == nil {
+		return json.Marshal([]TokenMetrics{})
+	}
 	return json.Marshal(mp.metrics)
 }
 
@@ -175,6 +344,8 @@ func (mp *metricsMonitor) wrapHandler(
 	request *http.Request,
 	next func(modelID string, w http.ResponseWriter, r *http.Request) error,
 ) error {
+	requestStart := time.Now()
+
 	// Capture request body and headers if captures enabled
 	var reqBody []byte
 	var reqHeaders map[string]string
@@ -211,23 +382,18 @@ func (mp *metricsMonitor) wrapHandler(
 	// after this point we have to assume that data was sent to the client
 	// and we can only log errors but not send them to clients
 
-	if recorder.Status() != http.StatusOK {
-		mp.logger.Warnf("metrics skipped, HTTP status=%d, path=%s", recorder.Status(), request.URL.Path)
-		return nil
-	}
-
 	// Initialize default metrics - these will always be recorded
 	tm := TokenMetrics{
 		Timestamp:  time.Now(),
 		Model:      modelID,
-		DurationMs: int(time.Since(recorder.StartTime()).Milliseconds()),
+		StatusCode: recorder.Status(),
+		DurationMs: int(time.Since(requestStart).Milliseconds()),
 	}
 
 	body := recorder.body.Bytes()
 	if len(body) == 0 {
 		mp.logger.Warn("metrics: empty body, recording minimal metrics")
-		mp.addMetrics(tm)
-		return nil
+		return mp.finalizeMetricCapture(request, recorder, reqBody, reqHeaders, tm, nil)
 	}
 
 	// Decompress if needed
@@ -236,15 +402,20 @@ func (mp *metricsMonitor) wrapHandler(
 		body, err = decompressBody(body, encoding)
 		if err != nil {
 			mp.logger.Warnf("metrics: decompression failed: %v, path=%s, recording minimal metrics", err, request.URL.Path)
-			mp.addMetrics(tm)
-			return nil
+			return mp.finalizeMetricCapture(request, recorder, reqBody, reqHeaders, tm, nil)
 		}
 	}
+	if recorder.Status() != http.StatusOK {
+		mp.logger.Warnf("metrics recorded failed request, HTTP status=%d, path=%s", recorder.Status(), request.URL.Path)
+		return mp.finalizeMetricCapture(request, recorder, reqBody, reqHeaders, tm, body)
+	}
 	if strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
-		if parsed, err := processStreamingResponse(modelID, recorder.StartTime(), body); err != nil {
+		if parsed, err := processStreamingResponse(modelID, requestStart, body); err != nil {
 			mp.logger.Warnf("error processing streaming response: %v, path=%s, recording minimal metrics", err, request.URL.Path)
 		} else {
 			tm = parsed
+			tm.StatusCode = recorder.Status()
+			mergeRequestDuration(&tm, requestStart)
 		}
 	} else {
 		if gjson.ValidBytes(body) {
@@ -261,10 +432,12 @@ func (mp *metricsMonitor) wrapHandler(
 			}
 
 			if usage.Exists() || timings.Exists() {
-				if parsedMetrics, err := parseMetrics(modelID, recorder.StartTime(), usage, timings); err != nil {
+				if parsedMetrics, err := parseMetrics(modelID, requestStart, usage, timings); err != nil {
 					mp.logger.Warnf("error parsing metrics: %v, path=%s, recording minimal metrics", err, request.URL.Path)
 				} else {
 					tm = parsedMetrics
+					tm.StatusCode = recorder.Status()
+					mergeRequestDuration(&tm, requestStart)
 				}
 			}
 		} else {
@@ -272,6 +445,23 @@ func (mp *metricsMonitor) wrapHandler(
 		}
 	}
 
+	if request.URL.Path == "/v1/responses" {
+		if upstreamMetric := mp.consumeUpstreamMetric(modelID, request.URL.Path, requestStart, 250*time.Millisecond); upstreamMetric != nil {
+			applyUpstreamTimingMetric(&tm, upstreamMetric)
+		}
+	}
+
+	return mp.finalizeMetricCapture(request, recorder, reqBody, reqHeaders, tm, body)
+}
+
+func (mp *metricsMonitor) finalizeMetricCapture(
+	request *http.Request,
+	recorder *responseBodyCopier,
+	reqBody []byte,
+	reqHeaders map[string]string,
+	tm TokenMetrics,
+	body []byte,
+) error {
 	// Build capture if enabled and determine if it will be stored
 	var capture *ReqRespCapture
 	if mp.enableCaptures {
@@ -414,6 +604,38 @@ func parseMetrics(modelID string, start time.Time, usage, timings gjson.Result) 
 		TokensPerSecond: tokensPerSecond,
 		DurationMs:      durationMs,
 	}, nil
+}
+
+func mergeRequestDuration(tm *TokenMetrics, requestStart time.Time) {
+	if tm == nil {
+		return
+	}
+
+	requestDurationMs := int(time.Since(requestStart).Milliseconds())
+	if requestDurationMs > tm.DurationMs {
+		tm.DurationMs = requestDurationMs
+	}
+}
+
+func applyUpstreamTimingMetric(tm *TokenMetrics, upstreamMetric *upstreamTimingCandidate) {
+	if tm == nil || upstreamMetric == nil {
+		return
+	}
+	if upstreamMetric.InputTokens > 0 {
+		tm.InputTokens = upstreamMetric.InputTokens
+	}
+	if upstreamMetric.OutputTokens >= 0 {
+		tm.OutputTokens = upstreamMetric.OutputTokens
+	}
+	if upstreamMetric.PromptPerSecond > 0 {
+		tm.PromptPerSecond = upstreamMetric.PromptPerSecond
+	}
+	if upstreamMetric.TokensPerSecond > 0 {
+		tm.TokensPerSecond = upstreamMetric.TokensPerSecond
+	}
+	if upstreamMetric.DurationMs > tm.DurationMs {
+		tm.DurationMs = upstreamMetric.DurationMs
+	}
 }
 
 // decompressBody decompresses the body based on Content-Encoding header

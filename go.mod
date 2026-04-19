@@ -1,4 +1,4 @@
-module github.com/mostlygeek/llama-swap
+module github.com/Ltamann/tbg-ollama-swap-prompt-optimizer
 
 go 1.25.4
 

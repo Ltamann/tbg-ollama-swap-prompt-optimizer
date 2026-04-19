@@ -6,7 +6,7 @@ This guide show how to use aider and llama-swap to get a 100% local coding co-pi
 
 - aider - [installation docs](https://aider.chat/docs/install.html)
 - llama-server - [download latest release](https://github.com/ggml-org/llama.cpp/releases)
-- llama-swap - [download latest release](https://github.com/mostlygeek/llama-swap/releases)
+- llama-swap - [download latest release](https://github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/releases)
 - [QwQ 32B](https://huggingface.co/bartowski/Qwen_QwQ-32B-GGUF) and [Qwen Coder 2.5 32B](https://huggingface.co/bartowski/Qwen2.5-Coder-32B-Instruct-GGUF) models
 - 24GB VRAM video card
 

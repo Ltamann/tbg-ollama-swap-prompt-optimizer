@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -33,7 +34,7 @@ func TestProcess_AutomaticallyStartsUpstream(t *testing.T) {
 	config := getTestSimpleResponderConfig(expectedMessage)
 
 	// Create a process
-	process := NewProcess("test-process", 5, config, debugLogger, debugLogger)
+	process := NewProcess("test-process", 5, config, debugLogger, debugLogger, debugLogger)
 	defer process.Stop()
 
 	req := httptest.NewRequest("GET", "/test", nil)
@@ -69,7 +70,7 @@ func TestProcess_WaitOnMultipleStarts(t *testing.T) {
 	expectedMessage := "testing91931"
 	config := getTestSimpleResponderConfig(expectedMessage)
 
-	process := NewProcess("test-process", 5, config, debugLogger, debugLogger)
+	process := NewProcess("test-process", 5, config, debugLogger, debugLogger, debugLogger)
 	defer process.Stop()
 
 	var wg sync.WaitGroup
@@ -97,7 +98,7 @@ func TestProcess_BrokenModelConfig(t *testing.T) {
 		CheckEndpoint: "/health",
 	}
 
-	process := NewProcess("broken", 1, config, debugLogger, debugLogger)
+	process := NewProcess("broken", 1, config, debugLogger, debugLogger, debugLogger)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	w := httptest.NewRecorder()
@@ -122,7 +123,7 @@ func TestProcess_UnloadAfterTTL(t *testing.T) {
 	config.UnloadAfter = 3 // seconds
 	assert.Equal(t, 3, config.UnloadAfter)
 
-	process := NewProcess("ttl_test", 2, config, debugLogger, debugLogger)
+	process := NewProcess("ttl_test", 2, config, debugLogger, debugLogger, debugLogger)
 	defer process.Stop()
 
 	// this should take 4 seconds
@@ -154,6 +155,109 @@ func TestProcess_UnloadAfterTTL(t *testing.T) {
 	assert.Equal(t, StateStopped, process.CurrentState())
 }
 
+func TestRewriteResponsesToolCallPayload(t *testing.T) {
+	body := []byte(`{
+		"output":[
+			{
+				"type":"function_call",
+				"call_id":"call_1",
+				"name":"__llamaswap_shell",
+				"arguments":"{\"commands\":[\"pwd\"],\"timeout_ms\":1000,\"max_output_length\":5000}",
+				"status":"completed"
+			},
+			{
+				"type":"function_call",
+				"call_id":"call_2",
+				"name":"__llamaswap_apply_patch",
+				"arguments":"{\"operation\":{\"type\":\"update_file\",\"path\":\"README.md\",\"diff\":\"@@\"}}",
+				"status":"completed"
+			},
+			{
+				"type":"function_call",
+				"call_id":"call_3",
+				"name":"__llamaswap_web_search_preview",
+				"arguments":"{\"query\":\"llama-swap logs\",\"domains\":[\"github.com\"],\"search_context_size\":\"medium\"}",
+				"status":"completed"
+			},
+			{
+				"type":"function_call",
+				"call_id":"call_4",
+				"name":"__llamaswap_file_search",
+				"arguments":"{\"query\":\"README\",\"max_num_results\":3}",
+				"status":"completed"
+			},
+			{
+				"type":"function_call",
+				"call_id":"call_5",
+				"name":"__llamaswap_code_interpreter",
+				"arguments":"{\"code\":\"print(1)\",\"language\":\"python\"}",
+				"status":"completed"
+			},
+			{
+				"type":"function_call",
+				"call_id":"call_6",
+				"name":"__llamaswap_image_generation",
+				"arguments":"{\"prompt\":\"cat\",\"size\":\"1024x1024\"}",
+				"status":"completed"
+			},
+			{
+				"type":"function_call",
+				"call_id":"call_7",
+				"name":"__llamaswap_computer",
+				"arguments":"{\"action\":\"click\",\"x\":10,\"y\":20}",
+				"status":"completed"
+			}
+		]
+	}`)
+
+	updated, changed, err := rewriteResponsesToolCallPayload(body)
+	assert.NoError(t, err)
+	assert.True(t, changed)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(updated, &payload))
+	output, ok := payload["output"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, output, 7) {
+		return
+	}
+
+	first, _ := output[0].(map[string]any)
+	assert.Equal(t, "shell_call", first["type"])
+	action, _ := first["action"].(map[string]any)
+	assert.Equal(t, float64(1000), action["timeout_ms"])
+
+	second, _ := output[1].(map[string]any)
+	assert.Equal(t, "apply_patch_call", second["type"])
+	operation, _ := second["operation"].(map[string]any)
+	assert.Equal(t, "update_file", operation["type"])
+	assert.Equal(t, "README.md", operation["path"])
+
+	third, _ := output[2].(map[string]any)
+	assert.Equal(t, "web_search_call", third["type"])
+	action, _ = third["action"].(map[string]any)
+	assert.Equal(t, "llama-swap logs", action["query"])
+
+	fourth, _ := output[3].(map[string]any)
+	assert.Equal(t, "file_search_call", fourth["type"])
+	action, _ = fourth["action"].(map[string]any)
+	assert.Equal(t, "README", action["query"])
+
+	fifth, _ := output[4].(map[string]any)
+	assert.Equal(t, "code_interpreter_call", fifth["type"])
+	action, _ = fifth["action"].(map[string]any)
+	assert.Equal(t, "python", action["language"])
+
+	sixth, _ := output[5].(map[string]any)
+	assert.Equal(t, "image_generation_call", sixth["type"])
+	action, _ = sixth["action"].(map[string]any)
+	assert.Equal(t, "cat", action["prompt"])
+
+	seventh, _ := output[6].(map[string]any)
+	assert.Equal(t, "computer_call", seventh["type"])
+	action, _ = seventh["action"].(map[string]any)
+	assert.Equal(t, "click", action["action"])
+}
+
 func TestProcess_LowTTLValue(t *testing.T) {
 	if true { // change this code to run this ...
 		t.Skip("skipping test, edit process_test.go to run it ")
@@ -164,7 +268,7 @@ func TestProcess_LowTTLValue(t *testing.T) {
 	config.UnloadAfter = 1 // second
 	assert.Equal(t, 1, config.UnloadAfter)
 
-	process := NewProcess("ttl", 2, config, debugLogger, debugLogger)
+	process := NewProcess("ttl", 2, config, debugLogger, debugLogger, debugLogger)
 	defer process.Stop()
 
 	for i := 0; i < 100; i++ {
@@ -191,7 +295,7 @@ func TestProcess_HTTPRequestsHaveTimeToFinish(t *testing.T) {
 
 	expectedMessage := "12345"
 	config := getTestSimpleResponderConfig(expectedMessage)
-	process := NewProcess("t", 10, config, debugLogger, debugLogger)
+	process := NewProcess("t", 10, config, debugLogger, debugLogger, debugLogger)
 	defer process.Stop()
 
 	results := map[string]string{
@@ -264,7 +368,7 @@ func TestProcess_SwapState(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			p := NewProcess("test", 10, getTestSimpleResponderConfig("test"), debugLogger, debugLogger)
+			p := NewProcess("test", 10, getTestSimpleResponderConfig("test"), debugLogger, debugLogger, debugLogger)
 			p.state = test.currentState
 
 			resultState, err := p.swapState(test.expectedState, test.newState)
@@ -297,7 +401,7 @@ func TestProcess_ShutdownInterruptsHealthCheck(t *testing.T) {
 	config.Proxy = "http://localhost:9998/test"
 
 	healthCheckTTLSeconds := 30
-	process := NewProcess("test-process", healthCheckTTLSeconds, config, debugLogger, debugLogger)
+	process := NewProcess("test-process", healthCheckTTLSeconds, config, debugLogger, debugLogger, debugLogger)
 
 	// make it a lot faster
 	process.healthCheckLoopInterval = time.Second
@@ -332,7 +436,7 @@ func TestProcess_ExitInterruptsHealthCheck(t *testing.T) {
 		CheckEndpoint: "/health",
 	}
 
-	process := NewProcess("sleepy", checkHealthTimeout, config, debugLogger, debugLogger)
+	process := NewProcess("sleepy", checkHealthTimeout, config, debugLogger, debugLogger, debugLogger)
 	process.healthCheckLoopInterval = time.Second // make it faster
 	err := process.start()
 	assert.Equal(t, "upstream command exited prematurely but successfully", err.Error())
@@ -350,7 +454,7 @@ func TestProcess_ConcurrencyLimit(t *testing.T) {
 	// only allow 1 concurrent request at a time
 	config.ConcurrencyLimit = 1
 
-	process := NewProcess("ttl_test", 2, config, debugLogger, debugLogger)
+	process := NewProcess("ttl_test", 2, config, debugLogger, debugLogger, debugLogger)
 	assert.Equal(t, 1, cap(process.concurrencyLimitSemaphore))
 	defer process.Stop()
 
@@ -375,7 +479,7 @@ func TestProcess_StopImmediately(t *testing.T) {
 	expectedMessage := "test_stop_immediate"
 	config := getTestSimpleResponderConfig(expectedMessage)
 
-	process := NewProcess("stop_immediate", 2, config, debugLogger, debugLogger)
+	process := NewProcess("stop_immediate", 2, config, debugLogger, debugLogger, debugLogger)
 	defer process.Stop()
 
 	err := process.start()
@@ -415,7 +519,7 @@ func TestProcess_ForceStopWithKill(t *testing.T) {
 		CheckEndpoint: "/health",
 	}
 
-	process := NewProcess("stop_immediate", 2, conf, debugLogger, debugLogger)
+	process := NewProcess("stop_immediate", 2, conf, debugLogger, debugLogger, debugLogger)
 	defer process.Stop()
 
 	// reduce to make testing go faster
@@ -465,7 +569,7 @@ func TestProcess_StopCmd(t *testing.T) {
 		conf.CmdStop = "kill -TERM ${PID}"
 	}
 
-	process := NewProcess("testStopCmd", 2, conf, debugLogger, debugLogger)
+	process := NewProcess("testStopCmd", 2, conf, debugLogger, debugLogger, debugLogger)
 	defer process.Stop()
 
 	err := process.start()
@@ -485,8 +589,8 @@ func TestProcess_EnvironmentSetCorrectly(t *testing.T) {
 	// ensure the additiona variables are appended to the process' environment
 	configWEnv.Env = append(configWEnv.Env, "TEST_ENV1=1", "TEST_ENV2=2")
 
-	process1 := NewProcess("env_test", 2, conf, debugLogger, debugLogger)
-	process2 := NewProcess("env_test", 2, configWEnv, debugLogger, debugLogger)
+	process1 := NewProcess("env_test", 2, conf, debugLogger, debugLogger, debugLogger)
+	process2 := NewProcess("env_test", 2, configWEnv, debugLogger, debugLogger, debugLogger)
 
 	process1.start()
 	defer process1.Stop()
@@ -507,7 +611,7 @@ func TestProcess_EnvironmentSetCorrectly(t *testing.T) {
 // can't copy the body. This can be caused by a client disconnecting before the full
 // response is sent from some reason.
 //
-// bug: https://github.com/mostlygeek/llama-swap/issues/362
+// bug: https://github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/issues/362
 // see: https://github.com/golang/go/issues/23643 (where panic was added to httputil.ReverseProxy)
 func TestProcess_ReverseProxyPanicIsHandled(t *testing.T) {
 	// Add defer/recover to catch any panics that aren't handled by ProxyRequest
@@ -521,7 +625,7 @@ func TestProcess_ReverseProxyPanicIsHandled(t *testing.T) {
 	expectedMessage := "panic_test"
 	config := getTestSimpleResponderConfig(expectedMessage)
 
-	process := NewProcess("panic-test", 5, config, debugLogger, debugLogger)
+	process := NewProcess("panic-test", 5, config, debugLogger, debugLogger, debugLogger)
 	defer process.Stop()
 
 	// Start the process

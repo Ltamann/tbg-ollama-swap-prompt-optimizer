@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mostlygeek/llama-swap/event"
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/tidwall/gjson"
 )
@@ -1038,12 +1038,487 @@ func TestProxyManager_FiltersStripParams(t *testing.T) {
 	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
 
 	// `temperature` and `stream` are gone but model remains
-	assert.Equal(t, `{"model":"model1", "x_param":"123", "y_param":"abc"}`, response["request_body"])
+	assert.Equal(t, `{"model":"model1","x_param":"123","y_param":"abc"}`, response["request_body"])
 
 	// assert.Nil(t, response["temperature"])
 	// assert.Equal(t, "123", response["x_param"])
 	// assert.Equal(t, "abc", response["y_param"])
 	// t.Logf("%v", response)
+}
+
+func TestNormalizeChatCompletionTools(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"messages":[{"role":"user","content":"hello"}],
+		"tools":[
+			{
+				"type":"function",
+				"name":"say_hello",
+				"description":"Say hello",
+				"parameters":{
+					"type":"object",
+					"properties":{"name":{"type":"string"}},
+					"required":["name"]
+				}
+			}
+		]
+	}`)
+
+	normalized, err := normalizeChatCompletionTools(body)
+	assert.NoError(t, err)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(normalized, &payload))
+
+	tools, ok := payload["tools"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, tools, 1) {
+		return
+	}
+
+	tool, ok := tools[0].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+	assert.Equal(t, "function", tool["type"])
+
+	function, ok := tool["function"].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+	assert.Equal(t, "say_hello", function["name"])
+	assert.Equal(t, "Say hello", function["description"])
+	parameters, ok := function["parameters"].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+	assert.Equal(t, "object", parameters["type"])
+}
+
+func TestProxyManager_ChatCompletionNormalizesResponsesStyleTools(t *testing.T) {
+	config := config.AddDefaultGroupToConfig(config.Config{
+		HealthCheckTimeout: 15,
+		LogLevel:           "error",
+		Models: map[string]config.ModelConfig{
+			"model1": getTestSimpleResponderConfig("model1"),
+		},
+	})
+
+	proxy := New(config)
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+
+	reqBody := `{
+		"model":"model1",
+		"messages":[{"role":"user","content":"say hi"}],
+		"tools":[
+			{
+				"type":"function",
+				"name":"say_hello",
+				"description":"Say hello",
+				"parameters":{
+					"type":"object",
+					"properties":{"name":{"type":"string"}},
+					"required":["name"]
+				}
+			}
+		]
+	}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+	w := CreateTestResponseRecorder()
+
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var response map[string]any
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+
+	requestBody, ok := response["request_body"].(string)
+	if !assert.True(t, ok) {
+		return
+	}
+
+	assert.Contains(t, requestBody, `"type":"function"`)
+	assert.Contains(t, requestBody, `"function":{"description":"Say hello","name":"say_hello","parameters"`)
+	assert.NotContains(t, requestBody, `"tools":[{"description":"Say hello","name":"say_hello"`)
+}
+
+func TestNormalizeResponsesRequest_AdaptsBuiltInTools(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"input":"hello",
+		"tools":[
+			{"type":"shell"},
+			{"type":"apply_patch"},
+			{"type":"web_search_preview"},
+			{"type":"web_search"},
+			{"type":"file_search"},
+			{"type":"code_interpreter"},
+			{"type":"image_generation"},
+			{"type":"computer"},
+			{"type":"function","name":"echo","parameters":{"type":"object"}}
+		]
+	}`)
+
+	normalized, adapted, unsupported, err := normalizeResponsesRequest(body)
+	assert.NoError(t, err)
+	assert.ElementsMatch(t, []string{"shell", "apply_patch", "web_search_preview", "web_search", "file_search", "code_interpreter", "image_generation", "computer"}, adapted)
+	assert.Empty(t, unsupported)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(normalized, &payload))
+
+	tools, ok := payload["tools"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, tools, 9) {
+		return
+	}
+
+	first, _ := tools[0].(map[string]any)
+	second, _ := tools[1].(map[string]any)
+	third, _ := tools[2].(map[string]any)
+	fourth, _ := tools[3].(map[string]any)
+	fifth, _ := tools[4].(map[string]any)
+	sixth, _ := tools[5].(map[string]any)
+	seventh, _ := tools[6].(map[string]any)
+	eighth, _ := tools[7].(map[string]any)
+	ninth, _ := tools[8].(map[string]any)
+	assert.Equal(t, "function", first["type"])
+	assert.Equal(t, llamaSwapShellFunctionName, first["name"])
+	assert.Equal(t, "function", second["type"])
+	assert.Equal(t, llamaSwapApplyPatchFunctionName, second["name"])
+	assert.Equal(t, "function", third["type"])
+	assert.Equal(t, llamaSwapWebSearchFunctionName, third["name"])
+	assert.Equal(t, "function", fourth["type"])
+	assert.Equal(t, llamaSwapWebSearchFunctionName, fourth["name"])
+	assert.Equal(t, "function", fifth["type"])
+	assert.Equal(t, llamaSwapFileSearchFunctionName, fifth["name"])
+	assert.Equal(t, "function", sixth["type"])
+	assert.Equal(t, llamaSwapCodeInterpreterFunctionName, sixth["name"])
+	assert.Equal(t, "function", seventh["type"])
+	assert.Equal(t, llamaSwapImageGenerationFunctionName, seventh["name"])
+	assert.Equal(t, "function", eighth["type"])
+	assert.Equal(t, llamaSwapComputerFunctionName, eighth["name"])
+	assert.Equal(t, "function", ninth["type"])
+	assert.Equal(t, "echo", ninth["name"])
+}
+
+func TestNormalizeResponsesRequest_RejectsUnsupportedBuiltInTools(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"input":"hello",
+		"tools":[
+			{"type":"computer_use_preview"},
+			{"type":"function","name":"echo","parameters":{"type":"object"}}
+		]
+	}`)
+
+	_, adapted, unsupported, err := normalizeResponsesRequest(body)
+	assert.NoError(t, err)
+	assert.Empty(t, adapted)
+	assert.Equal(t, []string{"computer_use_preview"}, unsupported)
+}
+
+func TestNormalizeResponsesRequest_RewritesToolOutputs(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"input":[
+			{"type":"shell_call","call_id":"call_0","action":{"commands":["pwd"]}},
+			{"type":"shell_call_output","call_id":"call_1","output":"ok","status":"completed"},
+			{"type":"apply_patch_call","call_id":"call_1b","operation":{"type":"update_file","path":"README.md","diff":"@@"}},
+			{"type":"apply_patch_call_output","call_id":"call_2","success":true},
+			{"type":"web_search_call","call_id":"call_2b","action":{"query":"llama-swap github"}},
+			{"type":"web_search_call_output","call_id":"call_3","output":[{"title":"A"}]},
+			{"type":"file_search_call","call_id":"call_4","action":{"query":"readme","max_num_results":3}},
+			{"type":"file_search_call_output","call_id":"call_5","output":[{"filename":"README.md"}]},
+			{"type":"code_interpreter_call","call_id":"call_6","action":{"code":"print(1)","language":"python"}},
+			{"type":"code_interpreter_call_output","call_id":"call_7","output":"1"},
+			{"type":"image_generation_call","call_id":"call_8","action":{"prompt":"cat","size":"1024x1024"}},
+			{"type":"image_generation_call_output","call_id":"call_9","output":[{"b64_json":"abc"}]},
+			{"type":"computer_call","call_id":"call_10","action":{"action":"click","x":10,"y":20}},
+			{"type":"computer_call_output","call_id":"call_11","output":{"ok":true}}
+		]
+	}`)
+
+	normalized, adapted, unsupported, err := normalizeResponsesRequest(body)
+	assert.NoError(t, err)
+	assert.Empty(t, adapted)
+	assert.Empty(t, unsupported)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(normalized, &payload))
+	input, ok := payload["input"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, input, 14) {
+		return
+	}
+
+	first, _ := input[0].(map[string]any)
+	second, _ := input[1].(map[string]any)
+	third, _ := input[2].(map[string]any)
+	fourth, _ := input[3].(map[string]any)
+	fifth, _ := input[4].(map[string]any)
+	sixth, _ := input[5].(map[string]any)
+	seventh, _ := input[6].(map[string]any)
+	eighth, _ := input[7].(map[string]any)
+	ninth, _ := input[8].(map[string]any)
+	tenth, _ := input[9].(map[string]any)
+	eleventh, _ := input[10].(map[string]any)
+	twelfth, _ := input[11].(map[string]any)
+	thirteenth, _ := input[12].(map[string]any)
+	fourteenth, _ := input[13].(map[string]any)
+	assert.Equal(t, "function_call", first["type"])
+	assert.Equal(t, llamaSwapShellFunctionName, first["name"])
+	assert.Equal(t, "function_call_output", second["type"])
+	assert.Equal(t, "call_1", second["call_id"])
+	assert.Equal(t, "function_call", third["type"])
+	assert.Equal(t, llamaSwapApplyPatchFunctionName, third["name"])
+	assert.Equal(t, "function_call_output", fourth["type"])
+	assert.Equal(t, "call_2", fourth["call_id"])
+	assert.Equal(t, "function_call", fifth["type"])
+	assert.Equal(t, llamaSwapWebSearchFunctionName, fifth["name"])
+	assert.Equal(t, "function_call_output", sixth["type"])
+	assert.Equal(t, "call_3", sixth["call_id"])
+	assert.Equal(t, "function_call", seventh["type"])
+	assert.Equal(t, llamaSwapFileSearchFunctionName, seventh["name"])
+	assert.Equal(t, "function_call_output", eighth["type"])
+	assert.Equal(t, "call_5", eighth["call_id"])
+	assert.Equal(t, "function_call", ninth["type"])
+	assert.Equal(t, llamaSwapCodeInterpreterFunctionName, ninth["name"])
+	assert.Equal(t, "function_call_output", tenth["type"])
+	assert.Equal(t, "call_7", tenth["call_id"])
+	assert.Equal(t, "function_call", eleventh["type"])
+	assert.Equal(t, llamaSwapImageGenerationFunctionName, eleventh["name"])
+	assert.Equal(t, "function_call_output", twelfth["type"])
+	assert.Equal(t, "call_9", twelfth["call_id"])
+	assert.Equal(t, "function_call", thirteenth["type"])
+	assert.Equal(t, llamaSwapComputerFunctionName, thirteenth["name"])
+	assert.Equal(t, "function_call_output", fourteenth["type"])
+	assert.Equal(t, "call_11", fourteenth["call_id"])
+}
+
+func TestNormalizeResponsesRequest_RewritesDeveloperRoleToSystem(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"input":[
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"system rules"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+		]
+	}`)
+
+	normalized, adapted, unsupported, err := normalizeResponsesRequest(body)
+	assert.NoError(t, err)
+	assert.Empty(t, adapted)
+	assert.Empty(t, unsupported)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(normalized, &payload))
+
+	input, ok := payload["input"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, input, 2) {
+		return
+	}
+
+	first, ok := input[0].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+	second, ok := input[1].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+
+	assert.Equal(t, "message", first["type"])
+	assert.Equal(t, "system", first["role"])
+	assert.Equal(t, "message", second["type"])
+	assert.Equal(t, "user", second["role"])
+}
+
+func TestNormalizeResponsesRequest_MovesSystemMessagesToFront(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"input":[
+			{"type":"message","role":"system","content":[{"type":"input_text","text":"a"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"b"}]},
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"c"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"d"}]}
+		]
+	}`)
+
+	normalized, adapted, unsupported, err := normalizeResponsesRequest(body)
+	assert.NoError(t, err)
+	assert.Empty(t, adapted)
+	assert.Empty(t, unsupported)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(normalized, &payload))
+
+	input, ok := payload["input"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, input, 3) {
+		return
+	}
+
+	roles := make([]string, 0, len(input))
+	for _, rawItem := range input {
+		item, ok := rawItem.(map[string]any)
+		if !assert.True(t, ok) {
+			return
+		}
+		role, _ := item["role"].(string)
+		roles = append(roles, role)
+	}
+
+	assert.Equal(t, []string{"system", "user", "user"}, roles)
+}
+
+func TestNormalizeResponsesRequest_MergesLeadingSystemMessages(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"input":[
+			{"type":"message","role":"system","content":[{"type":"input_text","text":"a"}]},
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"b"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"c"}]}
+		]
+	}`)
+
+	normalized, adapted, unsupported, err := normalizeResponsesRequest(body)
+	assert.NoError(t, err)
+	assert.Empty(t, adapted)
+	assert.Empty(t, unsupported)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(normalized, &payload))
+
+	input, ok := payload["input"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, input, 2) {
+		return
+	}
+
+	first, ok := input[0].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+	second, ok := input[1].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+
+	assert.Equal(t, "system", first["role"])
+	content, ok := first["content"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, content, 2) {
+		return
+	}
+	assert.Equal(t, "user", second["role"])
+}
+
+func TestNormalizeResponsesRequest_InjectsQwenToolPolicyForBuiltInTools(t *testing.T) {
+	body := []byte(`{
+		"model":"Qwen3.5-35B-A3B-Q8",
+		"input":[
+			{"type":"message","role":"system","content":"You are a coding agent."},
+			{"type":"message","role":"user","content":"Edit app.js."}
+		],
+		"tools":[
+			{"type":"shell"},
+			{"type":"apply_patch"},
+			{"type":"web_search"}
+		]
+	}`)
+
+	normalized, adapted, unsupported, err := normalizeResponsesRequest(body)
+	assert.NoError(t, err)
+	assert.ElementsMatch(t, []string{"shell", "apply_patch", "web_search"}, adapted)
+	assert.Empty(t, unsupported)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(normalized, &payload))
+
+	input, ok := payload["input"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, input, 2) {
+		return
+	}
+
+	first, ok := input[0].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+
+	content, ok := first["content"].(string)
+	if !assert.True(t, ok) {
+		return
+	}
+
+	assert.Contains(t, content, "Use apply_patch for any file creation, deletion, or modification.")
+	assert.Contains(t, content, "Do not use shell to edit files.")
+	assert.Contains(t, content, "Use web_search for current or external information.")
+}
+
+func TestNormalizeResponsesRequest_DoesNotInjectQwenToolPolicyForNonQwenModels(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"input":[
+			{"type":"message","role":"system","content":"You are a coding agent."},
+			{"type":"message","role":"user","content":"Edit app.js."}
+		],
+		"tools":[
+			{"type":"shell"},
+			{"type":"apply_patch"}
+		]
+	}`)
+
+	normalized, adapted, unsupported, err := normalizeResponsesRequest(body)
+	assert.NoError(t, err)
+	assert.ElementsMatch(t, []string{"shell", "apply_patch"}, adapted)
+	assert.Empty(t, unsupported)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(normalized, &payload))
+
+	input, ok := payload["input"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, input, 2) {
+		return
+	}
+
+	first, ok := input[0].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+
+	content, ok := first["content"].(string)
+	if !assert.True(t, ok) {
+		return
+	}
+
+	assert.Equal(t, "You are a coding agent.", content)
+}
+
+func TestProxyManager_ResponsesStartsModelBeforeUnsupportedToolError(t *testing.T) {
+	config := config.AddDefaultGroupToConfig(config.Config{
+		HealthCheckTimeout: 15,
+		LogLevel:           "error",
+		Models: map[string]config.ModelConfig{
+			"model1": getTestSimpleResponderConfig("model1"),
+		},
+	})
+
+	proxy := New(config)
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+	proxy.Lock()
+	proxy.transformModes["model1"] = TransformModeResponses
+	proxy.Unlock()
+
+	reqBody := `{"model":"model1","input":"hello","tools":[{"type":"computer_use_preview"}]}`
+	req := httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := CreateTestResponseRecorder()
+
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "unsupported /v1/responses tool types for local backend")
+
+	processGroup := proxy.findGroupByModelName("model1")
+	if assert.NotNil(t, processGroup) {
+		process, ok := processGroup.GetMember("model1")
+		if assert.True(t, ok) {
+			assert.Equal(t, StateReady, process.CurrentState())
+		}
+	}
 }
 
 func TestProxyManager_HealthEndpoint(t *testing.T) {

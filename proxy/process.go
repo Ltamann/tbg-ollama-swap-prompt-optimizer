@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -18,8 +20,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mostlygeek/llama-swap/event"
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 )
 
 type ProcessState string
@@ -54,8 +56,9 @@ type Process struct {
 	// closed when command exits
 	cmdWaitChan chan struct{}
 
-	processLogger *LogMonitor
-	proxyLogger   *LogMonitor
+	processLogger   *LogMonitor
+	proxyLogger     *LogMonitor
+	transformLogger *LogMonitor
 
 	healthCheckTimeout      int
 	healthCheckLoopInterval time.Duration
@@ -89,7 +92,7 @@ type Process struct {
 	runtimeFitCtxMode atomic.Int32
 }
 
-func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, processLogger *LogMonitor, proxyLogger *LogMonitor) *Process {
+func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, processLogger *LogMonitor, proxyLogger *LogMonitor, transformLogger *LogMonitor) *Process {
 	concurrentLimit := 10
 	if config.ConcurrencyLimit > 0 {
 		concurrentLimit = config.ConcurrencyLimit
@@ -109,6 +112,9 @@ func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, pr
 			if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 				resp.Header.Set("X-Accel-Buffering", "no")
 			}
+			if err := normalizeResponsesToolCallResponse(resp, transformLogger, ID); err != nil {
+				proxyLogger.Warnf("<%s> failed to normalize responses tool call output: %v", ID, err)
+			}
 			return nil
 		}
 	}
@@ -121,6 +127,7 @@ func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, pr
 		cancelUpstream:          nil,
 		processLogger:           processLogger,
 		proxyLogger:             proxyLogger,
+		transformLogger:         transformLogger,
 		healthCheckTimeout:      healthCheckTimeout,
 		healthCheckLoopInterval: 5 * time.Second, /* default, can not be set by user - used for testing */
 		state:                   StateStopped,
@@ -133,6 +140,236 @@ func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, pr
 		gracefulStopTimeout: 10 * time.Second,
 		cmdWaitChan:         make(chan struct{}),
 	}
+}
+
+func normalizeResponsesToolCallResponse(resp *http.Response, transformLogger *LogMonitor, modelID string) error {
+	if resp == nil || resp.Request == nil {
+		return nil
+	}
+	if !strings.HasPrefix(resp.Request.URL.Path, "/v1/responses") {
+		return nil
+	}
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") {
+		return nil
+	}
+
+	adapterHeader := resp.Request.Header.Get(llamaSwapResponseToolAdapterHeader)
+	if strings.TrimSpace(adapterHeader) == "" {
+		return nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+
+	updated, changed, err := rewriteResponsesToolCallPayload(body)
+	if err != nil {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return err
+	}
+
+	if !changed {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return nil
+	}
+
+	logBodyTransform(transformLogger, modelID, "responses_output_rewrite", body, updated)
+	resp.Body = io.NopCloser(bytes.NewReader(updated))
+	resp.ContentLength = int64(len(updated))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(updated)))
+	return nil
+}
+
+func rewriteResponsesToolCallPayload(body []byte) ([]byte, bool, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false, err
+	}
+
+	output, ok := payload["output"].([]any)
+	if !ok || len(output) == 0 {
+		return body, false, nil
+	}
+
+	changed := false
+	normalized := make([]any, 0, len(output))
+	for _, rawItem := range output {
+		item, itemChanged := rewriteResponsesOutputItem(rawItem)
+		if itemChanged {
+			changed = true
+		}
+		normalized = append(normalized, item)
+	}
+
+	if !changed {
+		return body, false, nil
+	}
+
+	payload["output"] = normalized
+	updated, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, err
+	}
+	return updated, true, nil
+}
+
+func rewriteResponsesOutputItem(rawItem any) (any, bool) {
+	item, ok := rawItem.(map[string]any)
+	if !ok {
+		return rawItem, false
+	}
+
+	itemType, _ := item["type"].(string)
+	if itemType != "function_call" {
+		return rawItem, false
+	}
+
+	name, _ := item["name"].(string)
+	switch name {
+	case llamaSwapShellFunctionName:
+		action := map[string]any{}
+		if args := parseJSONMapString(item["arguments"]); args != nil {
+			if commands, ok := args["commands"]; ok {
+				action["commands"] = commands
+			}
+			if timeoutMS, ok := args["timeout_ms"]; ok {
+				action["timeout_ms"] = timeoutMS
+			}
+			if maxOutputLength, ok := args["max_output_length"]; ok {
+				action["max_output_length"] = maxOutputLength
+			}
+		}
+		rewritten := cloneMap(item)
+		rewritten["type"] = "shell_call"
+		delete(rewritten, "arguments")
+		delete(rewritten, "name")
+		rewritten["action"] = action
+		return rewritten, true
+	case llamaSwapApplyPatchFunctionName:
+		operation := map[string]any{}
+		if args := parseJSONMapString(item["arguments"]); args != nil {
+			if rawOperation, ok := args["operation"].(map[string]any); ok {
+				operation = rawOperation
+			}
+		}
+		rewritten := cloneMap(item)
+		rewritten["type"] = "apply_patch_call"
+		delete(rewritten, "arguments")
+		delete(rewritten, "name")
+		rewritten["operation"] = operation
+		return rewritten, true
+	case llamaSwapWebSearchFunctionName:
+		action := map[string]any{}
+		if args := parseJSONMapString(item["arguments"]); args != nil {
+			if query, ok := args["query"]; ok {
+				action["query"] = query
+			}
+			if domains, ok := args["domains"]; ok {
+				action["domains"] = domains
+			}
+			if searchContextSize, ok := args["search_context_size"]; ok {
+				action["search_context_size"] = searchContextSize
+			}
+			if userLocation, ok := args["user_location"]; ok {
+				action["user_location"] = userLocation
+			}
+		}
+		rewritten := cloneMap(item)
+		rewritten["type"] = "web_search_call"
+		delete(rewritten, "arguments")
+		delete(rewritten, "name")
+		rewritten["action"] = action
+		return rewritten, true
+	case llamaSwapFileSearchFunctionName:
+		action := map[string]any{}
+		if args := parseJSONMapString(item["arguments"]); args != nil {
+			for _, key := range []string{"query", "vector_store_ids", "max_num_results", "filters"} {
+				if value, ok := args[key]; ok {
+					action[key] = value
+				}
+			}
+		}
+		rewritten := cloneMap(item)
+		rewritten["type"] = "file_search_call"
+		delete(rewritten, "arguments")
+		delete(rewritten, "name")
+		rewritten["action"] = action
+		return rewritten, true
+	case llamaSwapCodeInterpreterFunctionName:
+		action := map[string]any{}
+		if args := parseJSONMapString(item["arguments"]); args != nil {
+			for _, key := range []string{"code", "language", "files", "args"} {
+				if value, ok := args[key]; ok {
+					action[key] = value
+				}
+			}
+		}
+		rewritten := cloneMap(item)
+		rewritten["type"] = "code_interpreter_call"
+		delete(rewritten, "arguments")
+		delete(rewritten, "name")
+		rewritten["action"] = action
+		return rewritten, true
+	case llamaSwapImageGenerationFunctionName:
+		action := map[string]any{}
+		if args := parseJSONMapString(item["arguments"]); args != nil {
+			for _, key := range []string{"prompt", "size", "quality", "background", "output_format"} {
+				if value, ok := args[key]; ok {
+					action[key] = value
+				}
+			}
+		}
+		rewritten := cloneMap(item)
+		rewritten["type"] = "image_generation_call"
+		delete(rewritten, "arguments")
+		delete(rewritten, "name")
+		rewritten["action"] = action
+		return rewritten, true
+	case llamaSwapComputerFunctionName:
+		action := map[string]any{}
+		if args := parseJSONMapString(item["arguments"]); args != nil {
+			for _, key := range []string{"action", "x", "y", "text", "button"} {
+				if value, ok := args[key]; ok {
+					action[key] = value
+				}
+			}
+		}
+		rewritten := cloneMap(item)
+		rewritten["type"] = "computer_call"
+		delete(rewritten, "arguments")
+		delete(rewritten, "name")
+		rewritten["action"] = action
+		return rewritten, true
+	default:
+		return rawItem, false
+	}
+}
+
+func parseJSONMapString(value any) map[string]any {
+	text, ok := value.(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		return nil
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		return nil
+	}
+	return parsed
+}
+
+func cloneMap(input map[string]any) map[string]any {
+	out := make(map[string]any, len(input))
+	for k, v := range input {
+		out[k] = v
+	}
+	return out
 }
 
 // LogMonitor returns the log monitor associated with the process.

@@ -89,6 +89,66 @@ type ChatMessage struct {
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
 }
 
+type rawChatMessage struct {
+	Role         string          `json:"role"`
+	Content      json.RawMessage `json:"content"`
+	Name         string          `json:"name,omitempty"`
+	FunctionName string          `json:"function_name,omitempty"`
+	ToolCalls    []ToolCall      `json:"tool_calls,omitempty"`
+}
+
+type chatMessageContentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+func (m *ChatMessage) UnmarshalJSON(data []byte) error {
+	var raw rawChatMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	content, err := parseChatMessageContent(raw.Content)
+	if err != nil {
+		return err
+	}
+
+	m.Role = raw.Role
+	m.Content = content
+	m.Name = raw.Name
+	m.FunctionName = raw.FunctionName
+	m.ToolCalls = raw.ToolCalls
+	return nil
+}
+
+func parseChatMessageContent(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", nil
+	}
+
+	var content string
+	if err := json.Unmarshal(raw, &content); err == nil {
+		return content, nil
+	}
+
+	var parts []chatMessageContentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return "", err
+	}
+
+	textParts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		switch part.Type {
+		case "", "text", "input_text", "output_text":
+			if strings.TrimSpace(part.Text) != "" {
+				textParts = append(textParts, part.Text)
+			}
+		}
+	}
+
+	return strings.Join(textParts, "\n"), nil
+}
+
 // ToolCall represents a tool call in a message
 type ToolCall struct {
 	ID       string       `json:"id"`
@@ -104,21 +164,15 @@ type FunctionCall struct {
 
 // ChatRequest represents an OpenAI-style chat completion request
 type ChatRequest struct {
-	Model            string        `json:"model"`
-	Messages         []ChatMessage `json:"messages"`
-	MaxTokens        int           `json:"max_tokens,omitempty"`
-	Stream           bool          `json:"stream,omitempty"`
-	Tools            []ToolSchema  `json:"tools,omitempty"`
-	ToolChoice       any           `json:"tool_choice,omitempty"`
-	PresencePenalty  float64       `json:"presence_penalty,omitempty"`
-	FrequencyPenalty float64       `json:"frequency_penalty,omitempty"`
-	Temperature      float64       `json:"temperature,omitempty"`
-}
-
-// ToolSchema represents a tool definition
-type ToolSchema struct {
-	Type     string      `json:"type"`
-	Function FunctionDef `json:"function,omitempty"`
+	Model            string            `json:"model"`
+	Messages         []ChatMessage     `json:"messages"`
+	MaxTokens        int               `json:"max_tokens,omitempty"`
+	Stream           bool              `json:"stream,omitempty"`
+	Tools            []json.RawMessage `json:"tools,omitempty"`
+	ToolChoice       any               `json:"tool_choice,omitempty"`
+	PresencePenalty  float64           `json:"presence_penalty,omitempty"`
+	FrequencyPenalty float64           `json:"frequency_penalty,omitempty"`
+	Temperature      float64           `json:"temperature,omitempty"`
 }
 
 // FunctionDef defines a callable function
@@ -203,7 +257,7 @@ func (cm *ContextManager) defaultReservedOutputTokens() int {
 }
 
 // CountChatTokens counts tokens in chat messages and tools using llama.cpp endpoint
-func (cm *ContextManager) CountChatTokens(messages []ChatMessage, tools []ToolSchema) (int, error) {
+func (cm *ContextManager) CountChatTokens(messages []ChatMessage, tools []json.RawMessage) (int, error) {
 	if cm.upstreamProxyURL == "" {
 		return 0, fmt.Errorf("upstream URL not configured for model %s", cm.modelID)
 	}
@@ -280,7 +334,7 @@ func (cm *ContextManager) estimateTokens(textParts []string) int {
 }
 
 // applySlidingWindow implements the sliding window cropping strategy
-func (cm *ContextManager) applySlidingWindow(messages []ChatMessage, tools []ToolSchema, maxTokens int) ([]ChatMessage, []ToolSchema) {
+func (cm *ContextManager) applySlidingWindow(messages []ChatMessage, tools []json.RawMessage, maxTokens int) ([]ChatMessage, []json.RawMessage) {
 	if maxTokens <= 0 || len(messages) == 0 {
 		return messages, tools
 	}
@@ -390,11 +444,15 @@ func cloneMessages(messages []ChatMessage) []ChatMessage {
 	return cloned
 }
 
-func cloneTools(tools []ToolSchema) []ToolSchema {
+func cloneTools(tools []json.RawMessage) []json.RawMessage {
 	if len(tools) == 0 {
 		return nil
 	}
-	return append([]ToolSchema(nil), tools...)
+	cloned := make([]json.RawMessage, 0, len(tools))
+	for _, tool := range tools {
+		cloned = append(cloned, append(json.RawMessage(nil), tool...))
+	}
+	return cloned
 }
 
 func (cm *ContextManager) compactRepeatedMessages(messages []ChatMessage) []ChatMessage {
@@ -493,10 +551,10 @@ func compactRepeatedLines(content string) string {
 
 // CropResult contains the cropped request data
 type CropResult struct {
-	Messages         []ChatMessage `json:"messages,omitempty"`
-	Tools            []ToolSchema  `json:"tools,omitempty"`
-	OriginalMessages []ChatMessage `json:"-"`
-	OriginalTools    []ToolSchema  `json:"-"`
+	Messages         []ChatMessage     `json:"messages,omitempty"`
+	Tools            []json.RawMessage `json:"tools,omitempty"`
+	OriginalMessages []ChatMessage     `json:"-"`
+	OriginalTools    []json.RawMessage `json:"-"`
 }
 
 // IsCropped returns true if the request was actually cropped

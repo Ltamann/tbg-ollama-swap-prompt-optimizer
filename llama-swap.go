@@ -14,9 +14,9 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
-	"github.com/mostlygeek/llama-swap/proxy"
-	"github.com/mostlygeek/llama-swap/proxy/config"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 )
 
 var (
@@ -123,13 +123,12 @@ func main() {
 	// load the initial proxy manager
 	reloadProxyManager()
 	debouncedReload := debounce(time.Second, reloadProxyManager)
+	defer event.On(func(e proxy.ConfigFileChangedEvent) {
+		if e.ReloadingState == proxy.ReloadingStateStart {
+			debouncedReload()
+		}
+	})()
 	if *watchConfig {
-		defer event.On(func(e proxy.ConfigFileChangedEvent) {
-			if e.ReloadingState == proxy.ReloadingStateStart {
-				debouncedReload()
-			}
-		})()
-
 		fmt.Println("Watching Configuration for changes")
 		go func() {
 			absConfigPath, err := filepath.Abs(*configPath)

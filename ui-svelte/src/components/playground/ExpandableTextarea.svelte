@@ -54,7 +54,7 @@
 
 <div class="flex-1 relative group flex items-stretch min-h-0">
   <textarea
-    class="w-full px-3 py-2 pr-10 rounded border border-gray-200 dark:border-white/10 bg-surface focus:outline-none focus:ring-2 focus:ring-inset focus:ring-primary resize-none"
+    class="w-full pl-10 pr-3 py-2 pb-9 rounded-xl border border-transparent bg-transparent focus:outline-none focus:ring-0 resize-none"
     {placeholder}
     {rows}
     bind:value
@@ -62,7 +62,7 @@
     {disabled}
   ></textarea>
   <button
-    class="absolute top-2 right-2 p-1.5 rounded-lg opacity-60 md:opacity-0 group-hover:opacity-100 transition-opacity bg-surface/90 hover:bg-surface border border-gray-200 dark:border-white/10 shadow-sm"
+    class="absolute bottom-0 left-2 btn w-9 h-9 rounded-full p-0 flex items-center justify-center"
     onclick={openExpanded}
     title="Expand to edit"
     type="button"

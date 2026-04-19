@@ -1,11 +1,11 @@
 <script lang="ts">
-  import { proxyLogs, upstreamLogs } from "../stores/api";
+  import { proxyLogs, upstreamLogs, transformLogs } from "../stores/api";
   import { screenWidth } from "../stores/theme";
   import { persistentStore } from "../stores/persistent";
   import LogPanel from "../components/LogPanel.svelte";
   import ResizablePanels from "../components/ResizablePanels.svelte";
 
-  type ViewMode = "proxy" | "upstream" | "panels";
+  type ViewMode = "proxy" | "upstream" | "transform" | "panels";
 
   const viewModeStore = persistentStore<ViewMode>("logviewer-view-mode", "panels");
 
@@ -14,7 +14,7 @@
   );
 
   function cycleViewMode(): void {
-    const modes: ViewMode[] = ["panels", "proxy", "upstream"];
+    const modes: ViewMode[] = ["panels", "proxy", "upstream", "transform"];
     const currentIndex = modes.indexOf($viewModeStore);
     const nextIndex = (currentIndex + 1) % modes.length;
     viewModeStore.set(modes[nextIndex]);
@@ -26,6 +26,8 @@
         return "P";
       case "upstream":
         return "U";
+      case "transform":
+        return "T";
       case "panels":
         return "⊞";
     }
@@ -37,6 +39,8 @@
         return "Proxy";
       case "upstream":
         return "Upstream";
+      case "transform":
+        return "Transform";
       case "panels":
         return "Panels";
     }
@@ -63,11 +67,16 @@
           <LogPanel id="proxy" title="Proxy Logs" logData={$proxyLogs} />
         {/snippet}
         {#snippet rightPanel()}
-          <LogPanel id="upstream" title="Upstream Logs" logData={$upstreamLogs} />
+          <div class="grid h-full grid-rows-2 gap-2">
+            <LogPanel id="upstream" title="Upstream Logs" logData={$upstreamLogs} />
+            <LogPanel id="transform" title="Transform Logs" logData={$transformLogs} />
+          </div>
         {/snippet}
       </ResizablePanels>
     {:else if $viewModeStore === "proxy"}
       <LogPanel id="proxy" title="Proxy Logs" logData={$proxyLogs} />
+    {:else if $viewModeStore === "transform"}
+      <LogPanel id="transform" title="Transform Logs" logData={$transformLogs} />
     {:else}
       <LogPanel id="upstream" title="Upstream Logs" logData={$upstreamLogs} />
     {/if}

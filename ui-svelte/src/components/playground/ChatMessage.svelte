@@ -111,11 +111,13 @@
   }
 </script>
 
-<div class="flex {role === 'user' ? 'justify-end' : 'justify-start'} mb-4">
+<div class="flex {role === 'user' ? 'justify-end' : 'justify-start'} mb-6">
   <div
-    class="relative group max-w-[85%] rounded-lg px-4 py-2 {role === 'user'
-      ? 'bg-primary text-btn-primary-text'
-      : 'bg-surface border border-gray-200 dark:border-white/10'}"
+    class="relative group w-full {role === 'user'
+      ? 'max-w-[78%] rounded-[1.35rem] px-4 py-3 bg-surface border border-gray-200 dark:border-white/10 shadow-sm'
+      : role === 'assistant'
+        ? 'max-w-full rounded-xl px-0 py-0 bg-transparent border-0'
+        : 'max-w-full rounded-xl px-4 py-3 bg-surface border border-gray-200 dark:border-white/10'}"
   >
     {#if role === "assistant"}
       {#if reasoning_content || isReasoning}

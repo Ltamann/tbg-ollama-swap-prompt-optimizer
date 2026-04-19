@@ -1,14 +1,18 @@
 <script lang="ts">
   import { link, location } from "svelte-spa-router";
-  import { toggleTheme, isDarkMode, appTitle, isNarrow } from "../stores/theme";
+  import { models } from "../stores/api";
+  import { persistentStore } from "../stores/persistent";
+  import { toggleTheme, isDarkMode, appTitle, isNarrow, contextSize } from "../stores/theme";
   import ConnectionStatus from "./ConnectionStatus.svelte";
+  import ContextSizeBar from "./ContextSizeBar.svelte";
+
+  const selectedModelStore = persistentStore<string>("playground-selected-model", "");
 
   function handleTitleChange(newTitle: string): void {
     const sanitized = newTitle.replace(/\n/g, "").trim().substring(0, 64) || "TBG (O) LlamA Swap";
     appTitle.set(sanitized);
   }
 
-  // Migrate older persisted titles to the new project name.
   $effect(() => {
     const current = ($appTitle || "").trim();
     const lower = current.toLowerCase();
@@ -34,12 +38,38 @@
   function isActive(path: string, currentLocation: string): boolean {
     return path === "/" ? currentLocation === "/" : currentLocation.startsWith(path);
   }
+
+  $effect(() => {
+    const selectedId = $selectedModelStore;
+    const localModels = $models.filter((m) => !m.peerID && !m.unlisted);
+    const selectedModel = localModels.find((m) => m.id === selectedId);
+    const readyModel = localModels.find((m) => m.state === "ready");
+    const activeModel = selectedModel || readyModel || localModels[0];
+    const modelId = activeModel?.id || "";
+    const modelCtx = activeModel?.ctxConfigured || activeModel?.ctxReference || 0;
+    contextSize.update((current) => {
+      if (!modelId || modelCtx <= 0) {
+        if (current.modelId === "" && current.modelCtx === 0 && current.inputCtx === 0 && current.optimizedCtx === 0) {
+          return current;
+        }
+        return { modelId: "", modelCtx: 0, inputCtx: 0, optimizedCtx: 0 };
+      }
+
+      if (current.modelId !== modelId) {
+        return { modelId, modelCtx, inputCtx: 0, optimizedCtx: 0 };
+      }
+
+      if (current.modelCtx !== modelCtx) {
+        return { ...current, modelCtx };
+      }
+
+      return current;
+    });
+  });
 </script>
 
 <header
-  class="flex flex-col items-center bg-surface border-b border-border px-4 {$isNarrow
-    ? 'py-1 h-[75px]'
-    : 'py-2 h-[90px]'}"
+  class="flex flex-col items-center bg-surface border-b border-border px-4 {$isNarrow ? 'py-1' : 'py-2'}"
 >
   <h1
     contenteditable="true"
@@ -110,4 +140,13 @@
     </button>
     <ConnectionStatus />
   </menu>
+
+  <div class="mt-1 w-full flex justify-center">
+    <ContextSizeBar
+      modelCtx={$contextSize.modelCtx}
+      inputCtx={$contextSize.inputCtx}
+      optimizedCtx={$contextSize.optimizedCtx}
+      modelId={$contextSize.modelId}
+    />
+  </div>
 </header>

@@ -16,6 +16,8 @@ export interface Model {
   ctxSource?: "ctx-size" | "fit-ctx" | "";
   fitEnabled?: boolean;
   fitCtxMode?: "max" | "min";
+  transformBypass?: boolean;
+  transformMode?: "raw" | "completions_bridge" | "responses";
   tempConfigured?: number;
   topPConfigured?: number;
   topKConfigured?: number;
@@ -28,6 +30,7 @@ export interface Metrics {
   id: number;
   timestamp: string;
   model: string;
+  status_code: number;
   cache_tokens: number;
   input_tokens: number;
   output_tokens: number;
@@ -47,7 +50,7 @@ export interface ReqRespCapture {
 }
 
 export interface LogData {
-  source: "upstream" | "proxy";
+  source: "upstream" | "proxy" | "transform";
   data: string;
 }
 

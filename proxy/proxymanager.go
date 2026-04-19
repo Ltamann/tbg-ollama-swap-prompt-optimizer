@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"sort"
 	"strconv"
@@ -16,9 +17,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
-	"github.com/mostlygeek/llama-swap/proxy/config"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -26,6 +27,1946 @@ import (
 const (
 	PROFILE_SPLIT_CHAR = ":"
 )
+
+const (
+	llamaSwapResponseToolAdapterHeader   = "X-LlamaSwap-Responses-Tool-Adapter"
+	llamaSwapShellFunctionName           = "__llamaswap_shell"
+	llamaSwapApplyPatchFunctionName      = "__llamaswap_apply_patch"
+	llamaSwapWebSearchFunctionName       = "__llamaswap_web_search_preview"
+	llamaSwapFileSearchFunctionName      = "__llamaswap_file_search"
+	llamaSwapCodeInterpreterFunctionName = "__llamaswap_code_interpreter"
+	llamaSwapImageGenerationFunctionName = "__llamaswap_image_generation"
+	llamaSwapComputerFunctionName        = "__llamaswap_computer"
+)
+
+// stripTopLevelParam removes a top-level parameter from JSON body without affecting nested fields.
+// This prevents accidentally removing nested fields like tools[].type when stripping "type".
+func stripTopLevelParam(bodyBytes []byte, paramName string) ([]byte, error) {
+	// Parse the JSON to work with it structurally
+	var data map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &data); err != nil {
+		return bodyBytes, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	}
+
+	// Only delete from the top level
+	delete(data, paramName)
+
+	// Marshal back to JSON
+	result, err := json.Marshal(data)
+	if err != nil {
+		return bodyBytes, fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+
+	return result, nil
+}
+
+// normalizeChatCompletionTools converts Responses-style top-level function tools
+// into the nested chat.completions format expected by llama.cpp-compatible servers.
+func normalizeChatCompletionTools(bodyBytes []byte) ([]byte, error) {
+	var data map[string]any
+	if err := json.Unmarshal(bodyBytes, &data); err != nil {
+		return bodyBytes, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	}
+
+	rawTools, ok := data["tools"].([]any)
+	if !ok || len(rawTools) == 0 {
+		return bodyBytes, nil
+	}
+
+	changed := false
+	normalizedTools := make([]any, 0, len(rawTools))
+	for _, rawTool := range rawTools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			normalizedTools = append(normalizedTools, rawTool)
+			continue
+		}
+
+		toolType, _ := tool["type"].(string)
+		if toolType != "function" {
+			// Convert non-function tools (e.g. Codex custom types) to function format
+			name, _ := tool["name"].(string)
+			if strings.TrimSpace(name) == "" {
+				normalizedTools = append(normalizedTools, rawTool)
+				continue
+			}
+			fn := map[string]any{"name": name}
+			if desc, ok := tool["description"]; ok {
+				fn["description"] = desc
+			}
+			if params, ok := tool["parameters"]; ok {
+				fn["parameters"] = params
+			}
+			if strict, ok := tool["strict"]; ok {
+				fn["strict"] = strict
+			}
+			flat := map[string]any{
+				"type": "function",
+				"name": name,
+			}
+			if description, ok := fn["description"]; ok {
+				flat["description"] = description
+			}
+			if parameters, ok := fn["parameters"]; ok {
+				flat["parameters"] = parameters
+			}
+			if strict, ok := fn["strict"]; ok {
+				flat["strict"] = strict
+			}
+			normalizedTools = append(normalizedTools, flat)
+			continue
+		}
+		if _, hasNested := tool["function"]; hasNested {
+			normalizedTools = append(normalizedTools, rawTool)
+			continue
+		}
+
+		name, _ := tool["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			normalizedTools = append(normalizedTools, rawTool)
+			continue
+		}
+
+		function := map[string]any{
+			"name": name,
+		}
+		if description, ok := tool["description"]; ok {
+			function["description"] = description
+		}
+		if parameters, ok := tool["parameters"]; ok {
+			function["parameters"] = parameters
+		}
+		if strict, ok := tool["strict"]; ok {
+			function["strict"] = strict
+		}
+
+		normalizedTools = append(normalizedTools, map[string]any{
+			"type":     "function",
+			"function": function,
+		})
+		changed = true
+	}
+
+	if !changed {
+		return bodyBytes, nil
+	}
+
+	data["tools"] = normalizedTools
+	result, err := json.Marshal(data)
+	if err != nil {
+		return bodyBytes, fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+	return result, nil
+}
+
+func normalizeResponsesRequest(bodyBytes []byte) ([]byte, []string, []string, error) {
+	var data map[string]any
+	if err := json.Unmarshal(bodyBytes, &data); err != nil {
+		return bodyBytes, nil, nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	}
+
+	adaptedTools, unsupportedTools, changedTools := normalizeResponsesToolsMap(data)
+	changedInput := normalizeResponsesInputMap(data)
+	changedSteering := injectQwenResponsesToolPolicy(data, adaptedTools)
+
+	if !changedTools && !changedInput && !changedSteering {
+		return bodyBytes, adaptedTools, unsupportedTools, nil
+	}
+
+	result, err := json.Marshal(data)
+	if err != nil {
+		return bodyBytes, nil, nil, fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+	return result, adaptedTools, unsupportedTools, nil
+}
+
+func injectQwenResponsesToolPolicy(data map[string]any, adaptedTools []string) bool {
+	modelName, _ := data["model"].(string)
+	if !isQwenModelName(modelName) || len(adaptedTools) == 0 {
+		return false
+	}
+
+	policy := buildQwenResponsesToolPolicy(adaptedTools)
+	if policy == "" {
+		return false
+	}
+
+	input, ok := data["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	for idx, rawItem := range input {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemType, _ := item["type"].(string)
+		role, _ := item["role"].(string)
+		if itemType != "message" || !strings.EqualFold(strings.TrimSpace(role), "system") {
+			continue
+		}
+
+		rewritten := cloneMap(item)
+		rewritten["content"] = appendPolicyToMessageContent(item["content"], policy)
+		input[idx] = rewritten
+		data["input"] = input
+		return true
+	}
+
+	data["input"] = append([]any{map[string]any{
+		"type":    "message",
+		"role":    "system",
+		"content": policy,
+	}}, input...)
+	return true
+}
+
+// injectQwenChatCompletionsToolPolicy injects the same Qwen tool policy into a
+// chat-completions request body. This is used by the completions_bridge path
+// after the Responses request has already been translated to chat format.
+func injectQwenChatCompletionsToolPolicy(bodyBytes []byte, modelName string, adaptedTools []string) ([]byte, bool) {
+	if !isQwenModelName(modelName) || len(adaptedTools) == 0 {
+		return bodyBytes, false
+	}
+
+	policy := buildQwenResponsesToolPolicy(adaptedTools)
+	if policy == "" {
+		return bodyBytes, false
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal(bodyBytes, &data); err != nil {
+		return bodyBytes, false
+	}
+
+	rawMessages, _ := data["messages"].([]any)
+	if len(rawMessages) == 0 {
+		data["messages"] = []any{
+			map[string]any{
+				"role":    "system",
+				"content": policy,
+			},
+		}
+	} else {
+		found := false
+		for idx, rawMessage := range rawMessages {
+			message, ok := rawMessage.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			role, _ := message["role"].(string)
+			if !strings.EqualFold(strings.TrimSpace(role), "system") {
+				continue
+			}
+
+			rewritten := cloneMap(message)
+			rewritten["content"] = appendPolicyToMessageContent(message["content"], policy)
+			rawMessages[idx] = rewritten
+			data["messages"] = rawMessages
+			found = true
+			break
+		}
+
+		if !found {
+			data["messages"] = append([]any{
+				map[string]any{
+					"role":    "system",
+					"content": policy,
+				},
+			}, rawMessages...)
+		}
+	}
+
+	result, err := json.Marshal(data)
+	if err != nil {
+		return bodyBytes, false
+	}
+
+	return result, true
+}
+
+func isQwenModelName(modelName string) bool {
+	modelName = strings.TrimSpace(strings.ToLower(modelName))
+	return strings.Contains(modelName, "qwen")
+}
+
+func buildQwenResponsesToolPolicy(adaptedTools []string) string {
+	toolSet := make(map[string]struct{}, len(adaptedTools))
+	for _, tool := range adaptedTools {
+		toolSet[strings.TrimSpace(strings.ToLower(tool))] = struct{}{}
+	}
+
+	lines := make([]string, 0, 5)
+	if hasAnyTool(toolSet, "apply_patch", "shell") {
+		lines = append(lines,
+			"Tool policy:",
+			"- Use apply_patch for any file creation, deletion, or modification.",
+			"- Do not use shell to edit files.",
+			"- Use shell only to inspect files, run builds, tests, or commands.",
+			"- When changing files, prefer the tool call over prose.",
+		)
+	}
+	if hasAnyTool(toolSet, "web_search", "web_search_preview") {
+		if len(lines) == 0 {
+			lines = append(lines, "Tool policy:")
+		}
+		lines = append(lines,
+			"- Use web_search for current or external information.",
+			"- Do not answer current-events or live-information questions from memory when web_search is available.",
+		)
+	}
+
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func hasAnyTool(toolSet map[string]struct{}, names ...string) bool {
+	for _, name := range names {
+		if _, ok := toolSet[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func appendPolicyToMessageContent(content any, policy string) any {
+	switch typed := content.(type) {
+	case string:
+		existing := strings.TrimSpace(typed)
+		if existing == "" {
+			return policy
+		}
+		return existing + "\n\n" + policy
+	case []any:
+		rewritten := make([]any, 0, len(typed)+1)
+		rewritten = append(rewritten, typed...)
+		rewritten = append(rewritten, map[string]any{
+			"type": "input_text",
+			"text": policy,
+		})
+		return rewritten
+	default:
+		return policy
+	}
+}
+
+func normalizeResponsesToolsMap(data map[string]any) ([]string, []string, bool) {
+	rawTools, ok := data["tools"].([]any)
+	if !ok || len(rawTools) == 0 {
+		return nil, nil, false
+	}
+
+	adapted := make([]string, 0, 2)
+	unsupported := make([]string, 0)
+	changed := false
+	normalizedTools := make([]any, 0, len(rawTools))
+
+	for _, rawTool := range rawTools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			normalizedTools = append(normalizedTools, rawTool)
+			continue
+		}
+
+		toolType, _ := tool["type"].(string)
+		toolType = strings.TrimSpace(toolType)
+
+		switch toolType {
+		case "function":
+			normalizedTools = append(normalizedTools, flattenFunctionTool(tool))
+			changed = true
+		case "shell":
+			normalizedTools = append(normalizedTools, buildResponsesShellFunctionTool())
+			adapted = appendIfMissing(adapted, "shell")
+			changed = true
+		case "apply_patch":
+			normalizedTools = append(normalizedTools, buildResponsesApplyPatchFunctionTool())
+			adapted = appendIfMissing(adapted, "apply_patch")
+			changed = true
+		case "web_search_preview", "web_search":
+			normalizedTools = append(normalizedTools, buildResponsesWebSearchFunctionTool())
+			adapted = appendIfMissing(adapted, toolType)
+			changed = true
+		case "file_search":
+			normalizedTools = append(normalizedTools, buildResponsesFileSearchFunctionTool())
+			adapted = appendIfMissing(adapted, toolType)
+			changed = true
+		case "code_interpreter":
+			normalizedTools = append(normalizedTools, buildResponsesCodeInterpreterFunctionTool())
+			adapted = appendIfMissing(adapted, toolType)
+			changed = true
+		case "image_generation":
+			normalizedTools = append(normalizedTools, buildResponsesImageGenerationFunctionTool())
+			adapted = appendIfMissing(adapted, toolType)
+			changed = true
+		case "computer":
+			normalizedTools = append(normalizedTools, buildResponsesComputerFunctionTool())
+			adapted = appendIfMissing(adapted, toolType)
+			changed = true
+		case "", "custom":
+			name, _ := tool["name"].(string)
+			name = strings.TrimSpace(name)
+			if name == "" {
+				unsupported = appendIfMissing(unsupported, "custom")
+				normalizedTools = append(normalizedTools, rawTool)
+				continue
+			}
+
+			adapted = appendIfMissing(adapted, name)
+			changed = true
+
+			fn := map[string]any{"name": name}
+			if description, ok := tool["description"]; ok {
+				fn["description"] = description
+			}
+			if parameters, ok := tool["parameters"]; ok {
+				fn["parameters"] = parameters
+			}
+			if strict, ok := tool["strict"]; ok {
+				fn["strict"] = strict
+			}
+
+			flat := map[string]any{
+				"type": "function",
+				"name": name,
+			}
+			if description, ok := fn["description"]; ok {
+				flat["description"] = description
+			}
+			if parameters, ok := fn["parameters"]; ok {
+				flat["parameters"] = parameters
+			}
+			if strict, ok := fn["strict"]; ok {
+				flat["strict"] = strict
+			}
+			normalizedTools = append(normalizedTools, flat)
+		default:
+			unsupported = appendIfMissing(unsupported, toolType)
+			normalizedTools = append(normalizedTools, rawTool)
+		}
+	}
+
+	if changed {
+		data["tools"] = normalizedTools
+	}
+
+	return adapted, unsupported, changed
+}
+
+func normalizeResponsesInputMap(data map[string]any) bool {
+	input, exists := data["input"]
+	if !exists {
+		return false
+	}
+
+	inputItems, ok := input.([]any)
+	if !ok {
+		return false
+	}
+
+	changed := false
+	normalized := make([]any, 0, len(inputItems))
+	for _, item := range inputItems {
+		mapped, itemChanged := normalizeResponsesInputItem(item)
+		if itemChanged {
+			changed = true
+		}
+		normalized = append(normalized, mapped)
+	}
+
+	reordered, reorderedChanged := moveSystemMessagesToFront(normalized)
+	if reorderedChanged {
+		normalized = reordered
+		changed = true
+	}
+
+	merged, mergedChanged := mergeLeadingSystemMessages(normalized)
+	if mergedChanged {
+		normalized = merged
+		changed = true
+	}
+
+	if changed {
+		data["input"] = normalized
+	}
+	return changed
+}
+
+func normalizeResponsesInputItem(item any) (any, bool) {
+	m, ok := item.(map[string]any)
+	if !ok {
+		return item, false
+	}
+
+	itemType, _ := m["type"].(string)
+	switch itemType {
+	case "message":
+		role, _ := m["role"].(string)
+		normalizedRole := normalizeResponsesMessageRole(role)
+		if normalizedRole == role {
+			return item, false
+		}
+
+		rewritten := cloneMap(m)
+		rewritten["role"] = normalizedRole
+		return rewritten, true
+	case "shell_call":
+		action, _ := m["action"].(map[string]any)
+		return map[string]any{
+			"type":      "function_call",
+			"call_id":   m["call_id"],
+			"name":      llamaSwapShellFunctionName,
+			"arguments": mustJSONString(action),
+		}, true
+	case "apply_patch_call":
+		payload := map[string]any{}
+		if operation, ok := m["operation"].(map[string]any); ok {
+			payload["operation"] = operation
+		}
+		return map[string]any{
+			"type":      "function_call",
+			"call_id":   m["call_id"],
+			"name":      llamaSwapApplyPatchFunctionName,
+			"arguments": mustJSONString(payload),
+		}, true
+	case "web_search_call":
+		action, _ := m["action"].(map[string]any)
+		return map[string]any{
+			"type":      "function_call",
+			"call_id":   m["call_id"],
+			"name":      llamaSwapWebSearchFunctionName,
+			"arguments": mustJSONString(action),
+		}, true
+	case "file_search_call":
+		action, _ := m["action"].(map[string]any)
+		return map[string]any{
+			"type":      "function_call",
+			"call_id":   m["call_id"],
+			"name":      llamaSwapFileSearchFunctionName,
+			"arguments": mustJSONString(action),
+		}, true
+	case "code_interpreter_call":
+		action, _ := m["action"].(map[string]any)
+		return map[string]any{
+			"type":      "function_call",
+			"call_id":   m["call_id"],
+			"name":      llamaSwapCodeInterpreterFunctionName,
+			"arguments": mustJSONString(action),
+		}, true
+	case "image_generation_call":
+		action, _ := m["action"].(map[string]any)
+		return map[string]any{
+			"type":      "function_call",
+			"call_id":   m["call_id"],
+			"name":      llamaSwapImageGenerationFunctionName,
+			"arguments": mustJSONString(action),
+		}, true
+	case "computer_call":
+		action, _ := m["action"].(map[string]any)
+		return map[string]any{
+			"type":      "function_call",
+			"call_id":   m["call_id"],
+			"name":      llamaSwapComputerFunctionName,
+			"arguments": mustJSONString(action),
+		}, true
+	case "shell_call_output":
+		return map[string]any{
+			"type":    "function_call_output",
+			"call_id": m["call_id"],
+			"output":  mustJSONString(map[string]any{"type": "shell_call_output", "payload": m}),
+		}, true
+	case "apply_patch_call_output":
+		return map[string]any{
+			"type":    "function_call_output",
+			"call_id": m["call_id"],
+			"output":  mustJSONString(map[string]any{"type": "apply_patch_call_output", "payload": m}),
+		}, true
+	case "web_search_call_output":
+		return map[string]any{
+			"type":    "function_call_output",
+			"call_id": m["call_id"],
+			"output":  mustJSONString(map[string]any{"type": "web_search_call_output", "payload": m}),
+		}, true
+	case "file_search_call_output":
+		return map[string]any{
+			"type":    "function_call_output",
+			"call_id": m["call_id"],
+			"output":  mustJSONString(map[string]any{"type": "file_search_call_output", "payload": m}),
+		}, true
+	case "code_interpreter_call_output":
+		return map[string]any{
+			"type":    "function_call_output",
+			"call_id": m["call_id"],
+			"output":  mustJSONString(map[string]any{"type": "code_interpreter_call_output", "payload": m}),
+		}, true
+	case "image_generation_call_output":
+		return map[string]any{
+			"type":    "function_call_output",
+			"call_id": m["call_id"],
+			"output":  mustJSONString(map[string]any{"type": "image_generation_call_output", "payload": m}),
+		}, true
+	case "computer_call_output":
+		return map[string]any{
+			"type":    "function_call_output",
+			"call_id": m["call_id"],
+			"output":  mustJSONString(map[string]any{"type": "computer_call_output", "payload": m}),
+		}, true
+	default:
+		return item, false
+	}
+}
+
+func normalizeResponsesMessageRole(role string) string {
+	switch strings.TrimSpace(strings.ToLower(role)) {
+	case "developer":
+		return "system"
+	default:
+		return role
+	}
+}
+
+func moveSystemMessagesToFront(items []any) ([]any, bool) {
+	systemItems := make([]any, 0, len(items))
+	otherItems := make([]any, 0, len(items))
+
+	seenNonSystem := false
+	changed := false
+
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			seenNonSystem = true
+			otherItems = append(otherItems, item)
+			continue
+		}
+
+		itemType, _ := m["type"].(string)
+		role, _ := m["role"].(string)
+		isSystemMessage := itemType == "message" && strings.EqualFold(strings.TrimSpace(role), "system")
+		if isSystemMessage {
+			if seenNonSystem {
+				changed = true
+			}
+			systemItems = append(systemItems, item)
+			continue
+		}
+
+		seenNonSystem = true
+		otherItems = append(otherItems, item)
+	}
+
+	if !changed {
+		return items, false
+	}
+
+	reordered := make([]any, 0, len(items))
+	reordered = append(reordered, systemItems...)
+	reordered = append(reordered, otherItems...)
+	return reordered, true
+}
+
+func mergeLeadingSystemMessages(items []any) ([]any, bool) {
+	if len(items) < 2 {
+		return items, false
+	}
+
+	systemCount := 0
+	mergedContent := make([]any, 0)
+
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			break
+		}
+		itemType, _ := m["type"].(string)
+		role, _ := m["role"].(string)
+		if itemType != "message" || !strings.EqualFold(strings.TrimSpace(role), "system") {
+			break
+		}
+
+		systemCount++
+		if content, ok := m["content"].([]any); ok {
+			mergedContent = append(mergedContent, content...)
+		}
+	}
+
+	if systemCount < 2 {
+		return items, false
+	}
+
+	firstMessage, ok := items[0].(map[string]any)
+	if !ok {
+		return items, false
+	}
+
+	mergedFirst := cloneMap(firstMessage)
+	mergedFirst["content"] = mergedContent
+
+	rewritten := make([]any, 0, len(items)-systemCount+1)
+	rewritten = append(rewritten, mergedFirst)
+	rewritten = append(rewritten, items[systemCount:]...)
+	return rewritten, true
+}
+
+func buildFlatFunctionTool(name string, description string, parameters map[string]any) map[string]any {
+	tool := map[string]any{
+		"type": "function",
+		"name": name,
+	}
+	if strings.TrimSpace(description) != "" {
+		tool["description"] = description
+	}
+	if len(parameters) > 0 {
+		tool["parameters"] = parameters
+	}
+	return tool
+}
+
+func flattenFunctionTool(tool map[string]any) map[string]any {
+	if fn, ok := tool["function"].(map[string]any); ok {
+		flat := map[string]any{"type": "function"}
+		if name, _ := fn["name"].(string); strings.TrimSpace(name) != "" {
+			flat["name"] = strings.TrimSpace(name)
+		}
+		if description, ok := fn["description"]; ok {
+			flat["description"] = description
+		}
+		if parameters, ok := fn["parameters"]; ok {
+			flat["parameters"] = parameters
+		}
+		if strict, ok := fn["strict"]; ok {
+			flat["strict"] = strict
+		}
+		return flat
+	}
+
+	flat := map[string]any{"type": "function"}
+	if name, _ := tool["name"].(string); strings.TrimSpace(name) != "" {
+		flat["name"] = strings.TrimSpace(name)
+	}
+	if description, ok := tool["description"]; ok {
+		flat["description"] = description
+	}
+	if parameters, ok := tool["parameters"]; ok {
+		flat["parameters"] = parameters
+	}
+	if strict, ok := tool["strict"]; ok {
+		flat["strict"] = strict
+	}
+	return flat
+}
+
+func buildResponsesShellFunctionTool() map[string]any {
+	return map[string]any{
+		"type":        "function",
+		"name":        llamaSwapShellFunctionName,
+		"description": "Compatibility wrapper for the Responses API shell tool. Return commands to execute locally.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"commands": map[string]any{
+					"type":        "array",
+					"description": "Commands to execute in order.",
+					"items": map[string]any{
+						"type": "string",
+					},
+				},
+				"timeout_ms": map[string]any{
+					"type":        "integer",
+					"description": "Timeout in milliseconds.",
+				},
+				"max_output_length": map[string]any{
+					"type":        "integer",
+					"description": "Maximum output length to capture.",
+				},
+			},
+			"required": []string{"commands"},
+		},
+	}
+}
+
+func buildResponsesApplyPatchFunctionTool() map[string]any {
+	return map[string]any{
+		"type":        "function",
+		"name":        llamaSwapApplyPatchFunctionName,
+		"description": "Compatibility wrapper for the Responses API apply_patch tool. Return one patch operation to apply.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"operation": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"type": map[string]any{
+							"type": "string",
+							"enum": []string{"create_file", "update_file", "delete_file"},
+						},
+						"path": map[string]any{
+							"type": "string",
+						},
+						"diff": map[string]any{
+							"type": "string",
+						},
+					},
+					"required": []string{"type", "path"},
+				},
+			},
+			"required": []string{"operation"},
+		},
+	}
+}
+
+func buildResponsesWebSearchFunctionTool() map[string]any {
+	return map[string]any{
+		"type":        "function",
+		"name":        llamaSwapWebSearchFunctionName,
+		"description": "Compatibility wrapper for the Responses API web_search_preview tool. Return search parameters for the caller to execute.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{
+					"type":        "string",
+					"description": "The search query.",
+				},
+				"domains": map[string]any{
+					"type":        "array",
+					"description": "Optional domains to constrain search results.",
+					"items": map[string]any{
+						"type": "string",
+					},
+				},
+				"search_context_size": map[string]any{
+					"type":        "string",
+					"description": "Optional context hint such as low, medium, or high.",
+				},
+				"user_location": map[string]any{
+					"type":                 "object",
+					"description":          "Optional user location metadata.",
+					"additionalProperties": true,
+				},
+			},
+			"required": []string{"query"},
+		},
+	}
+}
+
+func buildResponsesFileSearchFunctionTool() map[string]any {
+	return map[string]any{
+		"type":        "function",
+		"name":        llamaSwapFileSearchFunctionName,
+		"description": "Compatibility wrapper for the Responses API file_search tool. Return a file search request for the caller to execute.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query":            map[string]any{"type": "string", "description": "The file search query."},
+				"vector_store_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional vector store identifiers."},
+				"max_num_results":  map[string]any{"type": "integer", "description": "Optional maximum result count."},
+				"filters":          map[string]any{"type": "object", "additionalProperties": true, "description": "Optional structured filters."},
+			},
+			"required": []string{"query"},
+		},
+	}
+}
+
+func buildResponsesCodeInterpreterFunctionTool() map[string]any {
+	return map[string]any{
+		"type":        "function",
+		"name":        llamaSwapCodeInterpreterFunctionName,
+		"description": "Compatibility wrapper for the Responses API code_interpreter tool. Return an execution request for the caller to run.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"code":     map[string]any{"type": "string", "description": "Code to execute."},
+				"language": map[string]any{"type": "string", "description": "Execution language, such as python."},
+				"files":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional file references."},
+				"args":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional execution arguments."},
+			},
+			"required": []string{"code"},
+		},
+	}
+}
+
+func buildResponsesImageGenerationFunctionTool() map[string]any {
+	return map[string]any{
+		"type":        "function",
+		"name":        llamaSwapImageGenerationFunctionName,
+		"description": "Compatibility wrapper for the Responses API image_generation tool. Return an image generation request for the caller to execute.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"prompt":        map[string]any{"type": "string", "description": "The image generation prompt."},
+				"size":          map[string]any{"type": "string", "description": "Optional image size."},
+				"quality":       map[string]any{"type": "string", "description": "Optional image quality."},
+				"background":    map[string]any{"type": "string", "description": "Optional background mode."},
+				"output_format": map[string]any{"type": "string", "description": "Optional output format."},
+			},
+			"required": []string{"prompt"},
+		},
+	}
+}
+
+func buildResponsesComputerFunctionTool() map[string]any {
+	return map[string]any{
+		"type":        "function",
+		"name":        llamaSwapComputerFunctionName,
+		"description": "Compatibility wrapper for the Responses API computer tool. Return a desktop automation action for the caller to execute.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action": map[string]any{"type": "string", "description": "Computer action such as click, type, keypress, scroll, or screenshot."},
+				"x":      map[string]any{"type": "number", "description": "Optional X coordinate."},
+				"y":      map[string]any{"type": "number", "description": "Optional Y coordinate."},
+				"text":   map[string]any{"type": "string", "description": "Optional text payload."},
+				"button": map[string]any{"type": "string", "description": "Optional mouse button."},
+			},
+			"required": []string{"action"},
+		},
+	}
+}
+
+func extractAdaptedToolsFromResponsesRequest(req map[string]any) []string {
+	rawTools, ok := req["tools"].([]any)
+	if !ok || len(rawTools) == 0 {
+		return nil
+	}
+
+	adapted := make([]string, 0, len(rawTools))
+	for _, rawTool := range rawTools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if fn, ok := tool["function"].(map[string]any); ok {
+			if name, _ := fn["name"].(string); strings.TrimSpace(name) != "" {
+				adapted = appendIfMissing(adapted, strings.TrimSpace(name))
+			}
+			continue
+		}
+
+		toolType, _ := tool["type"].(string)
+		toolType = strings.TrimSpace(toolType)
+		switch toolType {
+		case "shell", "apply_patch", "web_search", "web_search_preview", "file_search", "code_interpreter", "image_generation", "computer":
+			adapted = appendIfMissing(adapted, toolType)
+		case "", "function", "custom":
+			if name, _ := tool["name"].(string); strings.TrimSpace(name) != "" {
+				adapted = appendIfMissing(adapted, strings.TrimSpace(name))
+			}
+		default:
+			if name, _ := tool["name"].(string); strings.TrimSpace(name) != "" {
+				adapted = appendIfMissing(adapted, strings.TrimSpace(name))
+			} else if toolType != "" {
+				adapted = appendIfMissing(adapted, toolType)
+			}
+		}
+	}
+
+	return adapted
+}
+
+func collectUnsupportedBridgeTools(toolsRaw []any) []string {
+	unsupported := make([]string, 0)
+	for _, rawTool := range toolsRaw {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if fn, ok := tool["function"].(map[string]any); ok {
+			if name, _ := fn["name"].(string); strings.TrimSpace(name) == "" {
+				unsupported = appendIfMissing(unsupported, "function")
+			}
+			continue
+		}
+
+		toolType, _ := tool["type"].(string)
+		toolType = strings.TrimSpace(toolType)
+		switch toolType {
+		case "", "function":
+			name, _ := tool["name"].(string)
+			if strings.TrimSpace(name) == "" {
+				unsupported = appendIfMissing(unsupported, "function")
+			}
+		case "shell", "apply_patch", "web_search", "web_search_preview", "file_search", "code_interpreter", "image_generation", "computer":
+			continue
+		case "custom":
+			name, _ := tool["name"].(string)
+			if strings.TrimSpace(name) == "" {
+				unsupported = appendIfMissing(unsupported, "custom")
+			}
+		default:
+			unsupported = appendIfMissing(unsupported, toolType)
+		}
+	}
+	return unsupported
+}
+
+func translateResponsesToChatCompletionsRequestWithUnsupported(body []byte) ([]byte, []string, error) {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, nil, err
+	}
+
+	unsupported := make([]string, 0)
+	if toolsRaw, ok := req["tools"].([]any); ok {
+		unsupported = collectUnsupportedBridgeTools(toolsRaw)
+	}
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	if err != nil {
+		return nil, nil, err
+	}
+	return translated, unsupported, nil
+}
+
+func reorderChatMessagesForLlama(messages []map[string]any) []map[string]any {
+	if len(messages) < 2 {
+		return messages
+	}
+
+	systemMessages := make([]map[string]any, 0, len(messages))
+	otherMessages := make([]map[string]any, 0, len(messages))
+	for _, message := range messages {
+		role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", message["role"])))
+		if role == "system" {
+			systemMessages = append(systemMessages, message)
+		} else {
+			otherMessages = append(otherMessages, message)
+		}
+	}
+
+	if len(systemMessages) == 0 || len(otherMessages) == 0 {
+		return mergeLeadingSystemChatMessages(messages)
+	}
+
+	reordered := make([]map[string]any, 0, len(messages))
+	reordered = append(reordered, systemMessages...)
+	reordered = append(reordered, otherMessages...)
+	return mergeLeadingSystemChatMessages(reordered)
+}
+
+func mergeLeadingSystemChatMessages(messages []map[string]any) []map[string]any {
+	if len(messages) < 2 {
+		return messages
+	}
+
+	systemCount := 0
+	mergedParts := make([]string, 0, len(messages))
+	for _, message := range messages {
+		role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", message["role"])))
+		if role != "system" {
+			break
+		}
+		content := strings.TrimSpace(fmt.Sprintf("%v", message["content"]))
+		if content != "" {
+			mergedParts = append(mergedParts, content)
+		}
+		systemCount++
+	}
+
+	if systemCount < 2 {
+		return messages
+	}
+
+	merged := make([]map[string]any, 0, len(messages)-systemCount+1)
+	merged = append(merged, map[string]any{
+		"role":    "system",
+		"content": strings.TrimSpace(strings.Join(mergedParts, "\n\n")),
+	})
+	merged = append(merged, messages[systemCount:]...)
+	return merged
+}
+
+func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, err
+	}
+
+	out := map[string]any{}
+	copyField := func(key string) {
+		if v, ok := req[key]; ok {
+			out[key] = v
+		}
+	}
+	for _, key := range []string{
+		// Removed: use loaded model, not request model
+		"temperature",
+		"top_p",
+		"presence_penalty",
+		"frequency_penalty",
+		"stop",
+		"n",
+		"tool_choice",
+		"parallel_tool_calls",
+		"metadata",
+	} {
+		copyField(key)
+	}
+
+	if toolsRaw, ok := req["tools"].([]any); ok {
+		if normalized := normalizeBridgeChatTools(toolsRaw); len(normalized) > 0 {
+			out["tools"] = normalized
+		}
+	}
+
+	if v, ok := req["max_output_tokens"]; ok {
+		out["max_tokens"] = v
+	} else if v, ok := req["max_tokens"]; ok {
+		out["max_tokens"] = v
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	hasUserMessage := false
+	for _, message := range messages {
+		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", message["role"])), "user") {
+			hasUserMessage = true
+			break
+		}
+	}
+	if !hasUserMessage {
+		userText := extractResponsesInputText(req["input"])
+		userText = strings.TrimSpace(cleanFallbackInput(req["input"], userText))
+		if userText != "" {
+			messages = append(messages, map[string]any{"role": "user", "content": userText})
+		}
+	}
+	if len(messages) == 0 {
+		messages = []map[string]any{{"role": "user", "content": " "}}
+	}
+	messages = reorderChatMessagesForLlama(messages)
+	for _, message := range messages {
+		content, _ := message["content"].(string)
+		if strings.TrimSpace(content) == "" {
+			message["content"] = " "
+		}
+	}
+	out["messages"] = messages
+	out["stream"] = false
+
+	outBytes, err := json.Marshal(out)
+	if err != nil {
+		return nil, err
+	}
+
+	modelName := strings.TrimSpace(fmt.Sprintf("%v", req["model"]))
+	adaptedTools := extractAdaptedToolsFromResponsesRequest(req)
+	if injected, ok := injectQwenChatCompletionsToolPolicy(outBytes, modelName, adaptedTools); ok {
+		var injectedBody map[string]any
+		if err := json.Unmarshal(injected, &injectedBody); err == nil {
+			if rawMessages, ok := injectedBody["messages"].([]any); ok {
+				reordered := make([]map[string]any, 0, len(rawMessages))
+				for _, rawMessage := range rawMessages {
+					if message, ok := rawMessage.(map[string]any); ok {
+						reordered = append(reordered, message)
+					}
+				}
+				injectedBody["messages"] = reorderChatMessagesForLlama(reordered)
+				if fixed, err := json.Marshal(injectedBody); err == nil {
+					return fixed, nil
+				}
+			}
+		}
+		return injected, nil
+	}
+
+	return outBytes, nil
+}
+
+func normalizeBridgeChatTools(toolsRaw []any) []any {
+	out := make([]any, 0, len(toolsRaw))
+	for _, rawTool := range toolsRaw {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if fn, ok := tool["function"].(map[string]any); ok {
+			if name, _ := fn["name"].(string); strings.TrimSpace(name) != "" {
+				out = append(out, map[string]any{
+					"type":     "function",
+					"function": fn,
+				})
+			}
+			continue
+		}
+
+		toolType, _ := tool["type"].(string)
+		toolType = strings.TrimSpace(toolType)
+		switch toolType {
+		case "", "function":
+			name, _ := tool["name"].(string)
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			fn := map[string]any{"name": name}
+			if description, ok := tool["description"].(string); ok && strings.TrimSpace(description) != "" {
+				fn["description"] = description
+			}
+			if parameters, ok := tool["parameters"]; ok {
+				fn["parameters"] = parameters
+			}
+			if strict, ok := tool["strict"]; ok {
+				fn["strict"] = strict
+			}
+			out = append(out, map[string]any{"type": "function", "function": fn})
+		case "shell":
+			out = append(out, buildBridgeShellTool())
+		case "apply_patch":
+			out = append(out, buildBridgeApplyPatchTool())
+		case "web_search", "web_search_preview":
+			out = append(out, buildBridgeWebSearchTool())
+		case "file_search":
+			out = append(out, buildBridgeFileSearchTool())
+		case "code_interpreter":
+			out = append(out, buildBridgeCodeInterpreterTool())
+		case "image_generation":
+			out = append(out, buildBridgeImageGenerationTool())
+		case "computer":
+			out = append(out, buildBridgeComputerTool())
+		default:
+			// Unknown tool types (e.g. Codex "custom") -> convert to function format
+			name, _ := tool["name"].(string)
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			fn := map[string]any{"name": name}
+			if description, ok := tool["description"].(string); ok && strings.TrimSpace(description) != "" {
+				fn["description"] = description
+			}
+			if parameters, ok := tool["parameters"]; ok {
+				fn["parameters"] = parameters
+			}
+			if strict, ok := tool["strict"]; ok {
+				fn["strict"] = strict
+			}
+			out = append(out, map[string]any{"type": "function", "function": fn})
+		}
+	}
+	return out
+}
+
+func buildBridgeShellTool() map[string]any {
+	return bridgeToolToChatTool("shell", "Run a shell command.", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"commands": map[string]any{
+				"type":        "array",
+				"description": "Commands to execute in order.",
+				"items":       map[string]any{"type": "string"},
+			},
+			"timeout_ms": map[string]any{
+				"type":        "integer",
+				"description": "Timeout in milliseconds.",
+			},
+			"max_output_length": map[string]any{
+				"type":        "integer",
+				"description": "Maximum output length to capture.",
+			},
+		},
+		"required": []string{"commands"},
+	})
+}
+
+func buildBridgeApplyPatchTool() map[string]any {
+	return bridgeToolToChatTool("apply_patch", "Apply a patch to files.", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"operation": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"type": map[string]any{
+						"type": "string",
+						"enum": []string{"create_file", "update_file", "delete_file"},
+					},
+					"path": map[string]any{"type": "string"},
+					"diff": map[string]any{"type": "string"},
+				},
+				"required": []string{"type", "path"},
+			},
+		},
+		"required": []string{"operation"},
+	})
+}
+
+func buildBridgeWebSearchTool() map[string]any {
+	return bridgeToolToChatTool("web_search", "Search the web.", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query": map[string]any{"type": "string", "description": "The search query."},
+			"domains": map[string]any{"type": "array", "description": "Optional domains to constrain search results.", "items": map[string]any{"type": "string"}},
+			"search_context_size": map[string]any{"type": "string", "description": "Optional context hint such as low, medium, or high."},
+			"user_location": map[string]any{"type": "object", "description": "Optional user location metadata.", "additionalProperties": true},
+		},
+		"required": []string{"query"},
+	})
+}
+
+func buildBridgeFileSearchTool() map[string]any {
+	return bridgeToolToChatTool("file_search", "Search indexed files.", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query": map[string]any{"type": "string", "description": "The file search query."},
+			"vector_store_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional vector store identifiers."},
+			"max_num_results": map[string]any{"type": "integer", "description": "Optional maximum result count."},
+			"filters": map[string]any{"type": "object", "additionalProperties": true, "description": "Optional structured filters."},
+		},
+		"required": []string{"query"},
+	})
+}
+
+func buildBridgeCodeInterpreterTool() map[string]any {
+	return bridgeToolToChatTool("code_interpreter", "Run code in an interpreter.", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"code": map[string]any{"type": "string", "description": "Code to execute."},
+			"language": map[string]any{"type": "string", "description": "Execution language, such as python."},
+			"files": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional file references."},
+			"args": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional execution arguments."},
+		},
+		"required": []string{"code"},
+	})
+}
+
+func buildBridgeImageGenerationTool() map[string]any {
+	return bridgeToolToChatTool("image_generation", "Generate an image.", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"prompt": map[string]any{"type": "string", "description": "The image generation prompt."},
+			"size": map[string]any{"type": "string", "description": "Optional image size."},
+			"quality": map[string]any{"type": "string", "description": "Optional image quality."},
+			"background": map[string]any{"type": "string", "description": "Optional background mode."},
+			"output_format": map[string]any{"type": "string", "description": "Optional output format."},
+		},
+		"required": []string{"prompt"},
+	})
+}
+
+func buildBridgeComputerTool() map[string]any {
+	return bridgeToolToChatTool("computer", "Perform a computer action.", map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"action": map[string]any{"type": "string", "description": "Computer action such as click, type, keypress, scroll, or screenshot."},
+			"x": map[string]any{"type": "number", "description": "Optional X coordinate."},
+			"y": map[string]any{"type": "number", "description": "Optional Y coordinate."},
+			"text": map[string]any{"type": "string", "description": "Optional text payload."},
+			"button": map[string]any{"type": "string", "description": "Optional mouse button."},
+		},
+		"required": []string{"action"},
+	})
+}
+
+func bridgeToolToChatTool(name string, description string, parameters map[string]any) map[string]any {
+	fn := map[string]any{"name": name}
+	if strings.TrimSpace(description) != "" {
+		fn["description"] = description
+	}
+	if len(parameters) > 0 {
+		fn["parameters"] = parameters
+	}
+	return map[string]any{
+		"type":     "function",
+		"function": fn,
+	}
+}
+
+func extractResponsesInputText(input any) string {
+	parts := make([]string, 0)
+	collectResponseText(input, &parts)
+	return strings.Join(parts, "\n")
+}
+
+func collectResponseText(v any, out *[]string) {
+	switch typed := v.(type) {
+	case string:
+		s := strings.TrimSpace(typed)
+		if s != "" {
+			*out = append(*out, s)
+		}
+	case []any:
+		for _, item := range typed {
+			collectResponseText(item, out)
+		}
+	case map[string]any:
+		for _, key := range []string{"input_text", "text", "content", "value"} {
+			if child, ok := typed[key]; ok {
+				collectResponseText(child, out)
+			}
+		}
+	}
+}
+
+func responsesRequestToChatMessages(req map[string]any) []map[string]any {
+	out := make([]map[string]any, 0)
+	if instructions, ok := req["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
+		out = append(out, map[string]any{
+			"role":    "system",
+			"content": strings.TrimSpace(instructions),
+		})
+	}
+
+	convertOne := func(role string, content any) {
+		if content == nil {
+			return
+		}
+		normalizedRole := normalizeChatCompletionRole(role)
+		text := extractResponsesInputText(content)
+		text = strings.TrimSpace(cleanFallbackInput(content, text))
+		if text == "" {
+			return
+		}
+		out = append(out, map[string]any{
+			"role":    normalizedRole,
+			"content": text,
+		})
+	}
+
+	appendAssistantToolCall := func(name string, arguments any, callID string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		args := encodeAnyAsJSONString(arguments)
+		callID = strings.TrimSpace(callID)
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(out))
+		}
+		out = append(out, map[string]any{
+			"role":    "assistant",
+			"content": "",
+			"tool_calls": []any{
+				map[string]any{
+					"id":   callID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      name,
+						"arguments": args,
+					},
+				},
+			},
+		})
+	}
+
+	appendToolResult := func(callID string, output any) {
+		callID = strings.TrimSpace(callID)
+		if callID == "" {
+			return
+		}
+		text := extractResponsesInputText(output)
+		text = strings.TrimSpace(text)
+		if text == "" {
+			text = encodeAnyAsJSONString(output)
+		}
+		text = strings.TrimSpace(cleanFallbackInput(output, text))
+		if text == "" {
+			text = " "
+		}
+		out = append(out, map[string]any{
+			"role":         "tool",
+			"tool_call_id": callID,
+			"content":      text,
+		})
+	}
+
+	if messages, ok := req["messages"].([]any); ok {
+		for _, rawMessage := range messages {
+			message, ok := rawMessage.(map[string]any)
+			if !ok {
+				continue
+			}
+			role, _ := message["role"].(string)
+			if strings.EqualFold(strings.TrimSpace(role), "assistant") {
+				if toolCalls, ok := message["tool_calls"]; ok {
+					assistantText := extractResponsesInputText(message["content"])
+					assistantText = strings.TrimSpace(cleanFallbackInput(message["content"], assistantText))
+					out = append(out, map[string]any{
+						"role":       "assistant",
+						"content":    assistantText,
+						"tool_calls": toolCalls,
+					})
+					continue
+				}
+			}
+			if strings.EqualFold(strings.TrimSpace(role), "tool") {
+				appendToolResult(strings.TrimSpace(fmt.Sprintf("%v", message["tool_call_id"])), message["content"])
+				continue
+			}
+			convertOne(role, message["content"])
+		}
+		return out
+	}
+
+	if inputArr, ok := req["input"].([]any); ok {
+		for _, rawItem := range inputArr {
+			item, ok := rawItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			itemType, _ := item["type"].(string)
+			switch itemType {
+			case "message":
+				convertOne(fmt.Sprintf("%v", item["role"]), item["content"])
+			case "function_call":
+				appendAssistantToolCall(fmt.Sprintf("%v", item["name"]), item["arguments"], fmt.Sprintf("%v", item["call_id"]))
+			case "function_call_output":
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+			case "shell_call":
+				appendAssistantToolCall("shell", item["action"], fmt.Sprintf("%v", item["call_id"]))
+			case "shell_call_output":
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+			case "apply_patch_call":
+				payload := map[string]any{}
+				if operation, ok := item["operation"].(map[string]any); ok {
+					payload["operation"] = operation
+				}
+				appendAssistantToolCall("apply_patch", payload, fmt.Sprintf("%v", item["call_id"]))
+			case "apply_patch_call_output":
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+			case "web_search_call":
+				appendAssistantToolCall("web_search", item["action"], fmt.Sprintf("%v", item["call_id"]))
+			case "web_search_call_output":
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+			case "file_search_call":
+				appendAssistantToolCall("file_search", item["action"], fmt.Sprintf("%v", item["call_id"]))
+			case "file_search_call_output":
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+			case "code_interpreter_call":
+				appendAssistantToolCall("code_interpreter", item["action"], fmt.Sprintf("%v", item["call_id"]))
+			case "code_interpreter_call_output":
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+			case "image_generation_call":
+				appendAssistantToolCall("image_generation", item["action"], fmt.Sprintf("%v", item["call_id"]))
+			case "image_generation_call_output":
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+			case "computer_call":
+				appendAssistantToolCall("computer", item["action"], fmt.Sprintf("%v", item["call_id"]))
+			case "computer_call_output":
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+			default:
+				convertOne("user", item)
+			}
+		}
+	}
+
+	return out
+}
+
+func normalizeChatCompletionRole(role string) string {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "system", "user", "assistant", "tool":
+		return strings.ToLower(strings.TrimSpace(role))
+	case "developer":
+		return "system"
+	default:
+		return "user"
+	}
+}
+
+func cleanFallbackInput(raw any, preferred string) string {
+	if strings.TrimSpace(preferred) != "" {
+		return preferred
+	}
+	if raw == nil {
+		return ""
+	}
+	s := strings.TrimSpace(fmt.Sprintf("%v", raw))
+	lower := strings.ToLower(s)
+	if s == "" || lower == "<nil>" || lower == "null" || lower == "[]" || lower == "{}" {
+		return ""
+	}
+	return s
+}
+
+func encodeAnyAsJSONString(v any) string {
+	switch typed := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return strings.TrimSpace(fmt.Sprintf("%v", v))
+		}
+		return strings.TrimSpace(string(b))
+	}
+}
+
+func translateChatCompletionToResponsesResponse(body []byte) ([]byte, error) {
+	message := gjson.GetBytes(body, "choices.0.message")
+	if !message.Exists() || strings.TrimSpace(message.Raw) == "" || message.Type == gjson.Null {
+		return nil, fmt.Errorf("chat completion missing choices[0].message")
+	}
+
+	id := strings.TrimSpace(gjson.GetBytes(body, "id").String())
+	if id == "" {
+		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	text := message.Get("content").String()
+	output := make([]any, 0, 2)
+
+	appendCall := func(callID string, name string, arguments string, index int) {
+		callID = strings.TrimSpace(callID)
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), index)
+		}
+		item := map[string]any{
+			"id":      fmt.Sprintf("fc_%s", callID),
+			"call_id": callID,
+			"status":  "completed",
+		}
+		switch strings.TrimSpace(name) {
+		case "shell":
+			item["type"] = "shell_call"
+			item["action"] = parseJSONMapString(arguments)
+		case "apply_patch":
+			item["type"] = "apply_patch_call"
+			args := parseJSONMapString(arguments)
+			if operation, ok := args["operation"].(map[string]any); ok {
+				item["operation"] = operation
+			} else {
+				item["operation"] = args
+			}
+		case "web_search", "web_search_preview":
+			item["type"] = "web_search_call"
+			item["action"] = parseJSONMapString(arguments)
+		case "file_search":
+			item["type"] = "file_search_call"
+			item["action"] = parseJSONMapString(arguments)
+		case "code_interpreter":
+			item["type"] = "code_interpreter_call"
+			item["action"] = parseJSONMapString(arguments)
+		case "image_generation":
+			item["type"] = "image_generation_call"
+			item["action"] = parseJSONMapString(arguments)
+		case "computer":
+			item["type"] = "computer_call"
+			item["action"] = parseJSONMapString(arguments)
+		default:
+			item["type"] = "function_call"
+			item["name"] = strings.TrimSpace(name)
+			item["arguments"] = arguments
+		}
+		output = append(output, item)
+	}
+
+	toolCalls := message.Get("tool_calls")
+	functionCall := message.Get("function_call")
+	hasToolCalls := toolCalls.IsArray() && len(toolCalls.Array()) > 0
+	hasFunctionCall := functionCall.Exists() && strings.TrimSpace(functionCall.Get("name").String()) != ""
+
+	if strings.TrimSpace(text) != "" || (!hasToolCalls && !hasFunctionCall) {
+		output = append(output, map[string]any{
+			"id":   "msg_" + id,
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{
+					"type": "output_text",
+					"text": text,
+				},
+			},
+		})
+	}
+
+	if hasToolCalls {
+		idx := 0
+		toolCalls.ForEach(func(_, tc gjson.Result) bool {
+			appendCall(
+				tc.Get("id").String(),
+				tc.Get("function.name").String(),
+				tc.Get("function.arguments").String(),
+				idx,
+			)
+			idx++
+			return true
+		})
+	} else if hasFunctionCall {
+		appendCall("", functionCall.Get("name").String(), functionCall.Get("arguments").String(), 0)
+	}
+
+	resp := map[string]any{
+		"id":          "resp_" + id,
+		"object":      "response",
+		"created_at":  time.Now().Unix(),
+		"status":      "completed",
+		"model":       model,
+		"output":      output,
+		"output_text": text,
+	}
+	if created := gjson.GetBytes(body, "created").Int(); created > 0 {
+		resp["created_at"] = created
+	}
+	if usage := gjson.GetBytes(body, "usage"); usage.Exists() {
+		resp["usage"] = map[string]any{
+			"input_tokens":  usage.Get("prompt_tokens").Int(),
+			"output_tokens": usage.Get("completion_tokens").Int(),
+			"total_tokens":  usage.Get("total_tokens").Int(),
+		}
+	}
+	return json.Marshal(resp)
+}
+
+func writeResponsesStream(w http.ResponseWriter, responseJSON []byte) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		_, _ = w.Write(responseJSON)
+		return
+	}
+
+	sequence := 0
+	writeEvent := func(eventType string, payload map[string]any) {
+		if _, ok := payload["type"]; !ok {
+			payload["type"] = eventType
+		}
+		payload["sequence_number"] = sequence
+		sequence++
+		data, _ := json.Marshal(payload)
+		_, _ = w.Write([]byte("event: " + eventType + "\n"))
+		_, _ = w.Write([]byte("data: " + string(data) + "\n\n"))
+		flusher.Flush()
+	}
+
+	respID := strings.TrimSpace(gjson.GetBytes(responseJSON, "id").String())
+	if respID == "" {
+		respID = fmt.Sprintf("resp_%d", time.Now().UnixNano())
+	}
+	createdAt := gjson.GetBytes(responseJSON, "created_at").Int()
+	if createdAt == 0 {
+		createdAt = time.Now().Unix()
+	}
+	model := strings.TrimSpace(gjson.GetBytes(responseJSON, "model").String())
+	responseSkeleton := map[string]any{
+		"id":         respID,
+		"object":     "response",
+		"created_at": createdAt,
+		"model":      model,
+		"status":     "in_progress",
+		"output":     []any{},
+	}
+
+	writeEvent("response.created", map[string]any{"response": responseSkeleton})
+	writeEvent("response.in_progress", map[string]any{"response": responseSkeleton})
+
+	var full map[string]any
+	_ = json.Unmarshal(responseJSON, &full)
+	output := gjson.GetBytes(responseJSON, "output").Array()
+	for idx, itemResult := range output {
+		item := map[string]any{}
+		if err := json.Unmarshal([]byte(itemResult.Raw), &item); err != nil {
+			continue
+		}
+		writeEvent("response.output_item.added", map[string]any{
+			"response_id":  respID,
+			"output_index": idx,
+			"item":         item,
+		})
+		if strings.TrimSpace(fmt.Sprintf("%v", item["type"])) == "message" {
+			if content, ok := item["content"].([]any); ok {
+				for contentIndex, rawPart := range content {
+					part, ok := rawPart.(map[string]any)
+					if !ok {
+						continue
+					}
+					writeEvent("response.content_part.added", map[string]any{
+						"response_id":   respID,
+						"item_id":       item["id"],
+						"output_index":  idx,
+						"content_index": contentIndex,
+						"part":          map[string]any{"type": part["type"], "text": ""},
+					})
+					writeEvent("response.output_text.delta", map[string]any{
+						"response_id":   respID,
+						"item_id":       item["id"],
+						"output_index":  idx,
+						"content_index": contentIndex,
+						"delta":         fmt.Sprintf("%v", part["text"]),
+					})
+					writeEvent("response.output_text.done", map[string]any{
+						"response_id":   respID,
+						"item_id":       item["id"],
+						"output_index":  idx,
+						"content_index": contentIndex,
+						"text":          fmt.Sprintf("%v", part["text"]),
+					})
+					writeEvent("response.content_part.done", map[string]any{
+						"response_id":   respID,
+						"item_id":       item["id"],
+						"output_index":  idx,
+						"content_index": contentIndex,
+						"part":          part,
+					})
+				}
+			}
+		}
+		writeEvent("response.output_item.done", map[string]any{
+			"response_id":  respID,
+			"output_index": idx,
+			"item":         item,
+		})
+	}
+
+	writeEvent("response.completed", map[string]any{"response": full})
+	_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	flusher.Flush()
+}
+
+func (pm *ProxyManager) buildResponsesBridgeHandler(
+	modelID string,
+	bodyBytes []byte,
+	nextHandler func(modelID string, w http.ResponseWriter, r *http.Request) error,
+) func(string, http.ResponseWriter, *http.Request) error {
+	return func(_ string, w http.ResponseWriter, r *http.Request) error {
+		responsesRequestedStream := gjson.GetBytes(bodyBytes, "stream").Bool() || strings.Contains(strings.ToLower(strings.TrimSpace(r.Header.Get("Accept"))), "text/event-stream")
+		translated, unsupportedTools, err := translateResponsesToChatCompletionsRequestWithUnsupported(bodyBytes)
+		if err != nil {
+			return fmt.Errorf("invalid responses request: %w", err)
+		}
+		if len(unsupportedTools) > 0 {
+			logTextTransform(pm.transformLogger, modelID, "reject_unsupported_bridge_tools", strings.Join(unsupportedTools, ", "))
+			return fmt.Errorf("unsupported /v1/responses tool types for completions bridge: %s", strings.Join(unsupportedTools, ", "))
+		}
+		logBodyTransform(pm.transformLogger, modelID, "bridge_translate_responses_to_chat", bodyBytes, translated)
+
+		beforeOptimization := append([]byte(nil), translated...)
+		translated, _, err = pm.applyPromptSizeControl(modelID, translated)
+		if err != nil {
+			return fmt.Errorf("context control rejected request: %w", err)
+		}
+		logBodyTransform(pm.transformLogger, modelID, "bridge_prompt_size_control", beforeOptimization, translated)
+
+		bridgeReq := r.Clone(r.Context())
+		bridgeReq.URL.Path = "/v1/chat/completions"
+		bridgeReq.Body = io.NopCloser(bytes.NewBuffer(translated))
+		bridgeReq.ContentLength = int64(len(translated))
+		bridgeReq.Header = r.Header.Clone()
+		bridgeReq.Header.Del("transfer-encoding")
+		bridgeReq.Header.Set("content-length", strconv.Itoa(len(translated)))
+		bridgeReq.Header.Set("Content-Type", "application/json")
+
+		rr := httptest.NewRecorder()
+		if err := nextHandler(modelID, rr, bridgeReq); err != nil {
+			return err
+		}
+
+		if rr.Code < 200 || rr.Code >= 300 {
+			for k, values := range rr.Header() {
+				for _, value := range values {
+					w.Header().Add(k, value)
+				}
+			}
+			w.WriteHeader(rr.Code)
+			_, _ = w.Write(rr.Body.Bytes())
+			return nil
+		}
+
+		out, err := translateChatCompletionToResponsesResponse(rr.Body.Bytes())
+		if err != nil {
+			return fmt.Errorf("error translating response: %w", err)
+		}
+		if responsesRequestedStream {
+			writeResponsesStream(w, out)
+			return nil
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(rr.Code)
+		_, _ = w.Write(out)
+		return nil
+	}
+}
+
+func appendIfMissing(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func mustJSONString(v any) string {
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
+}
+
+func logBodyTransform(logger *LogMonitor, modelID string, stage string, before []byte, after []byte) {
+	if logger == nil || bytes.Equal(before, after) {
+		return
+	}
+	logger.Infof("<%s> %s\nbefore: %s\nafter: %s", modelID, stage, summarizeJSONForLog(before), summarizeJSONForLog(after))
+}
+
+func logTextTransform(logger *LogMonitor, modelID string, stage string, details string) {
+	if logger == nil {
+		return
+	}
+	logger.Infof("<%s> %s: %s", modelID, stage, details)
+}
+
+func summarizeJSONForLog(body []byte) string {
+	const limit = 4000
+	if len(body) <= limit {
+		return string(body)
+	}
+	return string(body[:limit]) + "...<truncated>"
+}
+
+func ValidateTransformMode(mode RequestTransformMode) error {
+	switch mode {
+	case "", TransformModeRaw, TransformModeCompletionsBridge, TransformModeResponses:
+		return nil
+	default:
+		return fmt.Errorf("invalid request transform mode %q", mode)
+	}
+}
+
+// normalizeTransformMode canonicalizes the configured request transform mode.
+// raw = passthrough, completions_bridge = Responses <-> Chat Completions bridge,
+// responses = native Responses API normalization for local backends.
+func normalizeTransformMode(mode RequestTransformMode) RequestTransformMode {
+	switch mode {
+	case TransformModeRaw, TransformModeCompletionsBridge, TransformModeResponses:
+		return mode
+	default:
+		return TransformModeCompletionsBridge
+	}
+}
+
+// getTransformMode returns the effective transform mode for the model.
+// Invalid configured values are logged and normalized to the bridge default.
+func (pm *ProxyManager) getTransformMode(modelID string) RequestTransformMode {
+	pm.Lock()
+	defer pm.Unlock()
+
+	mode := pm.transformModes[modelID]
+	if err := ValidateTransformMode(mode); err != nil {
+		logTextTransform(pm.transformLogger, modelID, "invalid_transform_mode", err.Error())
+	}
+	return normalizeTransformMode(mode)
+}
+
+// isResponsesEndpoint returns true if the request path is a Responses API endpoint.
+// This covers both /v1/responses and the bare /responses route (used by Codex),
+// which may run in either completions_bridge or native responses mode.
+func isResponsesEndpoint(path string) bool {
+	return path == "/v1/responses" || path == "/responses"
+}
+func (pm *ProxyManager) isTransformBypassEnabled(modelID string) bool {
+	return pm.getTransformMode(modelID) == TransformModeRaw
+}
 
 type proxyCtxKey string
 
@@ -36,9 +1977,10 @@ type ProxyManager struct {
 	ginEngine *gin.Engine
 
 	// logging
-	proxyLogger    *LogMonitor
-	upstreamLogger *LogMonitor
-	muxLogger      *LogMonitor
+	proxyLogger     *LogMonitor
+	upstreamLogger  *LogMonitor
+	muxLogger       *LogMonitor
+	transformLogger *LogMonitor
 
 	metricsMonitor *metricsMonitor
 
@@ -65,6 +2007,8 @@ type ProxyManager struct {
 
 	// runtime prompt optimization policy per model
 	promptPolicies map[string]PromptOptimizationPolicy
+	// runtime request transform mode per model
+	transformModes map[string]RequestTransformMode
 
 	// latest optimization snapshot for each model (for user visibility and reuse)
 	latestPromptOptimizations map[string]PromptOptimizationSnapshot
@@ -80,12 +2024,22 @@ type ProxyManager struct {
 }
 
 type PromptOptimizationPolicy string
+type RequestTransformMode string
 
 const (
 	PromptOptimizationOff       PromptOptimizationPolicy = "off"
 	PromptOptimizationLimitOnly PromptOptimizationPolicy = "limit_only"
 	PromptOptimizationAlways    PromptOptimizationPolicy = "always"
 	PromptOptimizationLLMAssist PromptOptimizationPolicy = "llm_assisted"
+
+	// TransformModeRaw passes requests through without body transformation.
+	TransformModeRaw RequestTransformMode = "raw"
+	// TransformModeCompletionsBridge translates Responses requests into Chat
+	// Completions requests and converts the downstream response back again.
+	TransformModeCompletionsBridge RequestTransformMode = "completions_bridge"
+	// TransformModeResponses keeps requests on the Responses API path and only
+	// normalizes tool and input formats for local backend compatibility.
+	TransformModeResponses RequestTransformMode = "responses"
 )
 
 type PromptOptimizationSnapshot struct {
@@ -113,20 +2067,23 @@ type OllamaModel struct {
 func New(proxyConfig config.Config) *ProxyManager {
 	// set up loggers
 
-	var muxLogger, upstreamLogger, proxyLogger *LogMonitor
+	var muxLogger, upstreamLogger, proxyLogger, transformLogger *LogMonitor
 	switch proxyConfig.LogToStdout {
 	case config.LogToStdoutNone:
 		muxLogger = NewLogMonitorWriter(io.Discard)
 		upstreamLogger = NewLogMonitorWriter(io.Discard)
 		proxyLogger = NewLogMonitorWriter(io.Discard)
+		transformLogger = NewLogMonitorWriter(io.Discard)
 	case config.LogToStdoutBoth:
 		muxLogger = NewLogMonitorWriter(os.Stdout)
 		upstreamLogger = NewLogMonitorWriter(muxLogger)
 		proxyLogger = NewLogMonitorWriter(muxLogger)
+		transformLogger = NewLogMonitorWriter(muxLogger)
 	case config.LogToStdoutUpstream:
 		muxLogger = NewLogMonitorWriter(os.Stdout)
 		upstreamLogger = NewLogMonitorWriter(muxLogger)
 		proxyLogger = NewLogMonitorWriter(io.Discard)
+		transformLogger = NewLogMonitorWriter(io.Discard)
 	default:
 		// same as config.LogToStdoutProxy
 		// helpful because some old tests create a config.Config directly and it
@@ -134,6 +2091,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 		muxLogger = NewLogMonitorWriter(os.Stdout)
 		upstreamLogger = NewLogMonitorWriter(io.Discard)
 		proxyLogger = NewLogMonitorWriter(muxLogger)
+		transformLogger = NewLogMonitorWriter(muxLogger)
 	}
 
 	if proxyConfig.LogRequests {
@@ -144,18 +2102,23 @@ func New(proxyConfig config.Config) *ProxyManager {
 	case "debug":
 		proxyLogger.SetLogLevel(LevelDebug)
 		upstreamLogger.SetLogLevel(LevelDebug)
+		transformLogger.SetLogLevel(LevelDebug)
 	case "info":
 		proxyLogger.SetLogLevel(LevelInfo)
 		upstreamLogger.SetLogLevel(LevelInfo)
+		transformLogger.SetLogLevel(LevelInfo)
 	case "warn":
 		proxyLogger.SetLogLevel(LevelWarn)
 		upstreamLogger.SetLogLevel(LevelWarn)
+		transformLogger.SetLogLevel(LevelWarn)
 	case "error":
 		proxyLogger.SetLogLevel(LevelError)
 		upstreamLogger.SetLogLevel(LevelError)
+		transformLogger.SetLogLevel(LevelError)
 	default:
 		proxyLogger.SetLogLevel(LevelInfo)
 		upstreamLogger.SetLogLevel(LevelInfo)
+		transformLogger.SetLogLevel(LevelInfo)
 	}
 
 	// see: https://go.dev/src/time/format.go
@@ -180,6 +2143,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 	if timeFormat, ok := timeFormats[strings.ToLower(strings.TrimSpace(proxyConfig.LogTimeFormat))]; ok {
 		proxyLogger.SetLogTimeFormat(timeFormat)
 		upstreamLogger.SetLogTimeFormat(timeFormat)
+		transformLogger.SetLogTimeFormat(timeFormat)
 	}
 
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
@@ -201,9 +2165,10 @@ func New(proxyConfig config.Config) *ProxyManager {
 		config:    proxyConfig,
 		ginEngine: gin.New(),
 
-		proxyLogger:    proxyLogger,
-		muxLogger:      muxLogger,
-		upstreamLogger: upstreamLogger,
+		proxyLogger:     proxyLogger,
+		muxLogger:       muxLogger,
+		upstreamLogger:  upstreamLogger,
+		transformLogger: transformLogger,
 
 		metricsMonitor: newMetricsMonitor(proxyLogger, maxMetrics, proxyConfig.CaptureBuffer),
 
@@ -221,6 +2186,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 		fitModes:                  make(map[string]bool),
 		fitCtxModes:               make(map[string]string),
 		promptPolicies:            make(map[string]PromptOptimizationPolicy),
+		transformModes:            make(map[string]RequestTransformMode),
 		latestPromptOptimizations: make(map[string]PromptOptimizationSnapshot),
 		configPath:                "config.yaml",
 		ollamaEndpoint:            "http://127.0.0.1:11434",
@@ -230,8 +2196,11 @@ func New(proxyConfig config.Config) *ProxyManager {
 
 	// create the process groups
 	for groupID := range proxyConfig.Groups {
-		processGroup := NewProcessGroup(groupID, proxyConfig, proxyLogger, upstreamLogger)
+		processGroup := NewProcessGroup(groupID, proxyConfig, proxyLogger, upstreamLogger, transformLogger)
 		pm.processGroups[groupID] = processGroup
+		for modelID, process := range processGroup.processes {
+			pm.metricsMonitor.registerModelLogMonitor(modelID, process.LogMonitor())
+		}
 	}
 
 	pm.setupGinEngine()
@@ -341,6 +2310,8 @@ func (pm *ProxyManager) setupGinEngine() {
 	// Protected routes use pm.apiKeyAuth() middleware
 	pm.ginEngine.POST("/v1/chat/completions", pm.apiKeyAuth(), pm.proxyInferenceHandler)
 	pm.ginEngine.POST("/v1/responses", pm.apiKeyAuth(), pm.proxyInferenceHandler)
+	// Support Codex calling /responses without /v1/ prefix
+	pm.ginEngine.POST("/responses", pm.apiKeyAuth(), pm.proxyInferenceHandler)
 	// Support legacy /v1/completions api, see issue #12
 	pm.ginEngine.POST("/v1/completions", pm.apiKeyAuth(), pm.proxyInferenceHandler)
 	// Support anthropic /v1/messages (added https://github.com/ggml-org/llama.cpp/pull/17570)
@@ -787,7 +2758,23 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 		return
 	}
 
-	requestedModel := gjson.GetBytes(bodyBytes, "model").String()
+requestedModel := gjson.GetBytes(bodyBytes, "model").String()
+	if requestedModel == "" {
+		// Codex sends model_config as a string value directly
+		requestedModel = gjson.Get(string(bodyBytes), "model_config").String()
+	}
+	if requestedModel == "" {
+		// Some APIs send it nested: {"model_config": {"model": "..."}}
+		requestedModel = gjson.GetBytes(bodyBytes, "model_config.model").String()
+	}
+	if requestedModel == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "missing or invalid 'model' key")
+		return
+	}
+	if requestedModel == "" {
+		// Some APIs send it nested: {"model_config": {"model": "..."}}
+		requestedModel = gjson.GetBytes(bodyBytes, "model_config.model").String()
+	}
 	if requestedModel == "" {
 		pm.sendErrorResponse(c, http.StatusBadRequest, "missing or invalid 'model' key")
 		return
@@ -795,6 +2782,7 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 
 	// Look for a matching local model first
 	var nextHandler func(modelID string, w http.ResponseWriter, r *http.Request) error
+	requestPath := c.Request.URL.Path
 
 	modelID, found := pm.config.RealModelName(requestedModel)
 	if found {
@@ -803,47 +2791,110 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))
 			return
 		}
+		if err := processGroup.EnsureStarted(modelID); err != nil {
+			pm.sendErrorResponse(c, http.StatusBadGateway, fmt.Sprintf("unable to start process: %s", err.Error()))
+			return
+		}
 
 		// issue #69 allow custom model names to be sent to upstream
 		useModelName := pm.config.Models[modelID].UseModelName
 		if useModelName != "" {
+			beforeBody := append([]byte(nil), bodyBytes...)
 			bodyBytes, err = sjson.SetBytes(bodyBytes, "model", useModelName)
 			if err != nil {
 				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error rewriting model name in JSON: %s", err.Error()))
 				return
 			}
+			logBodyTransform(pm.transformLogger, modelID, "rewrite_model_name", beforeBody, bodyBytes)
 		}
 
 		// issue #174 strip parameters from the JSON body
-		stripParams, err := pm.config.Models[modelID].Filters.SanitizedStripParams()
-		if err != nil { // just log it and continue
-			pm.proxyLogger.Errorf("Error sanitizing strip params string: %s, %s", pm.config.Models[modelID].Filters.StripParams, err.Error())
-		} else {
-			for _, param := range stripParams {
-				pm.proxyLogger.Debugf("<%s> stripping param: %s", modelID, param)
-				bodyBytes, err = sjson.DeleteBytes(bodyBytes, param)
+		// Log raw request body for debugging (especially tools)
+		pm.proxyLogger.Debugf("<%s> Raw request body (before filters): %s", modelID, string(bodyBytes))
+
+		transformMode := pm.getTransformMode(modelID)
+		bypassTransforms := transformMode == TransformModeRaw
+		if bypassTransforms {
+			logTextTransform(pm.transformLogger, modelID, "bypass_transforms", "skipping request-body filters and prompt control")
+		} else if isResponsesEndpoint(requestPath) {
+			logTextTransform(pm.transformLogger, modelID, "transform_mode", string(transformMode))
+		}
+
+		if !bypassTransforms {
+			stripParams, err := pm.config.Models[modelID].Filters.SanitizedStripParams()
+			if err != nil { // just log it and continue
+				pm.proxyLogger.Errorf("Error sanitizing strip params string: %s, %s", pm.config.Models[modelID].Filters.StripParams, err.Error())
+			} else {
+				for _, param := range stripParams {
+					pm.proxyLogger.Debugf("<%s> stripping param: %s", modelID, param)
+					beforeBody := append([]byte(nil), bodyBytes...)
+					bodyBytes, err = stripTopLevelParam(bodyBytes, param)
+					if err != nil {
+						pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error deleting parameter %s from request", param))
+						return
+					}
+					logBodyTransform(pm.transformLogger, modelID, "strip_param:"+param, beforeBody, bodyBytes)
+				}
+			}
+		}
+
+		// Log request body after filtering
+		pm.proxyLogger.Debugf("<%s> Request body (after filters): %s", modelID, string(bodyBytes))
+
+		if !bypassTransforms {
+			if c.Request.URL.Path == "/v1/chat/completions" {
+				beforeBody := append([]byte(nil), bodyBytes...)
+				bodyBytes, err = normalizeChatCompletionTools(bodyBytes)
 				if err != nil {
-					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error deleting parameter %s from request", param))
+					pm.sendErrorResponse(c, http.StatusInternalServerError, "error normalizing chat tools in request")
 					return
+				}
+				logBodyTransform(pm.transformLogger, modelID, "normalize_chat_tools", beforeBody, bodyBytes)
+			} else if isResponsesEndpoint(requestPath) && transformMode == TransformModeResponses {
+				var adaptedTools []string
+				var unsupportedTools []string
+				beforeBody := append([]byte(nil), bodyBytes...)
+				bodyBytes, adaptedTools, unsupportedTools, err = normalizeResponsesRequest(bodyBytes)
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, "error normalizing responses tools in request")
+					return
+				}
+				logBodyTransform(pm.transformLogger, modelID, "normalize_responses_request", beforeBody, bodyBytes)
+				if len(unsupportedTools) > 0 {
+					logTextTransform(pm.transformLogger, modelID, "reject_unsupported_responses_tools", strings.Join(unsupportedTools, ", "))
+					pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("unsupported /v1/responses tool types for local backend: %s", strings.Join(unsupportedTools, ", ")))
+					return
+				}
+				if len(adaptedTools) > 0 {
+					logTextTransform(pm.transformLogger, modelID, "adapted_responses_tools", strings.Join(adaptedTools, ", "))
+					c.Request.Header.Set(llamaSwapResponseToolAdapterHeader, strings.Join(adaptedTools, ","))
 				}
 			}
 		}
 
 		// issue #453 set/override parameters in the JSON body
-		setParams, setParamKeys := pm.config.Models[modelID].Filters.SanitizedSetParams()
-		for _, key := range setParamKeys {
-			pm.proxyLogger.Debugf("<%s> setting param: %s", modelID, key)
-			bodyBytes, err = sjson.SetBytes(bodyBytes, key, setParams[key])
-			if err != nil {
-				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting parameter %s in request", key))
-				return
+		if !bypassTransforms {
+			setParams, setParamKeys := pm.config.Models[modelID].Filters.SanitizedSetParams()
+			for _, key := range setParamKeys {
+				pm.proxyLogger.Debugf("<%s> setting param: %s", modelID, key)
+				beforeBody := append([]byte(nil), bodyBytes...)
+				bodyBytes, err = sjson.SetBytes(bodyBytes, key, setParams[key])
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting parameter %s in request", key))
+					return
+				}
+				logBodyTransform(pm.transformLogger, modelID, "set_param:"+key, beforeBody, bodyBytes)
 			}
 		}
 
 		var optResult PromptOptimizationResult
-		if bodyBytes, optResult, err = pm.applyPromptSizeControl(modelID, bodyBytes); err != nil {
-			pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("context control rejected request: %s", err.Error()))
-			return
+		if !bypassTransforms && !(isResponsesEndpoint(requestPath) && transformMode == TransformModeCompletionsBridge) {
+			beforeOptimization := append([]byte(nil), bodyBytes...)
+			if bodyBytes, optResult, err = pm.applyPromptSizeControl(modelID, bodyBytes); err != nil {
+				pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("context control rejected request: %s", err.Error()))
+				return
+			}
+			logBodyTransform(pm.transformLogger, modelID, "prompt_size_control", beforeOptimization, bodyBytes)
 		}
 		c.Header("X-LlamaSwap-Prompt-Optimization-Policy", string(optResult.Policy))
 		if optResult.Applied {
@@ -854,6 +2905,9 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 
 		pm.proxyLogger.Debugf("ProxyManager using local Process for model: %s", requestedModel)
 		nextHandler = processGroup.ProxyRequest
+		if isResponsesEndpoint(requestPath) && transformMode == TransformModeCompletionsBridge {
+			nextHandler = pm.buildResponsesBridgeHandler(modelID, append([]byte(nil), bodyBytes...), nextHandler)
+		}
 	} else if pm.peerProxy != nil && pm.peerProxy.HasPeerModel(requestedModel) {
 		pm.proxyLogger.Debugf("ProxyManager using ProxyPeer for model: %s", requestedModel)
 		modelID = requestedModel
@@ -861,29 +2915,85 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 		// issue #453 apply filters for peer requests
 		peerFilters := pm.peerProxy.GetPeerFilters(requestedModel)
 
+		// Log raw request body for debugging
+		pm.proxyLogger.Debugf("<%s> Raw request body (before peer filters): %s", requestedModel, string(bodyBytes))
+
+		transformMode := pm.getTransformMode(modelID)
+		bypassTransforms := transformMode == TransformModeRaw
+		if bypassTransforms {
+			logTextTransform(pm.transformLogger, modelID, "peer_bypass_transforms", "skipping request-body filters and prompt control")
+		} else if isResponsesEndpoint(requestPath) {
+			logTextTransform(pm.transformLogger, modelID, "peer_transform_mode", string(transformMode))
+		}
+
 		// Apply stripParams - remove specified parameters from request
-		stripParams := peerFilters.SanitizedStripParams()
-		for _, param := range stripParams {
-			pm.proxyLogger.Debugf("<%s> stripping param: %s", requestedModel, param)
-			bodyBytes, err = sjson.DeleteBytes(bodyBytes, param)
-			if err != nil {
-				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error stripping parameter %s from request", param))
-				return
+		if !bypassTransforms {
+			stripParams := peerFilters.SanitizedStripParams()
+			for _, param := range stripParams {
+				pm.proxyLogger.Debugf("<%s> stripping param: %s", requestedModel, param)
+				beforeBody := append([]byte(nil), bodyBytes...)
+				bodyBytes, err = stripTopLevelParam(bodyBytes, param)
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error stripping parameter %s from request", param))
+					return
+				}
+				logBodyTransform(pm.transformLogger, modelID, "peer_strip_param:"+param, beforeBody, bodyBytes)
+			}
+		}
+
+		// Log request body after filtering
+		pm.proxyLogger.Debugf("<%s> Request body (after peer filters): %s", requestedModel, string(bodyBytes))
+
+		if !bypassTransforms {
+			if c.Request.URL.Path == "/v1/chat/completions" {
+				beforeBody := append([]byte(nil), bodyBytes...)
+				bodyBytes, err = normalizeChatCompletionTools(bodyBytes)
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, "error normalizing chat tools in request")
+					return
+				}
+				logBodyTransform(pm.transformLogger, modelID, "peer_normalize_chat_tools", beforeBody, bodyBytes)
+			} else if isResponsesEndpoint(requestPath) && transformMode == TransformModeResponses {
+				var adaptedTools []string
+				var unsupportedTools []string
+				beforeBody := append([]byte(nil), bodyBytes...)
+				bodyBytes, adaptedTools, unsupportedTools, err = normalizeResponsesRequest(bodyBytes)
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, "error normalizing responses tools in request")
+					return
+				}
+				logBodyTransform(pm.transformLogger, modelID, "peer_normalize_responses_request", beforeBody, bodyBytes)
+				if len(unsupportedTools) > 0 {
+					logTextTransform(pm.transformLogger, modelID, "peer_reject_unsupported_responses_tools", strings.Join(unsupportedTools, ", "))
+					pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("unsupported /v1/responses tool types for local backend: %s", strings.Join(unsupportedTools, ", ")))
+					return
+				}
+				if len(adaptedTools) > 0 {
+					logTextTransform(pm.transformLogger, modelID, "peer_adapted_responses_tools", strings.Join(adaptedTools, ", "))
+					c.Request.Header.Set(llamaSwapResponseToolAdapterHeader, strings.Join(adaptedTools, ","))
+				}
 			}
 		}
 
 		// Apply setParams - set/override specified parameters in request
-		setParams, setParamKeys := peerFilters.SanitizedSetParams()
-		for _, key := range setParamKeys {
-			pm.proxyLogger.Debugf("<%s> setting param: %s", requestedModel, key)
-			bodyBytes, err = sjson.SetBytes(bodyBytes, key, setParams[key])
-			if err != nil {
-				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting parameter %s in request", key))
-				return
+		if !bypassTransforms {
+			setParams, setParamKeys := peerFilters.SanitizedSetParams()
+			for _, key := range setParamKeys {
+				pm.proxyLogger.Debugf("<%s> setting param: %s", requestedModel, key)
+				beforeBody := append([]byte(nil), bodyBytes...)
+				bodyBytes, err = sjson.SetBytes(bodyBytes, key, setParams[key])
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting parameter %s in request", key))
+					return
+				}
+				logBodyTransform(pm.transformLogger, modelID, "peer_set_param:"+key, beforeBody, bodyBytes)
 			}
 		}
 
 		nextHandler = pm.peerProxy.ProxyRequest
+		if isResponsesEndpoint(requestPath) && transformMode == TransformModeCompletionsBridge {
+			nextHandler = pm.buildResponsesBridgeHandler(modelID, append([]byte(nil), bodyBytes...), nextHandler)
+		}
 	} else if ollamaModel, exists := pm.GetOllamaModelByID(requestedModel); exists {
 		modelID = ollamaModel.ID
 		bodyBytes, err = sjson.SetBytes(bodyBytes, "model", ollamaModel.Name)
@@ -891,11 +3001,18 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error rewriting ollama model name in JSON: %s", err.Error()))
 			return
 		}
+		logTextTransform(pm.transformLogger, modelID, "rewrite_ollama_model_name", ollamaModel.Name)
 
 		var optResult PromptOptimizationResult
-		if bodyBytes, optResult, err = pm.applyPromptSizeControl(modelID, bodyBytes); err != nil {
-			pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("context control rejected request: %s", err.Error()))
-			return
+		if !pm.isTransformBypassEnabled(modelID) {
+			beforeOptimization := append([]byte(nil), bodyBytes...)
+			if bodyBytes, optResult, err = pm.applyPromptSizeControl(modelID, bodyBytes); err != nil {
+				pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("context control rejected request: %s", err.Error()))
+				return
+			}
+			logBodyTransform(pm.transformLogger, modelID, "prompt_size_control", beforeOptimization, bodyBytes)
+		} else {
+			logTextTransform(pm.transformLogger, modelID, "bypass_transforms", "skipping prompt control for ollama request")
 		}
 		c.Header("X-LlamaSwap-Prompt-Optimization-Policy", string(optResult.Policy))
 		if optResult.Applied {

@@ -4,18 +4,25 @@
     loadModel,
     unloadAllModels,
     killAllLlamaCpp,
+    refreshConfig,
+    restartTBGSwap,
     unloadSingleModel,
     getModelCtxSize,
     setModelCtxSize,
     getModelFitMode,
     setModelFitMode,
+    getModelTransformMode,
+    setModelTransformMode,
   } from "../stores/api";
+  import type { TransformMode } from "../stores/api";
   import { isNarrow } from "../stores/theme";
   import { persistentStore } from "../stores/persistent";
   import type { Model } from "../lib/types";
 
   let isUnloading = $state(false);
   let isKillingLlamaCpp = $state(false);
+  let isRefreshingConfig = $state(false);
+  let isRestartingTBG = $state(false);
   let menuOpen = $state(false);
 
   const showUnlistedStore = persistentStore<boolean>("showUnlisted", true);
@@ -34,6 +41,7 @@
   let ctxKnown = $state<Record<string, boolean>>({});
   let fitSelections = $state<Record<string, boolean>>({});
   let fitCtxModeSelections = $state<Record<string, "max" | "min">>({});
+  let transformModeSelections = $state<Record<string, TransformMode>>({});
 
   let filteredModels = $derived.by(() => {
     const filtered = $models.filter((model) => $showUnlistedStore || !model.unlisted);
@@ -66,6 +74,12 @@
       }
       if (fitCtxModeSelections[model.id] === undefined) {
         fitCtxModeSelections = { ...fitCtxModeSelections, [model.id]: model.fitCtxMode === "min" ? "min" : "max" };
+      }
+      if (transformModeSelections[model.id] === undefined) {
+        transformModeSelections = {
+          ...transformModeSelections,
+          [model.id]: model.transformMode || (model.transformBypass === true ? "raw" : "completions_bridge"),
+        };
       }
       void ensureCtxSizeLoaded(model.id);
     }
@@ -181,6 +195,43 @@
     }
   }
 
+  async function handleRefreshConfig(): Promise<void> {
+    isRefreshingConfig = true;
+    try {
+      await refreshConfig();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setTimeout(() => (isRefreshingConfig = false), 1000);
+    }
+  }
+
+  async function handleRestartTBG(): Promise<void> {
+    isRestartingTBG = true;
+    try {
+      await restartTBGSwap();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setTimeout(() => (isRestartingTBG = false), 1500);
+    }
+  }
+
+  async function handleTransformModeChange(modelId: string, modeValue: string): Promise<void> {
+    const mode: TransformMode =
+      modeValue === "raw" || modeValue === "responses" || modeValue === "completions_bridge"
+        ? modeValue
+        : "completions_bridge";
+    transformModeSelections = { ...transformModeSelections, [modelId]: mode };
+    try {
+      await setModelTransformMode(modelId, mode);
+    } catch (e) {
+      console.error(e);
+      const fallback = await getModelTransformMode(modelId);
+      transformModeSelections = { ...transformModeSelections, [modelId]: fallback };
+    }
+  }
+
   function isExternalModel(model: Model): boolean {
     return model.external === true || model.provider === "ollama";
   }
@@ -247,6 +298,26 @@
                 </svg>
                 {isKillingLlamaCpp ? "Killing..." : "Kill llama.cpp"}
               </button>
+              <button
+                class="w-full text-left px-4 py-2 hover:bg-secondary-hover flex items-center gap-2"
+                onclick={() => { handleRefreshConfig(); menuOpen = false; }}
+                disabled={isRefreshingConfig}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6">
+                  <path fill-rule="evenodd" d="M4.5 12a7.5 7.5 0 0 1 12.8-5.303l.47.47V4.5a.75.75 0 0 1 1.5 0v4.5a.75.75 0 0 1-.75.75h-4.5a.75.75 0 0 1 0-1.5h2.61l-.39-.39A6 6 0 1 0 18 12a.75.75 0 0 1 1.5 0 7.5 7.5 0 1 1-15 0Z" clip-rule="evenodd" />
+                </svg>
+                {isRefreshingConfig ? "Refreshing..." : "Refresh Config"}
+              </button>
+              <button
+                class="w-full text-left px-4 py-2 hover:bg-secondary-hover flex items-center gap-2"
+                onclick={() => { handleRestartTBG(); menuOpen = false; }}
+                disabled={isRestartingTBG}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6">
+                  <path fill-rule="evenodd" d="M12 3.75a8.25 8.25 0 0 0-7.534 4.894.75.75 0 1 1-1.37-.614A9.75 9.75 0 1 1 12 21.75a.75.75 0 0 1 0-1.5 8.25 8.25 0 1 0 0-16.5ZM12 6a.75.75 0 0 1 .75.75V12a.75.75 0 0 1-1.5 0V6.75A.75.75 0 0 1 12 6Zm0 8.25a.938.938 0 1 0 0 1.875.938.938 0 0 0 0-1.875Z" clip-rule="evenodd" />
+                </svg>
+                {isRestartingTBG ? "Restarting..." : "Restart TBG (O)llama Swap"}
+              </button>
             </div>
           {/if}
         </div>
@@ -291,6 +362,20 @@
           </svg>
           {isKillingLlamaCpp ? "Killing..." : "Kill llama.cpp"}
         </button>
+        <div class="flex flex-col gap-2">
+          <button class="btn text-sm flex items-center gap-2" onclick={handleRefreshConfig} disabled={isRefreshingConfig}>
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
+              <path fill-rule="evenodd" d="M4.5 12a7.5 7.5 0 0 1 12.8-5.303l.47.47V4.5a.75.75 0 0 1 1.5 0v4.5a.75.75 0 0 1-.75.75h-4.5a.75.75 0 0 1 0-1.5h2.61l-.39-.39A6 6 0 1 0 18 12a.75.75 0 0 1 1.5 0 7.5 7.5 0 1 1-15 0Z" clip-rule="evenodd" />
+            </svg>
+            {isRefreshingConfig ? "Refreshing..." : "Refresh Config"}
+          </button>
+          <button class="btn text-sm flex items-center gap-2" onclick={handleRestartTBG} disabled={isRestartingTBG}>
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
+              <path fill-rule="evenodd" d="M12 3.75a8.25 8.25 0 0 0-7.534 4.894.75.75 0 1 1-1.37-.614A9.75 9.75 0 1 1 12 21.75a.75.75 0 0 1 0-1.5 8.25 8.25 0 1 0 0-16.5ZM12 6a.75.75 0 0 1 .75.75V12a.75.75 0 0 1-1.5 0V6.75A.75.75 0 0 1 12 6Zm0 8.25a.938.938 0 1 0 0 1.875.938.938 0 0 0 0-1.875Z" clip-rule="evenodd" />
+            </svg>
+            {isRestartingTBG ? "Restarting..." : "Restart TBG (O)llama Swap"}
+          </button>
+        </div>
       </div>
     {/if}
   </div>
@@ -301,6 +386,7 @@
         <tr class="text-left border-b border-gray-200 dark:border-white/10 bg-surface">
           <th>{$showIdorNameStore === "id" ? "Model ID" : "Name"}</th>
           <th>Ctx</th>
+          <th>Mode</th>
           <th></th>
           <th>State</th>
         </tr>
@@ -371,6 +457,22 @@
                 <div class={`mt-1 text-[10px] leading-tight ${sourceClass}`}>
                   {ctxSource}
                 </div>
+              {/if}
+            </td>
+            <td class="w-36">
+              {#if isExternal}
+                <span class="text-xs text-txtsecondary">n/a</span>
+              {:else}
+                <select
+                  class="w-full rounded border border-gray-300 dark:border-white/20 bg-surface px-2 py-1 text-xs"
+                  value={transformModeSelections[model.id] || "completions_bridge"}
+                  onchange={(e) => handleTransformModeChange(model.id, (e.currentTarget as HTMLSelectElement).value)}
+                  title="Choose how /v1/responses requests are handled for this model"
+                >
+                  <option value="completions_bridge">completions bridge</option>
+                  <option value="responses">responses</option>
+                  <option value="raw">raw</option>
+                </select>
               {/if}
             </td>
             <td class="w-12">

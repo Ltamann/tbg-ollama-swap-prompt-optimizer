@@ -1,5 +1,5 @@
 # add this modeline for validation in vscode
-# yaml-language-server: $schema=https://raw.githubusercontent.com/mostlygeek/llama-swap/refs/heads/main/config-schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Ltamann/tbg-ollama-swap-prompt-optimizer/refs/heads/main/config-schema.json
 #
 # llama-swap YAML configuration example
 # -------------------------------------

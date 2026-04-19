@@ -1,6 +1,6 @@
 <script lang="ts">
   import { get } from "svelte/store";
-  import { models } from "../../stores/api";
+  import { models, upstreamLogs } from "../../stores/api";
   import { persistentStore } from "../../stores/persistent";
   import {
     chatMessagesStore,
@@ -42,6 +42,49 @@
   let imageError = $state<string | null>(null);
 
   let hasModels = $derived($models.some((m) => !m.unlisted));
+  let selectedModelState = $derived(
+    $models.find((m) => m.id === $selectedModelStore)?.state || "unknown"
+  );
+  let isModelLoading = $derived(selectedModelState === "starting" || selectedModelState === "stopping");
+
+  type LoadStage = { pct: number; label: string; patterns: string[] };
+
+  const LOAD_STAGES: LoadStage[] = [
+    { pct: 8, label: "Starting model process", patterns: ["srv    load_model: loading model", "main: loading model"] },
+    { pct: 18, label: "Reading model metadata", patterns: ["llama_model_loader: loaded meta data"] },
+    { pct: 36, label: "Loading tensors", patterns: ["load_tensors: loading model tensors"] },
+    { pct: 56, label: "Offloading layers to GPU", patterns: ["load_tensors: offloaded"] },
+    { pct: 72, label: "Building context", patterns: ["llama_context: constructing llama_context"] },
+    { pct: 84, label: "Allocating compute buffers", patterns: ["sched_reserve: reserve took", "sched_reserve:"] },
+    { pct: 92, label: "Warming up model", patterns: ["warming up the model"] },
+    { pct: 100, label: "Model ready", patterns: ["main: model loaded", "srv    load_model: initialized slots"] },
+  ];
+
+  function parseModelLoadProgress(logs: string): { pct: number; label: string } {
+    const raw = (logs || "").toLowerCase();
+    if (!raw) {
+      return { pct: 4, label: "Waiting for load logs..." };
+    }
+
+    const markerA = raw.lastIndexOf("srv    load_model: loading model");
+    const markerB = raw.lastIndexOf("main: loading model");
+    const start = Math.max(markerA, markerB, 0);
+    const section = raw.slice(start);
+
+    let pct = 4;
+    let label = "Starting model process";
+    for (const stage of LOAD_STAGES) {
+      if (stage.patterns.some((pattern) => section.includes(pattern.toLowerCase()))) {
+        if (stage.pct >= pct) {
+          pct = stage.pct;
+          label = stage.label;
+        }
+      }
+    }
+    return { pct, label };
+  }
+
+  let loadProgress = $derived(parseModelLoadProgress($upstreamLogs));
 
   function configuredTemperatureForModel(modelID: string): number {
     const model = $models.find((m) => m.id === modelID);
@@ -301,87 +344,97 @@
   }
 </script>
 
-<div class="flex flex-col h-full">
-  <div class="shrink-0 sticky top-0 z-20 bg-card pb-3">
-    <!-- Model selector and controls -->
-    <div class="flex flex-wrap gap-2 mb-3">
-      <ModelSelector bind:value={$selectedModelStore} placeholder="Select a model..." disabled={$chatIsStreamingStore} />
-      <div class="flex gap-2">
+<div class="h-full flex flex-col">
+  <div class="shrink-0 sticky top-0 z-20 border-b border-gray-200/70 dark:border-white/10 bg-background/92 backdrop-blur">
+    <div class="max-w-4xl mx-auto w-full px-4 py-2">
+      <div class="flex items-center gap-2">
+        <div class="flex-1"></div>
         <button
-          class="btn"
+          class="btn px-2.5 py-2 rounded-lg"
           onclick={() => (showSettings = !showSettings)}
           title="Settings"
+          aria-label="Settings"
         >
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
             <path fill-rule="evenodd" d="M8.34 1.804A1 1 0 0 1 9.32 1h1.36a1 1 0 0 1 .98.804l.295 1.473c.497.144.971.342 1.416.587l1.25-.834a1 1 0 0 1 1.262.125l.962.962a1 1 0 0 1 .125 1.262l-.834 1.25c.245.445.443.919.587 1.416l1.473.295a1 1 0 0 1 .804.98v1.36a1 1 0 0 1-.804.98l-1.473.295a6.95 6.95 0 0 1-.587 1.416l.834 1.25a1 1 0 0 1-.125 1.262l-.962.962a1 1 0 0 1-1.262.125l-1.25-.834a6.953 6.953 0 0 1-1.416.587l-.295 1.473a1 1 0 0 1-.98.804H9.32a1 1 0 0 1-.98-.804l-.295-1.473a6.957 6.957 0 0 1-1.416-.587l-1.25.834a1 1 0 0 1-1.262-.125l-.962-.962a1 1 0 0 1-.125-1.262l.834-1.25a6.957 6.957 0 0 1-.587-1.416l-1.473-.295A1 1 0 0 1 1 10.68V9.32a1 1 0 0 1 .804-.98l1.473-.295c.144-.497.342-.971.587-1.416l-.834-1.25a1 1 0 0 1 .125-1.262l.962-.962A1 1 0 0 1 5.38 3.03l1.25.834a6.957 6.957 0 0 1 1.416-.587l.294-1.473ZM13 10a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" clip-rule="evenodd" />
           </svg>
         </button>
-        <button class="btn" onclick={newChat} disabled={$chatMessagesStore.length === 0 && !$chatIsStreamingStore}>
+        <button class="btn px-2.5 py-2 rounded-lg" onclick={newChat} disabled={$chatMessagesStore.length === 0 && !$chatIsStreamingStore} title="New chat" aria-label="New chat">
           New Chat
         </button>
       </div>
-    </div>
-
-    <!-- Settings panel -->
-    {#if showSettings}
-      <div class="p-4 bg-surface border border-gray-200 dark:border-white/10 rounded">
-        <div class="mb-4">
-          <label class="block text-sm font-medium mb-1" for="system-prompt">System Prompt</label>
-          <textarea
-            id="system-prompt"
-            class="w-full px-3 py-2 rounded border border-gray-200 dark:border-white/10 bg-card focus:outline-none focus:ring-2 focus:ring-primary resize-none"
-            placeholder="You are a helpful assistant..."
-            rows="3"
-            bind:value={$systemPromptStore}
-            disabled={$chatIsStreamingStore}
-          ></textarea>
+      {#if isModelLoading}
+        <div class="mt-2 max-w-md ml-auto px-3 py-2 rounded-xl border border-gray-200 dark:border-white/10 bg-surface shadow-sm">
+          <div class="flex items-center justify-between text-xs text-txtsecondary mb-1">
+            <span>Model loading</span>
+            <span>{Math.min(100, Math.max(0, Math.round(loadProgress.pct)))}%</span>
+          </div>
+          <div class="h-2 rounded-full bg-gray-200 dark:bg-white/10 overflow-hidden">
+            <div class="h-full bg-primary transition-all duration-300 ease-out" style={`width: ${Math.min(100, Math.max(0, loadProgress.pct))}%`}></div>
+          </div>
+          <div class="text-[11px] text-txtsecondary mt-1">{loadProgress.label}</div>
         </div>
-        <div>
-          <label class="block text-sm font-medium mb-1" for="temperature">
-            Temperature: {currentTemperature.toFixed(2)}
-          </label>
-          <input
-            id="temperature"
-            type="range"
-            min="0"
-            max="2"
-            step="0.05"
-            class="w-full"
-            bind:value={currentTemperature}
-            oninput={(e) => handleTemperatureInput(parseFloat((e.currentTarget as HTMLInputElement).value))}
-            disabled={$chatIsStreamingStore}
-          />
-          <div class="flex justify-between text-xs text-txtsecondary mt-1">
-            <span>Precise (0)</span>
-            <span>Creative (2)</span>
+      {/if}
+      {#if showSettings}
+        <div class="mt-3 p-4 bg-surface border border-gray-200 dark:border-white/10 rounded-xl shadow-sm">
+          <div class="mb-4">
+            <label class="block text-sm font-medium mb-1" for="system-prompt">System Prompt</label>
+            <textarea
+              id="system-prompt"
+              class="w-full px-3 py-2 rounded border border-gray-200 dark:border-white/10 bg-card focus:outline-none focus:ring-2 focus:ring-primary resize-none"
+              placeholder="You are a helpful assistant..."
+              rows="3"
+              bind:value={$systemPromptStore}
+              disabled={$chatIsStreamingStore}
+            ></textarea>
+          </div>
+          <div>
+            <label class="block text-sm font-medium mb-1" for="temperature">
+              Temperature: {currentTemperature.toFixed(2)}
+            </label>
+            <input
+              id="temperature"
+              type="range"
+              min="0"
+              max="2"
+              step="0.05"
+              class="w-full"
+              bind:value={currentTemperature}
+              oninput={(e) => handleTemperatureInput(parseFloat((e.currentTarget as HTMLInputElement).value))}
+              disabled={$chatIsStreamingStore}
+            />
+            <div class="flex justify-between text-xs text-txtsecondary mt-1">
+              <span>Precise (0)</span>
+              <span>Creative (2)</span>
+            </div>
+          </div>
+          <div class="mt-3">
+            <label class="block text-sm font-medium mb-1" for="top-p">Top P: {currentTopP.toFixed(2)}</label>
+            <input id="top-p" type="range" min="0" max="1" step="0.01" class="w-full" bind:value={currentTopP} oninput={(e) => handleTopPInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
+          </div>
+          <div class="mt-3">
+            <label class="block text-sm font-medium mb-1" for="top-k">Top K: {Math.round(currentTopK)}</label>
+            <input id="top-k" type="range" min="0" max="200" step="1" class="w-full" bind:value={currentTopK} oninput={(e) => handleTopKInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
+          </div>
+          <div class="mt-3">
+            <label class="block text-sm font-medium mb-1" for="min-p">Min P: {currentMinP.toFixed(2)}</label>
+            <input id="min-p" type="range" min="0" max="1" step="0.01" class="w-full" bind:value={currentMinP} oninput={(e) => handleMinPInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
+          </div>
+          <div class="mt-3">
+            <label class="block text-sm font-medium mb-1" for="presence-penalty">Presence Penalty: {currentPresencePenalty.toFixed(2)}</label>
+            <input id="presence-penalty" type="range" min="-2" max="2" step="0.01" class="w-full" bind:value={currentPresencePenalty} oninput={(e) => handlePresencePenaltyInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
+          </div>
+          <div class="mt-3">
+            <label class="block text-sm font-medium mb-1" for="frequency-penalty">Frequency Penalty: {currentFrequencyPenalty.toFixed(2)}</label>
+            <input id="frequency-penalty" type="range" min="-2" max="2" step="0.01" class="w-full" bind:value={currentFrequencyPenalty} oninput={(e) => handleFrequencyPenaltyInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
+          </div>
+          <div class="mt-3">
+            <label class="block text-sm font-medium mb-1" for="max-tokens">Max Tokens (0 = model default): {Math.round(currentMaxTokens)}</label>
+            <input id="max-tokens" type="range" min="0" max="8192" step="64" class="w-full" bind:value={currentMaxTokens} oninput={(e) => handleMaxTokensInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
           </div>
         </div>
-        <div class="mt-3">
-          <label class="block text-sm font-medium mb-1" for="top-p">Top P: {currentTopP.toFixed(2)}</label>
-          <input id="top-p" type="range" min="0" max="1" step="0.01" class="w-full" bind:value={currentTopP} oninput={(e) => handleTopPInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
-        </div>
-        <div class="mt-3">
-          <label class="block text-sm font-medium mb-1" for="top-k">Top K: {Math.round(currentTopK)}</label>
-          <input id="top-k" type="range" min="0" max="200" step="1" class="w-full" bind:value={currentTopK} oninput={(e) => handleTopKInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
-        </div>
-        <div class="mt-3">
-          <label class="block text-sm font-medium mb-1" for="min-p">Min P: {currentMinP.toFixed(2)}</label>
-          <input id="min-p" type="range" min="0" max="1" step="0.01" class="w-full" bind:value={currentMinP} oninput={(e) => handleMinPInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
-        </div>
-        <div class="mt-3">
-          <label class="block text-sm font-medium mb-1" for="presence-penalty">Presence Penalty: {currentPresencePenalty.toFixed(2)}</label>
-          <input id="presence-penalty" type="range" min="-2" max="2" step="0.01" class="w-full" bind:value={currentPresencePenalty} oninput={(e) => handlePresencePenaltyInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
-        </div>
-        <div class="mt-3">
-          <label class="block text-sm font-medium mb-1" for="frequency-penalty">Frequency Penalty: {currentFrequencyPenalty.toFixed(2)}</label>
-          <input id="frequency-penalty" type="range" min="-2" max="2" step="0.01" class="w-full" bind:value={currentFrequencyPenalty} oninput={(e) => handleFrequencyPenaltyInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
-        </div>
-        <div class="mt-3">
-          <label class="block text-sm font-medium mb-1" for="max-tokens">Max Tokens (0 = model default): {Math.round(currentMaxTokens)}</label>
-          <input id="max-tokens" type="range" min="0" max="8192" step="64" class="w-full" bind:value={currentMaxTokens} oninput={(e) => handleMaxTokensInput(parseFloat((e.currentTarget as HTMLInputElement).value))} disabled={$chatIsStreamingStore} />
-        </div>
-      </div>
-    {/if}
+      {/if}
+    </div>
   </div>
 
   <!-- Empty state for no models configured -->
@@ -392,9 +445,10 @@
   {:else}
     <!-- Messages area -->
     <div
-      class="flex-1 overflow-y-auto mb-4 px-2"
+      class="flex-1 overflow-y-auto px-2"
       bind:this={messagesContainer}
     >
+      <div class="max-w-4xl mx-auto w-full py-6 px-2">
       {#if $chatMessagesStore.length === 0}
         <div class="h-full flex items-center justify-center text-txtsecondary">
           <p>Start a conversation by typing a message below.</p>
@@ -415,10 +469,12 @@
           />
         {/each}
       {/if}
+      </div>
     </div>
 
     <!-- Input area -->
-    <div class="shrink-0">
+    <div class="shrink-0 sticky bottom-0 z-20 bg-background/95 backdrop-blur border-t border-gray-200/70 dark:border-white/10">
+      <div class="max-w-4xl mx-auto w-full px-4 py-3">
       <!-- Image preview strip -->
       {#if attachedImages.length > 0}
         <div class="mb-2 flex flex-wrap gap-2">
@@ -448,7 +504,7 @@
         </div>
       {/if}
 
-      <div class="flex gap-2">
+      <div role="group" aria-label="Message input and attachments" class="flex items-end gap-2 rounded-[1.6rem] border border-gray-300/80 dark:border-white/10 bg-surface px-2.5 py-2 shadow-sm">
         <!-- Hidden file input -->
         <input
           type="file"
@@ -459,38 +515,51 @@
           onchange={handleImageSelect}
         />
 
+        <div class="relative shrink-0">
+        {#if !$chatIsStreamingStore}
+          <button
+            class="btn w-9 h-9 rounded-full p-0 flex items-center justify-center"
+            onclick={() => fileInput?.click()}
+            disabled={$chatIsStreamingStore || !$selectedModelStore || isModelLoading}
+            title="Attach image"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4">
+              <path fill-rule="evenodd" d="M1 5.25A2.25 2.25 0 0 1 3.25 3h13.5A2.25 2.25 0 0 1 19 5.25v9.5A2.25 2.25 0 0 1 16.75 17H3.25A2.25 2.25 0 0 1 1 14.75v-9.5Zm1.5 5.81v3.69c0 .414.336.75.75.75h13.5a.75.75 0 0 0 .75-.75v-2.69l-2.22-2.219a.75.75 0 0 0-1.06 0l-1.91 1.909.47.47a.75.75 0 1 1-1.06 1.06L6.53 8.091a.75.75 0 0 0-1.06 0l-2.97 2.97ZM12 7a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" clip-rule="evenodd" />
+            </svg>
+          </button>
+        {/if}
+        </div>
+
         <ExpandableTextarea
           bind:value={userInput}
-          placeholder="Type a message..."
+          placeholder="Ask anything..."
           rows={3}
           onkeydown={handleKeyDown}
-          disabled={$chatIsStreamingStore || !$selectedModelStore}
+          disabled={$chatIsStreamingStore || !$selectedModelStore || isModelLoading}
         />
-        <div class="flex flex-col gap-2">
+        <div class="relative shrink-0">
+          <ModelSelector bind:value={$selectedModelStore} placeholder="Select a model..." disabled={$chatIsStreamingStore} />
+        </div>
+        <div class="shrink-0">
           {#if $chatIsStreamingStore}
-            <button class="btn bg-red-500 hover:bg-red-600 text-white" onclick={cancelStreaming}>
+            <button class="btn bg-red-500 hover:bg-red-600 text-white w-9 h-9 rounded-full p-0 flex items-center justify-center" onclick={cancelStreaming} title="Cancel">
               Cancel
             </button>
           {:else}
             <button
-              class="btn"
-              onclick={() => fileInput?.click()}
-              disabled={$chatIsStreamingStore || !$selectedModelStore}
-              title="Attach image"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
-                <path fill-rule="evenodd" d="M1 5.25A2.25 2.25 0 0 1 3.25 3h13.5A2.25 2.25 0 0 1 19 5.25v9.5A2.25 2.25 0 0 1 16.75 17H3.25A2.25 2.25 0 0 1 1 14.75v-9.5Zm1.5 5.81v3.69c0 .414.336.75.75.75h13.5a.75.75 0 0 0 .75-.75v-2.69l-2.22-2.219a.75.75 0 0 0-1.06 0l-1.91 1.909.47.47a.75.75 0 1 1-1.06 1.06L6.53 8.091a.75.75 0 0 0-1.06 0l-2.97 2.97ZM12 7a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z" clip-rule="evenodd" />
-              </svg>
-            </button>
-            <button
-              class="btn bg-primary text-btn-primary-text hover:opacity-90"
+              class="btn bg-primary text-btn-primary-text hover:opacity-90 w-9 h-9 rounded-full p-0 flex items-center justify-center"
               onclick={sendMessage}
-              disabled={(!userInput.trim() && attachedImages.length === 0) || !$selectedModelStore}
+              disabled={(!userInput.trim() && attachedImages.length === 0) || !$selectedModelStore || isModelLoading}
+              title="Send message"
+              aria-label="Send message"
             >
-              Send
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4">
+                <path d="M12 4l6.5 8h-4v8h-5v-8h-4L12 4Z"></path>
+              </svg>
             </button>
           {/if}
         </div>
+      </div>
       </div>
     </div>
   {/if}

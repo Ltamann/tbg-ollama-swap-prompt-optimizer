@@ -14,15 +14,15 @@ func selectEncoding(acceptEncoding string) (encoding, ext string) {
 
 	for _, part := range strings.Split(acceptEncoding, ",") {
 		enc := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
-		if enc == "gzip" {
-			return "gzip", ".gz"
+		if enc == "br" {
+			return "br", ".br"
 		}
 	}
 
 	for _, part := range strings.Split(acceptEncoding, ",") {
 		enc := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
-		if enc == "br" {
-			return "br", ".br"
+		if enc == "gzip" {
+			return "gzip", ".gz"
 		}
 	}
 

@@ -74,7 +74,7 @@ import urllib.request
 
 ASSET_NAME = "${ASSET_NAME}"
 
-with urllib.request.urlopen("https://api.github.com/repos/mostlygeek/llama-swap/releases/latest") as resp:
+with urllib.request.urlopen("https://api.github.com/repos/Ltamann/tbg-ollama-swap-prompt-optimizer/releases/latest") as resp:
     data = json.load(resp)
     for asset in data.get("assets", []):
         if ASSET_NAME in asset.get("name", ""):

@@ -8,6 +8,7 @@ const LOG_LENGTH_LIMIT = 1024 * 100; /* 100KB of log data */
 export const models = writable<Model[]>([]);
 export const proxyLogs = writable<string>("");
 export const upstreamLogs = writable<string>("");
+export const transformLogs = writable<string>("");
 export const metrics = writable<Metrics[]>([]);
 export const versionInfo = writable<VersionInfo>({
   build_date: "unknown",
@@ -17,7 +18,7 @@ export const versionInfo = writable<VersionInfo>({
 
 let apiEventSource: EventSource | null = null;
 
-function appendLog(newData: string, store: typeof proxyLogs | typeof upstreamLogs): void {
+function appendLog(newData: string, store: typeof proxyLogs | typeof upstreamLogs | typeof transformLogs): void {
   store.update((prev) => {
     const updatedLog = prev + newData;
     return updatedLog.length > LOG_LENGTH_LIMIT ? updatedLog.slice(-LOG_LENGTH_LIMIT) : updatedLog;
@@ -28,7 +29,7 @@ export function enableAPIEvents(enabled: boolean): void {
   if (!enabled) {
     apiEventSource?.close();
     apiEventSource = null;
-    metrics.set([]);
+    transformLogs.set("");
     return;
   }
 
@@ -42,10 +43,10 @@ export function enableAPIEvents(enabled: boolean): void {
     connectionState.set("connecting");
 
     apiEventSource.onopen = () => {
-      // Clear everything on connect to keep things in sync
+      // Keep metrics across reconnects so Activity survives model swaps/reloads
       proxyLogs.set("");
       upstreamLogs.set("");
-      metrics.set([]);
+      transformLogs.set("");
       models.set([]);
       retryCount = 0;
       connectionState.set("connected");
@@ -73,6 +74,9 @@ export function enableAPIEvents(enabled: boolean): void {
                 break;
               case "upstream":
                 appendLog(logData.data, upstreamLogs);
+                break;
+              case "transform":
+                appendLog(logData.data, transformLogs);
                 break;
             }
             break;
@@ -246,6 +250,95 @@ export async function setModelFitMode(model: string, fit: boolean, mode: "max" |
 
   if (!response.ok) {
     throw new Error(`Failed to set fit mode for ${model}: ${response.status}`);
+  }
+}
+
+export async function refreshConfig(): Promise<void> {
+  try {
+    const response = await fetch(`/api/config/reload`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to refresh config: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to refresh config:", error);
+    throw error;
+  }
+}
+
+export async function restartTBGSwap(): Promise<void> {
+  try {
+    const response = await fetch(`/api/restart`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to restart TBG swap: ${response.status}`);
+    }
+  } catch (error) {
+    console.error("Failed to restart TBG swap:", error);
+    throw error;
+  }
+}
+
+export async function getModelTransformBypass(model: string): Promise<boolean> {
+  try {
+    const response = await fetch(`/api/model/${encodeURIComponent(model)}/transform-bypass`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch transform bypass for ${model}: ${response.status}`);
+    }
+    const data = (await response.json()) as { enabled?: boolean };
+    return data.enabled === true;
+  } catch (error) {
+    console.error("Failed to fetch transform bypass:", model, error);
+    return false;
+  }
+}
+
+export async function setModelTransformBypass(model: string, enabled: boolean): Promise<void> {
+  const response = await fetch(`/api/model/${encodeURIComponent(model)}/transform-bypass`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ enabled }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to set transform bypass for ${model}: ${response.status}`);
+  }
+}
+
+export type TransformMode = "raw" | "completions_bridge" | "responses";
+
+export async function getModelTransformMode(model: string): Promise<TransformMode> {
+  try {
+    const response = await fetch(`/api/model/${encodeURIComponent(model)}/transform-mode`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch transform mode for ${model}: ${response.status}`);
+    }
+    const data = (await response.json()) as { mode?: TransformMode };
+    if (data.mode === "raw" || data.mode === "responses" || data.mode === "completions_bridge") {
+      return data.mode;
+    }
+    return "completions_bridge";
+  } catch (error) {
+    console.error("Failed to fetch transform mode:", model, error);
+    return "completions_bridge";
+  }
+}
+
+export async function setModelTransformMode(model: string, mode: TransformMode): Promise<void> {
+  const response = await fetch(`/api/model/${encodeURIComponent(model)}/transform-mode`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ mode }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to set transform mode for ${model}: ${response.status}`);
   }
 }
 

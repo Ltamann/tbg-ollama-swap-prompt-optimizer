@@ -7,12 +7,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -99,6 +100,69 @@ func TestMetricsMonitor_AddMetrics(t *testing.T) {
 	})
 }
 
+func TestMetricsMonitor_UpstreamLogParsing(t *testing.T) {
+	mm := newMetricsMonitor(testLogger, 10, 0)
+
+	logChunk := strings.Join([]string{
+		"slot print_timing: id  0 | task 0 | ",
+		"prompt eval time =     258.99 ms /    14 tokens (   18.50 ms per token,    54.06 tokens per second)",
+		"       eval time =      55.05 ms /     2 tokens (   27.52 ms per token,    36.33 tokens per second)",
+		"      total time =     314.03 ms /    16 tokens",
+		"srv  log_server_r: done request: POST /v1/responses 127.0.0.1 200",
+	}, "\n") + "\n"
+
+	mm.ingestUpstreamLog("model-a", []byte(logChunk))
+
+	metric := mm.consumeUpstreamMetric("model-a", "/v1/responses", time.Now().Add(-1*time.Second), 10*time.Millisecond)
+	if assert.NotNil(t, metric) {
+		assert.Equal(t, 14, metric.InputTokens)
+		assert.Equal(t, 2, metric.OutputTokens)
+		assert.InDelta(t, 54.06, metric.PromptPerSecond, 0.01)
+		assert.InDelta(t, 36.33, metric.TokensPerSecond, 0.01)
+		assert.Equal(t, 314, metric.DurationMs)
+	}
+}
+
+func TestMetricsMonitor_WrapHandler_ResponsesUsesUpstreamTimings(t *testing.T) {
+	mm := newMetricsMonitor(testLogger, 10, 0)
+
+	responseBody := `{"usage":{"input_tokens":14,"output_tokens":2,"total_tokens":16}}`
+
+	nextHandler := func(modelID string, w http.ResponseWriter, r *http.Request) error {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			logChunk := strings.Join([]string{
+				"prompt eval time =     258.99 ms /    14 tokens (   18.50 ms per token,    54.06 tokens per second)",
+				"       eval time =      55.05 ms /     2 tokens (   27.52 ms per token,    36.33 tokens per second)",
+				"      total time =     314.03 ms /    16 tokens",
+				"srv  log_server_r: done request: POST /v1/responses 127.0.0.1 200",
+			}, "\n") + "\n"
+			mm.ingestUpstreamLog(modelID, []byte(logChunk))
+		}()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(responseBody))
+		return nil
+	}
+
+	req := httptest.NewRequest("POST", "/v1/responses", nil)
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+
+	err := mm.wrapHandler("test-model", ginCtx.Writer, req, nextHandler)
+	assert.NoError(t, err)
+
+	metrics := mm.getMetrics()
+	if assert.Len(t, metrics, 1) {
+		assert.Equal(t, 14, metrics[0].InputTokens)
+		assert.Equal(t, 2, metrics[0].OutputTokens)
+		assert.InDelta(t, 54.06, metrics[0].PromptPerSecond, 0.01)
+		assert.InDelta(t, 36.33, metrics[0].TokensPerSecond, 0.01)
+		assert.Equal(t, 314, metrics[0].DurationMs)
+	}
+}
+
 func TestMetricsMonitor_GetMetrics(t *testing.T) {
 	t.Run("returns empty slice when no metrics", func(t *testing.T) {
 		mm := newMetricsMonitor(testLogger, 10, 0)
@@ -178,6 +242,7 @@ func TestMetricsMonitor_WrapHandler(t *testing.T) {
 		}`
 
 		nextHandler := func(modelID string, w http.ResponseWriter, r *http.Request) error {
+			time.Sleep(20 * time.Millisecond)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(responseBody))
@@ -196,6 +261,9 @@ func TestMetricsMonitor_WrapHandler(t *testing.T) {
 		assert.Equal(t, "test-model", metrics[0].Model)
 		assert.Equal(t, 100, metrics[0].InputTokens)
 		assert.Equal(t, 50, metrics[0].OutputTokens)
+		assert.Greater(t, metrics[0].DurationMs, 0)
+		assert.Equal(t, -1.0, metrics[0].PromptPerSecond)
+		assert.Equal(t, -1.0, metrics[0].TokensPerSecond)
 	})
 
 	t.Run("successful request with timings data", func(t *testing.T) {
@@ -291,7 +359,9 @@ data: [DONE]
 		assert.NoError(t, err)
 
 		metrics := mm.getMetrics()
-		assert.Equal(t, 0, len(metrics))
+		if assert.Len(t, metrics, 1) {
+			assert.Equal(t, http.StatusBadRequest, metrics[0].StatusCode)
+		}
 	})
 
 	t.Run("empty response body records minimal metrics", func(t *testing.T) {
@@ -1124,5 +1194,40 @@ func TestMetricsMonitor_WrapHandler_Capture(t *testing.T) {
 		// But no capture
 		capture := mm.getCaptureByID(metrics[0].ID)
 		assert.Nil(t, capture)
+	})
+
+	t.Run("captures failed requests when enabled", func(t *testing.T) {
+		mm := newMetricsMonitor(testLogger, 10, 5)
+
+		requestBody := `{"model":"test","input":"hi","tools":[{"type":"shell"}]}`
+		responseBody := `{"error":{"code":400,"message":"'type' of tool must be 'function'"}}`
+
+		nextHandler := func(modelID string, w http.ResponseWriter, r *http.Request) error {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(responseBody))
+			return nil
+		}
+
+		req := httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(requestBody))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(rec)
+
+		err := mm.wrapHandler("test-model", ginCtx.Writer, req, nextHandler)
+		assert.NoError(t, err)
+
+		metrics := mm.getMetrics()
+		if assert.Len(t, metrics, 1) {
+			assert.Equal(t, http.StatusBadRequest, metrics[0].StatusCode)
+			assert.True(t, metrics[0].HasCapture)
+		}
+
+		capture := mm.getCaptureByID(metrics[0].ID)
+		if assert.NotNil(t, capture) {
+			assert.Equal(t, []byte(requestBody), capture.ReqBody)
+			assert.Equal(t, []byte(responseBody), capture.RespBody)
+			assert.Equal(t, "/v1/responses", capture.ReqPath)
+		}
 	})
 }

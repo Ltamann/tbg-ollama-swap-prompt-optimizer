@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
 	"github.com/gin-gonic/gin"
-	"github.com/mostlygeek/llama-swap/event"
 )
 
 type Model struct {
@@ -29,6 +29,8 @@ type Model struct {
 	CtxSource                  string  `json:"ctxSource,omitempty"`
 	FitEnabled                 bool    `json:"fitEnabled,omitempty"`
 	FitCtxMode                 string  `json:"fitCtxMode,omitempty"`
+	TransformBypass            bool    `json:"transformBypass,omitempty"`
+	TransformMode              string  `json:"transformMode,omitempty"`
 	TempConfigured             float64 `json:"tempConfigured"`
 	TopPConfigured             float64 `json:"topPConfigured"`
 	TopKConfigured             int     `json:"topKConfigured"`
@@ -45,6 +47,8 @@ func addApiHandlers(pm *ProxyManager) {
 		apiGroup.POST("/models/unload", pm.apiUnloadAllModels)
 		apiGroup.POST("/models/kill-llama-cpp", pm.apiKillAllLlamaCpp)
 		apiGroup.POST("/models/unload/*model", pm.apiUnloadSingleModelHandler)
+		apiGroup.POST("/config/reload", pm.apiReloadConfig)
+		apiGroup.POST("/restart", pm.apiRestart)
 		apiGroup.GET("/events", pm.apiSendEvents)
 		apiGroup.GET("/metrics", pm.apiGetMetrics)
 		apiGroup.GET("/version", pm.apiGetVersion)
@@ -61,6 +65,10 @@ func addApiHandlers(pm *ProxyManager) {
 	ctxSizeGroup.POST("/:model/prompt-optimization", pm.apiSetPromptOptimization)
 	ctxSizeGroup.GET("/:model/prompt-optimization", pm.apiGetPromptOptimization)
 	ctxSizeGroup.GET("/:model/prompt-optimization/latest", pm.apiGetLatestPromptOptimization)
+	ctxSizeGroup.POST("/:model/transform-mode", pm.apiSetTransformMode)
+	ctxSizeGroup.GET("/:model/transform-mode", pm.apiGetTransformMode)
+	ctxSizeGroup.POST("/:model/transform-bypass", pm.apiSetTransformBypass)
+	ctxSizeGroup.GET("/:model/transform-bypass", pm.apiGetTransformBypass)
 }
 
 func (pm *ProxyManager) apiUnloadAllModels(c *gin.Context) {
@@ -102,6 +110,21 @@ func (pm *ProxyManager) apiKillAllLlamaCpp(c *gin.Context) {
 		outStr = "llama.cpp processes killed"
 	}
 	c.JSON(http.StatusOK, gin.H{"msg": "ok", "detail": outStr})
+}
+
+func (pm *ProxyManager) apiReloadConfig(c *gin.Context) {
+	event.Emit(ConfigFileChangedEvent{
+		ReloadingState: ReloadingStateStart,
+	})
+	c.JSON(http.StatusOK, gin.H{"msg": "ok"})
+}
+
+func (pm *ProxyManager) apiRestart(c *gin.Context) {
+	pm.StopProcesses(StopImmediately)
+	event.Emit(ConfigFileChangedEvent{
+		ReloadingState: ReloadingStateStart,
+	})
+	c.JSON(http.StatusOK, gin.H{"msg": "ok"})
 }
 
 func (pm *ProxyManager) getModelStatus() []Model {
@@ -147,6 +170,7 @@ func (pm *ProxyManager) getModelStatus() []Model {
 		pm.Lock()
 		runtimeFit, hasFitOverride := pm.fitModes[modelID]
 		runtimeFitCtxMode, hasFitCtxModeOverride := pm.fitCtxModes[modelID]
+		transformMode := normalizeTransformMode(pm.transformModes[modelID])
 		pm.Unlock()
 		fitEnabled := fitFromConfig
 		if hasFitOverride {
@@ -160,16 +184,18 @@ func (pm *ProxyManager) getModelStatus() []Model {
 		}
 
 		model := Model{
-			Id:            modelID,
-			Name:          pm.config.Models[modelID].Name,
-			Description:   pm.config.Models[modelID].Description,
-			State:         state,
-			Unlisted:      pm.config.Models[modelID].Unlisted,
-			Provider:      "llama",
-			CtxConfigured: configCtx,
-			CtxSource:     ctxSource,
-			FitEnabled:    fitEnabled,
-			FitCtxMode:    fitCtxMode,
+			Id:              modelID,
+			Name:            pm.config.Models[modelID].Name,
+			Description:     pm.config.Models[modelID].Description,
+			State:           state,
+			Unlisted:        pm.config.Models[modelID].Unlisted,
+			Provider:        "llama",
+			CtxConfigured:   configCtx,
+			CtxSource:       ctxSource,
+			FitEnabled:      fitEnabled,
+			FitCtxMode:      fitCtxMode,
+			TransformBypass: transformMode == TransformModeRaw,
+			TransformMode:   string(transformMode),
 		}
 		model.TempConfigured = samplingConfigured.temp
 		model.TopPConfigured = samplingConfigured.topP
@@ -404,6 +430,9 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 	defer pm.upstreamLogger.OnLogData(func(data []byte) {
 		sendLogData("upstream", data)
 	})()
+	defer pm.transformLogger.OnLogData(func(data []byte) {
+		sendLogData("transform", data)
+	})()
 
 	/**
 	 * Send Metrics data
@@ -415,6 +444,7 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 	// send initial batch of data
 	sendLogData("proxy", pm.proxyLogger.GetHistory())
 	sendLogData("upstream", pm.upstreamLogger.GetHistory())
+	sendLogData("transform", pm.transformLogger.GetHistory())
 	sendModels()
 	sendMetrics(pm.metricsMonitor.getMetrics())
 
@@ -646,6 +676,14 @@ type SetPromptOptimizationRequest struct {
 	Policy PromptOptimizationPolicy `json:"policy"`
 }
 
+type SetTransformBypassRequest struct {
+	Enabled bool `json:"enabled"`
+}
+
+type SetTransformModeRequest struct {
+	Mode RequestTransformMode `json:"mode"`
+}
+
 func (pm *ProxyManager) apiSetPromptOptimization(c *gin.Context) {
 	requestedModel := strings.TrimSpace(c.Param("model"))
 	if requestedModel == "" {
@@ -719,6 +757,116 @@ func (pm *ProxyManager) apiGetPromptOptimization(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"model":  modelName,
 		"policy": policy,
+	})
+}
+
+func (pm *ProxyManager) apiSetTransformBypass(c *gin.Context) {
+	requestedModel := strings.TrimSpace(c.Param("model"))
+	if requestedModel == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "model name required")
+		return
+	}
+
+	modelName, found := pm.config.RealModelName(requestedModel)
+	if !found {
+		pm.sendErrorResponse(c, http.StatusNotFound, "model not found")
+		return
+	}
+
+	var req SetTransformBypassRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+
+	mode := TransformModeCompletionsBridge
+	if req.Enabled {
+		mode = TransformModeRaw
+	}
+	pm.Lock()
+	pm.transformModes[modelName] = mode
+	pm.Unlock()
+
+	c.JSON(http.StatusOK, gin.H{
+		"msg":     "transform bypass set successfully",
+		"model":   modelName,
+		"enabled": req.Enabled,
+		"mode":    mode,
+	})
+}
+
+func (pm *ProxyManager) apiGetTransformBypass(c *gin.Context) {
+	requestedModel := strings.TrimSpace(c.Param("model"))
+	if requestedModel == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "model name required")
+		return
+	}
+
+	modelName, found := pm.config.RealModelName(requestedModel)
+	if !found {
+		pm.sendErrorResponse(c, http.StatusNotFound, "model not found")
+		return
+	}
+
+	mode := pm.getTransformMode(modelName)
+
+	c.JSON(http.StatusOK, gin.H{
+		"model":   modelName,
+		"enabled": mode == TransformModeRaw,
+		"mode":    mode,
+	})
+}
+
+func (pm *ProxyManager) apiSetTransformMode(c *gin.Context) {
+	requestedModel := strings.TrimSpace(c.Param("model"))
+	if requestedModel == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "model name required")
+		return
+	}
+
+	modelName, found := pm.config.RealModelName(requestedModel)
+	if !found {
+		pm.sendErrorResponse(c, http.StatusNotFound, "model not found")
+		return
+	}
+
+	var req SetTransformModeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+
+	mode := normalizeTransformMode(req.Mode)
+	pm.Lock()
+	pm.transformModes[modelName] = mode
+	pm.Unlock()
+
+	c.JSON(http.StatusOK, gin.H{
+		"msg":   "transform mode set successfully",
+		"model": modelName,
+		"mode":  mode,
+	})
+}
+
+func (pm *ProxyManager) apiGetTransformMode(c *gin.Context) {
+	requestedModel := strings.TrimSpace(c.Param("model"))
+	if requestedModel == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "model name required")
+		return
+	}
+
+	modelName, found := pm.config.RealModelName(requestedModel)
+	if !found {
+		pm.sendErrorResponse(c, http.StatusNotFound, "model not found")
+		return
+	}
+
+	mode := pm.getTransformMode(modelName)
+	c.JSON(http.StatusOK, gin.H{
+		"model":  modelName,
+		"mode":   mode,
+		"raw":    mode == TransformModeRaw,
+		"native": mode == TransformModeResponses,
 	})
 }
 

@@ -48,7 +48,7 @@ SD_IMAGE=${BASE_SDCPP_IMAGE:-ghcr.io/leejet/stable-diffusion.cpp}
 
 # Set llama-swap repository, automatically uses GITHUB_REPOSITORY variable
 # to enable easy container builds on forked repos
-LS_REPO=${GITHUB_REPOSITORY:-mostlygeek/llama-swap}
+LS_REPO=${GITHUB_REPOSITORY:-Ltamann/tbg-ollama-swap-prompt-optimizer}
 
 # the most recent llama-swap tag
 # have to strip out the 'v' due to .tar.gz file naming
