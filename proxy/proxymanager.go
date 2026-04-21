@@ -62,6 +62,7 @@ func stripTopLevelParam(bodyBytes []byte, paramName string) ([]byte, error) {
 
 // normalizeChatCompletionTools converts Responses-style top-level function tools
 // into the nested chat.completions format expected by llama.cpp-compatible servers.
+
 func normalizeChatCompletionTools(bodyBytes []byte) ([]byte, error) {
 	var data map[string]any
 	if err := json.Unmarshal(bodyBytes, &data); err != nil {
@@ -82,67 +83,36 @@ func normalizeChatCompletionTools(bodyBytes []byte) ([]byte, error) {
 			continue
 		}
 
-		toolType, _ := tool["type"].(string)
-		if toolType != "function" {
-			// Convert non-function tools (e.g. Codex custom types) to function format
-			name, _ := tool["name"].(string)
-			if strings.TrimSpace(name) == "" {
-				normalizedTools = append(normalizedTools, rawTool)
+		if fn, ok := tool["function"].(map[string]any); ok {
+			if name, _ := fn["name"].(string); strings.TrimSpace(name) != "" {
+				normalizedTools = append(normalizedTools, map[string]any{
+					"type":     "function",
+					"function": fn,
+				})
 				continue
 			}
-			fn := map[string]any{"name": name}
-			if desc, ok := tool["description"]; ok {
-				fn["description"] = desc
-			}
-			if params, ok := tool["parameters"]; ok {
-				fn["parameters"] = params
-			}
-			if strict, ok := tool["strict"]; ok {
-				fn["strict"] = strict
-			}
-			flat := map[string]any{
-				"type": "function",
-				"name": name,
-			}
-			if description, ok := fn["description"]; ok {
-				flat["description"] = description
-			}
-			if parameters, ok := fn["parameters"]; ok {
-				flat["parameters"] = parameters
-			}
-			if strict, ok := fn["strict"]; ok {
-				flat["strict"] = strict
-			}
-			normalizedTools = append(normalizedTools, flat)
-			continue
-		}
-		if _, hasNested := tool["function"]; hasNested {
-			normalizedTools = append(normalizedTools, rawTool)
-			continue
 		}
 
 		name, _ := tool["name"].(string)
-		if strings.TrimSpace(name) == "" {
+		name = strings.TrimSpace(name)
+		if name == "" {
 			normalizedTools = append(normalizedTools, rawTool)
 			continue
 		}
 
-		function := map[string]any{
-			"name": name,
+		fn := map[string]any{"name": name}
+		if desc, ok := tool["description"]; ok {
+			fn["description"] = desc
 		}
-		if description, ok := tool["description"]; ok {
-			function["description"] = description
-		}
-		if parameters, ok := tool["parameters"]; ok {
-			function["parameters"] = parameters
+		if params, ok := tool["parameters"]; ok {
+			fn["parameters"] = params
 		}
 		if strict, ok := tool["strict"]; ok {
-			function["strict"] = strict
+			fn["strict"] = strict
 		}
-
 		normalizedTools = append(normalizedTools, map[string]any{
 			"type":     "function",
-			"function": function,
+			"function": fn,
 		})
 		changed = true
 	}
@@ -150,7 +120,6 @@ func normalizeChatCompletionTools(bodyBytes []byte) ([]byte, error) {
 	if !changed {
 		return bodyBytes, nil
 	}
-
 	data["tools"] = normalizedTools
 	result, err := json.Marshal(data)
 	if err != nil {
@@ -158,6 +127,7 @@ func normalizeChatCompletionTools(bodyBytes []byte) ([]byte, error) {
 	}
 	return result, nil
 }
+
 
 func normalizeResponsesRequest(bodyBytes []byte) ([]byte, []string, []string, error) {
 	var data map[string]any
@@ -220,71 +190,6 @@ func injectQwenResponsesToolPolicy(data map[string]any, adaptedTools []string) b
 		"content": policy,
 	}}, input...)
 	return true
-}
-
-// injectQwenChatCompletionsToolPolicy injects the same Qwen tool policy into a
-// chat-completions request body. This is used by the completions_bridge path
-// after the Responses request has already been translated to chat format.
-func injectQwenChatCompletionsToolPolicy(bodyBytes []byte, modelName string, adaptedTools []string) ([]byte, bool) {
-	if !isQwenModelName(modelName) || len(adaptedTools) == 0 {
-		return bodyBytes, false
-	}
-
-	policy := buildQwenResponsesToolPolicy(adaptedTools)
-	if policy == "" {
-		return bodyBytes, false
-	}
-
-	var data map[string]any
-	if err := json.Unmarshal(bodyBytes, &data); err != nil {
-		return bodyBytes, false
-	}
-
-	rawMessages, _ := data["messages"].([]any)
-	if len(rawMessages) == 0 {
-		data["messages"] = []any{
-			map[string]any{
-				"role":    "system",
-				"content": policy,
-			},
-		}
-	} else {
-		found := false
-		for idx, rawMessage := range rawMessages {
-			message, ok := rawMessage.(map[string]any)
-			if !ok {
-				continue
-			}
-
-			role, _ := message["role"].(string)
-			if !strings.EqualFold(strings.TrimSpace(role), "system") {
-				continue
-			}
-
-			rewritten := cloneMap(message)
-			rewritten["content"] = appendPolicyToMessageContent(message["content"], policy)
-			rawMessages[idx] = rewritten
-			data["messages"] = rawMessages
-			found = true
-			break
-		}
-
-		if !found {
-			data["messages"] = append([]any{
-				map[string]any{
-					"role":    "system",
-					"content": policy,
-				},
-			}, rawMessages...)
-		}
-	}
-
-	result, err := json.Marshal(data)
-	if err != nil {
-		return bodyBytes, false
-	}
-
-	return result, true
 }
 
 func isQwenModelName(modelName string) bool {
@@ -370,12 +275,9 @@ func normalizeResponsesToolsMap(data map[string]any) ([]string, []string, bool) 
 		}
 
 		toolType, _ := tool["type"].(string)
-		toolType = strings.TrimSpace(toolType)
-
 		switch toolType {
 		case "function":
-			normalizedTools = append(normalizedTools, flattenFunctionTool(tool))
-			changed = true
+			normalizedTools = append(normalizedTools, rawTool)
 		case "shell":
 			normalizedTools = append(normalizedTools, buildResponsesShellFunctionTool())
 			adapted = appendIfMissing(adapted, "shell")
@@ -404,53 +306,36 @@ func normalizeResponsesToolsMap(data map[string]any) ([]string, []string, bool) 
 			normalizedTools = append(normalizedTools, buildResponsesComputerFunctionTool())
 			adapted = appendIfMissing(adapted, toolType)
 			changed = true
-		case "", "custom":
+		case "computer_use_preview":
+			unsupported = appendIfMissing(unsupported, toolType)
+			changed = true
+		default:
+			// Unknown tool types are treated as custom function tools when possible.
 			name, _ := tool["name"].(string)
 			name = strings.TrimSpace(name)
 			if name == "" {
-				unsupported = appendIfMissing(unsupported, "custom")
-				normalizedTools = append(normalizedTools, rawTool)
+				unsupported = appendIfMissing(unsupported, toolType)
+				changed = true
 				continue
 			}
 
-			adapted = appendIfMissing(adapted, name)
+			adapted = appendIfMissing(adapted, toolType)
 			changed = true
-
-			fn := map[string]any{"name": name}
-			if description, ok := tool["description"]; ok {
-				fn["description"] = description
-			}
-			if parameters, ok := tool["parameters"]; ok {
-				fn["parameters"] = parameters
-			}
-			if strict, ok := tool["strict"]; ok {
-				fn["strict"] = strict
-			}
-
-			flat := map[string]any{
+			normalizedTools = append(normalizedTools, map[string]any{
 				"type": "function",
-				"name": name,
-			}
-			if description, ok := fn["description"]; ok {
-				flat["description"] = description
-			}
-			if parameters, ok := fn["parameters"]; ok {
-				flat["parameters"] = parameters
-			}
-			if strict, ok := fn["strict"]; ok {
-				flat["strict"] = strict
-			}
-			normalizedTools = append(normalizedTools, flat)
-		default:
-			unsupported = appendIfMissing(unsupported, toolType)
-			normalizedTools = append(normalizedTools, rawTool)
+				"function": map[string]any{
+					"name":        name,
+					"description": tool["description"],
+					"parameters":  tool["parameters"],
+					"strict":      tool["strict"],
+				},
+			})
 		}
 	}
 
 	if changed {
 		data["tools"] = normalizedTools
 	}
-
 	return adapted, unsupported, changed
 }
 
@@ -666,19 +551,23 @@ func moveSystemMessagesToFront(items []any) ([]any, bool) {
 	return reordered, true
 }
 
+
 func mergeLeadingSystemMessages(items []any) ([]any, bool) {
 	if len(items) < 2 {
 		return items, false
 	}
 
 	systemCount := 0
-	mergedContent := make([]any, 0)
+	mergedParts := make([]string, 0)
+	mergedArrayParts := make([]any, 0)
+	useArrayContent := false
 
 	for _, item := range items {
 		m, ok := item.(map[string]any)
 		if !ok {
 			break
 		}
+
 		itemType, _ := m["type"].(string)
 		role, _ := m["role"].(string)
 		if itemType != "message" || !strings.EqualFold(strings.TrimSpace(role), "system") {
@@ -686,8 +575,32 @@ func mergeLeadingSystemMessages(items []any) ([]any, bool) {
 		}
 
 		systemCount++
-		if content, ok := m["content"].([]any); ok {
-			mergedContent = append(mergedContent, content...)
+		switch typed := m["content"].(type) {
+		case []any:
+			useArrayContent = true
+			for _, part := range typed {
+				text := strings.TrimSpace(extractResponsesInputText(part))
+				if text != "" {
+					mergedParts = append(mergedParts, text)
+					mergedArrayParts = append(mergedArrayParts, map[string]any{"type": "input_text", "text": text})
+				}
+			}
+		case string:
+			text := strings.TrimSpace(typed)
+			if text != "" {
+				mergedParts = append(mergedParts, text)
+				if useArrayContent {
+					mergedArrayParts = append(mergedArrayParts, map[string]any{"type": "input_text", "text": text})
+				}
+			}
+		default:
+			text := strings.TrimSpace(extractResponsesInputText(typed))
+			if text != "" {
+				mergedParts = append(mergedParts, text)
+				if useArrayContent {
+					mergedArrayParts = append(mergedArrayParts, map[string]any{"type": "input_text", "text": text})
+				}
+			}
 		}
 	}
 
@@ -701,7 +614,12 @@ func mergeLeadingSystemMessages(items []any) ([]any, bool) {
 	}
 
 	mergedFirst := cloneMap(firstMessage)
-	mergedFirst["content"] = mergedContent
+	joined := strings.TrimSpace(strings.Join(mergedParts, "\n\n"))
+	if useArrayContent {
+		mergedFirst["content"] = mergedArrayParts
+	} else {
+		mergedFirst["content"] = joined
+	}
 
 	rewritten := make([]any, 0, len(items)-systemCount+1)
 	rewritten = append(rewritten, mergedFirst)
@@ -709,53 +627,6 @@ func mergeLeadingSystemMessages(items []any) ([]any, bool) {
 	return rewritten, true
 }
 
-func buildFlatFunctionTool(name string, description string, parameters map[string]any) map[string]any {
-	tool := map[string]any{
-		"type": "function",
-		"name": name,
-	}
-	if strings.TrimSpace(description) != "" {
-		tool["description"] = description
-	}
-	if len(parameters) > 0 {
-		tool["parameters"] = parameters
-	}
-	return tool
-}
-
-func flattenFunctionTool(tool map[string]any) map[string]any {
-	if fn, ok := tool["function"].(map[string]any); ok {
-		flat := map[string]any{"type": "function"}
-		if name, _ := fn["name"].(string); strings.TrimSpace(name) != "" {
-			flat["name"] = strings.TrimSpace(name)
-		}
-		if description, ok := fn["description"]; ok {
-			flat["description"] = description
-		}
-		if parameters, ok := fn["parameters"]; ok {
-			flat["parameters"] = parameters
-		}
-		if strict, ok := fn["strict"]; ok {
-			flat["strict"] = strict
-		}
-		return flat
-	}
-
-	flat := map[string]any{"type": "function"}
-	if name, _ := tool["name"].(string); strings.TrimSpace(name) != "" {
-		flat["name"] = strings.TrimSpace(name)
-	}
-	if description, ok := tool["description"]; ok {
-		flat["description"] = description
-	}
-	if parameters, ok := tool["parameters"]; ok {
-		flat["parameters"] = parameters
-	}
-	if strict, ok := tool["strict"]; ok {
-		flat["strict"] = strict
-	}
-	return flat
-}
 
 func buildResponsesShellFunctionTool() map[string]any {
 	return map[string]any{
@@ -924,160 +795,6 @@ func buildResponsesComputerFunctionTool() map[string]any {
 	}
 }
 
-func extractAdaptedToolsFromResponsesRequest(req map[string]any) []string {
-	rawTools, ok := req["tools"].([]any)
-	if !ok || len(rawTools) == 0 {
-		return nil
-	}
-
-	adapted := make([]string, 0, len(rawTools))
-	for _, rawTool := range rawTools {
-		tool, ok := rawTool.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		if fn, ok := tool["function"].(map[string]any); ok {
-			if name, _ := fn["name"].(string); strings.TrimSpace(name) != "" {
-				adapted = appendIfMissing(adapted, strings.TrimSpace(name))
-			}
-			continue
-		}
-
-		toolType, _ := tool["type"].(string)
-		toolType = strings.TrimSpace(toolType)
-		switch toolType {
-		case "shell", "apply_patch", "web_search", "web_search_preview", "file_search", "code_interpreter", "image_generation", "computer":
-			adapted = appendIfMissing(adapted, toolType)
-		case "", "function", "custom":
-			if name, _ := tool["name"].(string); strings.TrimSpace(name) != "" {
-				adapted = appendIfMissing(adapted, strings.TrimSpace(name))
-			}
-		default:
-			if name, _ := tool["name"].(string); strings.TrimSpace(name) != "" {
-				adapted = appendIfMissing(adapted, strings.TrimSpace(name))
-			} else if toolType != "" {
-				adapted = appendIfMissing(adapted, toolType)
-			}
-		}
-	}
-
-	return adapted
-}
-
-func collectUnsupportedBridgeTools(toolsRaw []any) []string {
-	unsupported := make([]string, 0)
-	for _, rawTool := range toolsRaw {
-		tool, ok := rawTool.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		if fn, ok := tool["function"].(map[string]any); ok {
-			if name, _ := fn["name"].(string); strings.TrimSpace(name) == "" {
-				unsupported = appendIfMissing(unsupported, "function")
-			}
-			continue
-		}
-
-		toolType, _ := tool["type"].(string)
-		toolType = strings.TrimSpace(toolType)
-		switch toolType {
-		case "", "function":
-			name, _ := tool["name"].(string)
-			if strings.TrimSpace(name) == "" {
-				unsupported = appendIfMissing(unsupported, "function")
-			}
-		case "shell", "apply_patch", "web_search", "web_search_preview", "file_search", "code_interpreter", "image_generation", "computer":
-			continue
-		case "custom":
-			name, _ := tool["name"].(string)
-			if strings.TrimSpace(name) == "" {
-				unsupported = appendIfMissing(unsupported, "custom")
-			}
-		default:
-			unsupported = appendIfMissing(unsupported, toolType)
-		}
-	}
-	return unsupported
-}
-
-func translateResponsesToChatCompletionsRequestWithUnsupported(body []byte) ([]byte, []string, error) {
-	var req map[string]any
-	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, nil, err
-	}
-
-	unsupported := make([]string, 0)
-	if toolsRaw, ok := req["tools"].([]any); ok {
-		unsupported = collectUnsupportedBridgeTools(toolsRaw)
-	}
-
-	translated, err := translateResponsesToChatCompletionsRequest(body)
-	if err != nil {
-		return nil, nil, err
-	}
-	return translated, unsupported, nil
-}
-
-func reorderChatMessagesForLlama(messages []map[string]any) []map[string]any {
-	if len(messages) < 2 {
-		return messages
-	}
-
-	systemMessages := make([]map[string]any, 0, len(messages))
-	otherMessages := make([]map[string]any, 0, len(messages))
-	for _, message := range messages {
-		role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", message["role"])))
-		if role == "system" {
-			systemMessages = append(systemMessages, message)
-		} else {
-			otherMessages = append(otherMessages, message)
-		}
-	}
-
-	if len(systemMessages) == 0 || len(otherMessages) == 0 {
-		return mergeLeadingSystemChatMessages(messages)
-	}
-
-	reordered := make([]map[string]any, 0, len(messages))
-	reordered = append(reordered, systemMessages...)
-	reordered = append(reordered, otherMessages...)
-	return mergeLeadingSystemChatMessages(reordered)
-}
-
-func mergeLeadingSystemChatMessages(messages []map[string]any) []map[string]any {
-	if len(messages) < 2 {
-		return messages
-	}
-
-	systemCount := 0
-	mergedParts := make([]string, 0, len(messages))
-	for _, message := range messages {
-		role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", message["role"])))
-		if role != "system" {
-			break
-		}
-		content := strings.TrimSpace(fmt.Sprintf("%v", message["content"]))
-		if content != "" {
-			mergedParts = append(mergedParts, content)
-		}
-		systemCount++
-	}
-
-	if systemCount < 2 {
-		return messages
-	}
-
-	merged := make([]map[string]any, 0, len(messages)-systemCount+1)
-	merged = append(merged, map[string]any{
-		"role":    "system",
-		"content": strings.TrimSpace(strings.Join(mergedParts, "\n\n")),
-	})
-	merged = append(merged, messages[systemCount:]...)
-	return merged
-}
-
 func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -1135,7 +852,6 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	if len(messages) == 0 {
 		messages = []map[string]any{{"role": "user", "content": " "}}
 	}
-	messages = reorderChatMessagesForLlama(messages)
 	for _, message := range messages {
 		content, _ := message["content"].(string)
 		if strings.TrimSpace(content) == "" {
@@ -1144,34 +860,7 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	}
 	out["messages"] = messages
 	out["stream"] = false
-
-	outBytes, err := json.Marshal(out)
-	if err != nil {
-		return nil, err
-	}
-
-	modelName := strings.TrimSpace(fmt.Sprintf("%v", req["model"]))
-	adaptedTools := extractAdaptedToolsFromResponsesRequest(req)
-	if injected, ok := injectQwenChatCompletionsToolPolicy(outBytes, modelName, adaptedTools); ok {
-		var injectedBody map[string]any
-		if err := json.Unmarshal(injected, &injectedBody); err == nil {
-			if rawMessages, ok := injectedBody["messages"].([]any); ok {
-				reordered := make([]map[string]any, 0, len(rawMessages))
-				for _, rawMessage := range rawMessages {
-					if message, ok := rawMessage.(map[string]any); ok {
-						reordered = append(reordered, message)
-					}
-				}
-				injectedBody["messages"] = reorderChatMessagesForLlama(reordered)
-				if fixed, err := json.Marshal(injectedBody); err == nil {
-					return fixed, nil
-				}
-			}
-		}
-		return injected, nil
-	}
-
-	return outBytes, nil
+	return json.Marshal(out)
 }
 
 func normalizeBridgeChatTools(toolsRaw []any) []any {
@@ -1213,19 +902,61 @@ func normalizeBridgeChatTools(toolsRaw []any) []any {
 			}
 			out = append(out, map[string]any{"type": "function", "function": fn})
 		case "shell":
-			out = append(out, buildBridgeShellTool())
+			out = append(out, bridgeToolToChatTool("shell", "Run a shell command.", map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"command": map[string]any{"type": "string"},
+				},
+				"required": []string{"command"},
+			}))
 		case "apply_patch":
-			out = append(out, buildBridgeApplyPatchTool())
+			out = append(out, bridgeToolToChatTool("apply_patch", "Apply a patch to files.", map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"patch": map[string]any{"type": "string"},
+				},
+				"required": []string{"patch"},
+			}))
 		case "web_search", "web_search_preview":
-			out = append(out, buildBridgeWebSearchTool())
+			out = append(out, bridgeToolToChatTool("web_search", "Search the web.", map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query": map[string]any{"type": "string"},
+				},
+				"required": []string{"query"},
+			}))
 		case "file_search":
-			out = append(out, buildBridgeFileSearchTool())
+			out = append(out, bridgeToolToChatTool("file_search", "Search indexed files.", map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query": map[string]any{"type": "string"},
+				},
+				"required": []string{"query"},
+			}))
 		case "code_interpreter":
-			out = append(out, buildBridgeCodeInterpreterTool())
+			out = append(out, bridgeToolToChatTool("code_interpreter", "Run code in an interpreter.", map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"code": map[string]any{"type": "string"},
+				},
+				"required": []string{"code"},
+			}))
 		case "image_generation":
-			out = append(out, buildBridgeImageGenerationTool())
+			out = append(out, bridgeToolToChatTool("image_generation", "Generate an image.", map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"prompt": map[string]any{"type": "string"},
+				},
+				"required": []string{"prompt"},
+			}))
 		case "computer":
-			out = append(out, buildBridgeComputerTool())
+			out = append(out, bridgeToolToChatTool("computer", "Perform a computer action.", map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"action": map[string]any{"type": "string"},
+				},
+				"required": []string{"action"},
+			}))
 		default:
 			// Unknown tool types (e.g. Codex "custom") -> convert to function format
 			name, _ := tool["name"].(string)
@@ -1247,116 +978,6 @@ func normalizeBridgeChatTools(toolsRaw []any) []any {
 		}
 	}
 	return out
-}
-
-func buildBridgeShellTool() map[string]any {
-	return bridgeToolToChatTool("shell", "Run a shell command.", map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"commands": map[string]any{
-				"type":        "array",
-				"description": "Commands to execute in order.",
-				"items":       map[string]any{"type": "string"},
-			},
-			"timeout_ms": map[string]any{
-				"type":        "integer",
-				"description": "Timeout in milliseconds.",
-			},
-			"max_output_length": map[string]any{
-				"type":        "integer",
-				"description": "Maximum output length to capture.",
-			},
-		},
-		"required": []string{"commands"},
-	})
-}
-
-func buildBridgeApplyPatchTool() map[string]any {
-	return bridgeToolToChatTool("apply_patch", "Apply a patch to files.", map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"operation": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"type": map[string]any{
-						"type": "string",
-						"enum": []string{"create_file", "update_file", "delete_file"},
-					},
-					"path": map[string]any{"type": "string"},
-					"diff": map[string]any{"type": "string"},
-				},
-				"required": []string{"type", "path"},
-			},
-		},
-		"required": []string{"operation"},
-	})
-}
-
-func buildBridgeWebSearchTool() map[string]any {
-	return bridgeToolToChatTool("web_search", "Search the web.", map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"query": map[string]any{"type": "string", "description": "The search query."},
-			"domains": map[string]any{"type": "array", "description": "Optional domains to constrain search results.", "items": map[string]any{"type": "string"}},
-			"search_context_size": map[string]any{"type": "string", "description": "Optional context hint such as low, medium, or high."},
-			"user_location": map[string]any{"type": "object", "description": "Optional user location metadata.", "additionalProperties": true},
-		},
-		"required": []string{"query"},
-	})
-}
-
-func buildBridgeFileSearchTool() map[string]any {
-	return bridgeToolToChatTool("file_search", "Search indexed files.", map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"query": map[string]any{"type": "string", "description": "The file search query."},
-			"vector_store_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional vector store identifiers."},
-			"max_num_results": map[string]any{"type": "integer", "description": "Optional maximum result count."},
-			"filters": map[string]any{"type": "object", "additionalProperties": true, "description": "Optional structured filters."},
-		},
-		"required": []string{"query"},
-	})
-}
-
-func buildBridgeCodeInterpreterTool() map[string]any {
-	return bridgeToolToChatTool("code_interpreter", "Run code in an interpreter.", map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"code": map[string]any{"type": "string", "description": "Code to execute."},
-			"language": map[string]any{"type": "string", "description": "Execution language, such as python."},
-			"files": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional file references."},
-			"args": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional execution arguments."},
-		},
-		"required": []string{"code"},
-	})
-}
-
-func buildBridgeImageGenerationTool() map[string]any {
-	return bridgeToolToChatTool("image_generation", "Generate an image.", map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"prompt": map[string]any{"type": "string", "description": "The image generation prompt."},
-			"size": map[string]any{"type": "string", "description": "Optional image size."},
-			"quality": map[string]any{"type": "string", "description": "Optional image quality."},
-			"background": map[string]any{"type": "string", "description": "Optional background mode."},
-			"output_format": map[string]any{"type": "string", "description": "Optional output format."},
-		},
-		"required": []string{"prompt"},
-	})
-}
-
-func buildBridgeComputerTool() map[string]any {
-	return bridgeToolToChatTool("computer", "Perform a computer action.", map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"action": map[string]any{"type": "string", "description": "Computer action such as click, type, keypress, scroll, or screenshot."},
-			"x": map[string]any{"type": "number", "description": "Optional X coordinate."},
-			"y": map[string]any{"type": "number", "description": "Optional Y coordinate."},
-			"text": map[string]any{"type": "string", "description": "Optional text payload."},
-			"button": map[string]any{"type": "string", "description": "Optional mouse button."},
-		},
-		"required": []string{"action"},
-	})
 }
 
 func bridgeToolToChatTool(name string, description string, parameters map[string]any) map[string]any {
@@ -1399,6 +1020,7 @@ func collectResponseText(v any, out *[]string) {
 	}
 }
 
+
 func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 	out := make([]map[string]any, 0)
 	if instructions, ok := req["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
@@ -1424,31 +1046,43 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 		})
 	}
 
-	appendAssistantToolCall := func(name string, arguments any, callID string) {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			return
-		}
-		args := encodeAnyAsJSONString(arguments)
-		callID = strings.TrimSpace(callID)
-		if callID == "" {
-			callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(out))
-		}
-		out = append(out, map[string]any{
-			"role":    "assistant",
-			"content": "",
-			"tool_calls": []any{
-				map[string]any{
-					"id":   callID,
-					"type": "function",
-					"function": map[string]any{
-						"name":      name,
-						"arguments": args,
-					},
-				},
-			},
-		})
-	}
+appendAssistantToolCall := func(name string, arguments any, callID string) {
+    name = strings.TrimSpace(name)
+    if name == "" {
+        return
+    }
+
+    stringArgs := encodeAnyAsJSONString(arguments)
+    stringArgs = normalizePossiblyMixedToolArguments(stringArgs)
+
+    argsForTemplate := any(map[string]any{})
+    var parsed map[string]any
+    if err := json.Unmarshal([]byte(stringArgs), &parsed); err == nil && parsed != nil {
+        argsForTemplate = parsed
+    } else {
+        argsForTemplate = map[string]any{"raw": strings.TrimSpace(stringArgs)}
+    }
+
+    callID = strings.TrimSpace(callID)
+    if callID == "" {
+        callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(out))
+    }
+
+    out = append(out, map[string]any{
+        "role":    "assistant",
+        "content": "",
+        "tool_calls": []any{
+            map[string]any{
+                "id":   callID,
+                "type": "function",
+                "function": map[string]any{
+                    "name":      name,
+                    "arguments": argsForTemplate,
+                },
+            },
+        },
+    })
+}
 
 	appendToolResult := func(callID string, output any) {
 		callID = strings.TrimSpace(callID)
@@ -1469,34 +1103,6 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 			"tool_call_id": callID,
 			"content":      text,
 		})
-	}
-
-	if messages, ok := req["messages"].([]any); ok {
-		for _, rawMessage := range messages {
-			message, ok := rawMessage.(map[string]any)
-			if !ok {
-				continue
-			}
-			role, _ := message["role"].(string)
-			if strings.EqualFold(strings.TrimSpace(role), "assistant") {
-				if toolCalls, ok := message["tool_calls"]; ok {
-					assistantText := extractResponsesInputText(message["content"])
-					assistantText = strings.TrimSpace(cleanFallbackInput(message["content"], assistantText))
-					out = append(out, map[string]any{
-						"role":       "assistant",
-						"content":    assistantText,
-						"tool_calls": toolCalls,
-					})
-					continue
-				}
-			}
-			if strings.EqualFold(strings.TrimSpace(role), "tool") {
-				appendToolResult(strings.TrimSpace(fmt.Sprintf("%v", message["tool_call_id"])), message["content"])
-				continue
-			}
-			convertOne(role, message["content"])
-		}
-		return out
 	}
 
 	if inputArr, ok := req["input"].([]any); ok {
@@ -1550,9 +1156,9 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 			}
 		}
 	}
-
 	return out
 }
+
 
 func normalizeChatCompletionRole(role string) string {
 	switch strings.ToLower(strings.TrimSpace(role)) {
@@ -1563,6 +1169,19 @@ func normalizeChatCompletionRole(role string) string {
 	default:
 		return "user"
 	}
+}
+
+// Add near the other small helper functions in proxymanager.go.
+func splitNonEmptyLines(s string) []string {
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 func cleanFallbackInput(raw any, preferred string) string {
@@ -1595,6 +1214,81 @@ func encodeAnyAsJSONString(v any) string {
 	}
 }
 
+
+
+
+func normalizePossiblyMixedToolArguments(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "{}"
+	}
+	if json.Valid([]byte(raw)) {
+		return raw
+	}
+	if repaired := extractJSONObject(raw); repaired != "" && json.Valid([]byte(repaired)) {
+		return repaired
+	}
+	if repaired := extractXMLToolPayload(raw); repaired != "" && json.Valid([]byte(repaired)) {
+		return repaired
+	}
+	return mustJSONString(map[string]any{"raw": raw})
+}
+
+func extractJSONObject(s string) string {
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start >= 0 && end > start {
+		return strings.TrimSpace(s[start : end+1])
+	}
+	return ""
+}
+
+func extractXMLToolPayload(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	if !strings.Contains(lower, "<") || !strings.Contains(lower, ">") {
+		return ""
+	}
+	fields := map[string]string{}
+	for _, tag := range []string{"command", "commands", "query", "path", "diff", "text", "code", "language", "action", "button", "x", "y", "prompt", "size", "quality", "background", "output_format"} {
+		open := "<" + tag + ">"
+		close := "</" + tag + ">"
+		start := strings.Index(lower, open)
+		end := strings.Index(lower, close)
+		if start >= 0 && end > start {
+			value := strings.TrimSpace(s[start+len(open) : end])
+			if value != "" {
+				fields[tag] = value
+			}
+		}
+	}
+	if len(fields) == 0 {
+		return ""
+	}
+	if commands, ok := fields["commands"]; ok {
+		return mustJSONString(map[string]any{"commands": splitNonEmptyLines(commands)})
+	}
+	if command, ok := fields["command"]; ok {
+		return mustJSONString(map[string]any{"commands": []string{command}})
+	}
+	converted := make(map[string]any, len(fields))
+	for k, v := range fields {
+		converted[k] = v
+	}
+	return mustJSONString(converted)
+}
+
+func parseToolArgsMapString(s string) map[string]any {
+	s = normalizePossiblyMixedToolArguments(s)
+	out := map[string]any{}
+	if err := json.Unmarshal([]byte(s), &out); err == nil {
+		return out
+	}
+	return map[string]any{"raw": strings.TrimSpace(s)}
+}
 func translateChatCompletionToResponsesResponse(body []byte) ([]byte, error) {
 	message := gjson.GetBytes(body, "choices.0.message")
 	if !message.Exists() || strings.TrimSpace(message.Raw) == "" || message.Type == gjson.Null {
@@ -1619,13 +1313,15 @@ func translateChatCompletionToResponsesResponse(body []byte) ([]byte, error) {
 			"call_id": callID,
 			"status":  "completed",
 		}
+
+		arguments = normalizePossiblyMixedToolArguments(arguments)
 		switch strings.TrimSpace(name) {
 		case "shell":
 			item["type"] = "shell_call"
-			item["action"] = parseJSONMapString(arguments)
+			item["action"] = parseToolArgsMapString(arguments)
 		case "apply_patch":
 			item["type"] = "apply_patch_call"
-			args := parseJSONMapString(arguments)
+			args := parseToolArgsMapString(arguments)
 			if operation, ok := args["operation"].(map[string]any); ok {
 				item["operation"] = operation
 			} else {
@@ -1633,19 +1329,19 @@ func translateChatCompletionToResponsesResponse(body []byte) ([]byte, error) {
 			}
 		case "web_search", "web_search_preview":
 			item["type"] = "web_search_call"
-			item["action"] = parseJSONMapString(arguments)
+			item["action"] = parseToolArgsMapString(arguments)
 		case "file_search":
 			item["type"] = "file_search_call"
-			item["action"] = parseJSONMapString(arguments)
+			item["action"] = parseToolArgsMapString(arguments)
 		case "code_interpreter":
 			item["type"] = "code_interpreter_call"
-			item["action"] = parseJSONMapString(arguments)
+			item["action"] = parseToolArgsMapString(arguments)
 		case "image_generation":
 			item["type"] = "image_generation_call"
-			item["action"] = parseJSONMapString(arguments)
+			item["action"] = parseToolArgsMapString(arguments)
 		case "computer":
 			item["type"] = "computer_call"
-			item["action"] = parseJSONMapString(arguments)
+			item["action"] = parseToolArgsMapString(arguments)
 		default:
 			item["type"] = "function_call"
 			item["name"] = strings.TrimSpace(name)
@@ -1658,8 +1354,12 @@ func translateChatCompletionToResponsesResponse(body []byte) ([]byte, error) {
 	functionCall := message.Get("function_call")
 	hasToolCalls := toolCalls.IsArray() && len(toolCalls.Array()) > 0
 	hasFunctionCall := functionCall.Exists() && strings.TrimSpace(functionCall.Get("name").String()) != ""
+	parsedToolCalls, cleanedText := parseModelSpecificToolCalls(model, text)
+	if len(parsedToolCalls) > 0 {
+		text = cleanedText
+	}
 
-	if strings.TrimSpace(text) != "" || (!hasToolCalls && !hasFunctionCall) {
+	if strings.TrimSpace(text) != "" || (!hasToolCalls && !hasFunctionCall && len(parsedToolCalls) == 0) {
 		output = append(output, map[string]any{
 			"id":   "msg_" + id,
 			"type": "message",
@@ -1676,26 +1376,25 @@ func translateChatCompletionToResponsesResponse(body []byte) ([]byte, error) {
 	if hasToolCalls {
 		idx := 0
 		toolCalls.ForEach(func(_, tc gjson.Result) bool {
-			appendCall(
-				tc.Get("id").String(),
-				tc.Get("function.name").String(),
-				tc.Get("function.arguments").String(),
-				idx,
-			)
+			appendCall(tc.Get("id").String(), tc.Get("function.name").String(), tc.Get("function.arguments").String(), idx)
 			idx++
 			return true
 		})
 	} else if hasFunctionCall {
 		appendCall("", functionCall.Get("name").String(), functionCall.Get("arguments").String(), 0)
+	} else if len(parsedToolCalls) > 0 {
+		for idx, call := range parsedToolCalls {
+			appendCall(call.CallID, call.Name, mustJSONString(call.Arguments), idx)
+		}
 	}
 
 	resp := map[string]any{
-		"id":          "resp_" + id,
-		"object":      "response",
-		"created_at":  time.Now().Unix(),
-		"status":      "completed",
-		"model":       model,
-		"output":      output,
+		"id":         "resp_" + id,
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"status":     "completed",
+		"model":      model,
+		"output":     output,
 		"output_text": text,
 	}
 	if created := gjson.GetBytes(body, "created").Int(); created > 0 {
@@ -1710,6 +1409,7 @@ func translateChatCompletionToResponsesResponse(body []byte) ([]byte, error) {
 	}
 	return json.Marshal(resp)
 }
+
 
 func writeResponsesStream(w http.ResponseWriter, responseJSON []byte) {
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -1827,13 +1527,9 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 ) func(string, http.ResponseWriter, *http.Request) error {
 	return func(_ string, w http.ResponseWriter, r *http.Request) error {
 		responsesRequestedStream := gjson.GetBytes(bodyBytes, "stream").Bool() || strings.Contains(strings.ToLower(strings.TrimSpace(r.Header.Get("Accept"))), "text/event-stream")
-		translated, unsupportedTools, err := translateResponsesToChatCompletionsRequestWithUnsupported(bodyBytes)
+		translated, err := translateResponsesToChatCompletionsRequest(bodyBytes)
 		if err != nil {
 			return fmt.Errorf("invalid responses request: %w", err)
-		}
-		if len(unsupportedTools) > 0 {
-			logTextTransform(pm.transformLogger, modelID, "reject_unsupported_bridge_tools", strings.Join(unsupportedTools, ", "))
-			return fmt.Errorf("unsupported /v1/responses tool types for completions bridge: %s", strings.Join(unsupportedTools, ", "))
 		}
 		logBodyTransform(pm.transformLogger, modelID, "bridge_translate_responses_to_chat", bodyBytes, translated)
 
@@ -1924,43 +1620,41 @@ func summarizeJSONForLog(body []byte) string {
 	return string(body[:limit]) + "...<truncated>"
 }
 
-func ValidateTransformMode(mode RequestTransformMode) error {
-	switch mode {
-	case "", TransformModeRaw, TransformModeCompletionsBridge, TransformModeResponses:
-		return nil
-	default:
-		return fmt.Errorf("invalid request transform mode %q", mode)
-	}
-}
 
-// normalizeTransformMode canonicalizes the configured request transform mode.
-// raw = passthrough, completions_bridge = Responses <-> Chat Completions bridge,
-// responses = native Responses API normalization for local backends.
 func normalizeTransformMode(mode RequestTransformMode) RequestTransformMode {
 	switch mode {
-	case TransformModeRaw, TransformModeCompletionsBridge, TransformModeResponses:
+	case "", TransformModeCompletionsBridge:
+		return TransformModeCompletionsBridge
+	case TransformModeRaw, TransformModeResponses:
 		return mode
 	default:
-		return TransformModeCompletionsBridge
+		return ""
 	}
 }
 
-// getTransformMode returns the effective transform mode for the model.
-// Invalid configured values are logged and normalized to the bridge default.
+
+
 func (pm *ProxyManager) getTransformMode(modelID string) RequestTransformMode {
 	pm.Lock()
 	defer pm.Unlock()
-
 	mode := pm.transformModes[modelID]
-	if err := ValidateTransformMode(mode); err != nil {
-		logTextTransform(pm.transformLogger, modelID, "invalid_transform_mode", err.Error())
+	switch mode {
+	case "", TransformModeRaw, TransformModeCompletionsBridge, TransformModeResponses:
+	default:
+		logTextTransform(pm.transformLogger, modelID, "invalid_transform_mode", fmt.Sprintf("invalid request transform mode %q", mode))
+		return TransformModeCompletionsBridge
 	}
-	return normalizeTransformMode(mode)
+	normalized := normalizeTransformMode(mode)
+	if normalized == "" {
+		logTextTransform(pm.transformLogger, modelID, "invalid_transform_mode", fmt.Sprintf("invalid normalized transform mode %q", mode))
+		return TransformModeCompletionsBridge
+	}
+	return normalized
 }
 
-// isResponsesEndpoint returns true if the request path is a Responses API endpoint.
-// This covers both /v1/responses and the bare /responses route (used by Codex),
-// which may run in either completions_bridge or native responses mode.
+
+// isResponsesEndpoint returns true if the request path is a responses API endpoint.
+// This covers both /v1/responses and the bare /responses route (used by Codex).
 func isResponsesEndpoint(path string) bool {
 	return path == "/v1/responses" || path == "/responses"
 }
@@ -2032,14 +1726,9 @@ const (
 	PromptOptimizationAlways    PromptOptimizationPolicy = "always"
 	PromptOptimizationLLMAssist PromptOptimizationPolicy = "llm_assisted"
 
-	// TransformModeRaw passes requests through without body transformation.
-	TransformModeRaw RequestTransformMode = "raw"
-	// TransformModeCompletionsBridge translates Responses requests into Chat
-	// Completions requests and converts the downstream response back again.
+	TransformModeRaw               RequestTransformMode = "raw"
 	TransformModeCompletionsBridge RequestTransformMode = "completions_bridge"
-	// TransformModeResponses keeps requests on the Responses API path and only
-	// normalizes tool and input formats for local backend compatibility.
-	TransformModeResponses RequestTransformMode = "responses"
+	TransformModeResponses         RequestTransformMode = "responses"
 )
 
 type PromptOptimizationSnapshot struct {
