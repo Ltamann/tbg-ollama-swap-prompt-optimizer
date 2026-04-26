@@ -351,6 +351,37 @@ func TestExtractResponsesRequestMode_DoesNotInferPlanFromDefaultCollaborationMod
 	assert.Equal(t, "", extractResponsesRequestMode(req))
 }
 
+func TestExtractResponsesRequestMode_LatestCollaborationModeBlockWins(t *testing.T) {
+	req := map[string]any{
+		"instructions": "You are a coding agent.",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "<collaboration_mode># Plan Mode (Conversational)\nReturn plans only.</collaboration_mode>",
+					},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "<collaboration_mode># Collaboration Mode: Default\nYou are now in Default mode.</collaboration_mode>",
+					},
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, "", extractResponsesRequestMode(req))
+	assert.False(t, requestLooksLikePlanMode(req))
+}
+
 func TestEnforcePlanModeResponse_WrapsMissingProposedPlanTag(t *testing.T) {
 	body := []byte(`{
 		"id":"resp_test",
@@ -436,6 +467,98 @@ func TestTranslateChatCompletionToResponsesResponse_KeepsAssistantTextWithToolCa
 	assert.Equal(t, "I will run the tool now", strings.TrimSpace(resp["output_text"].(string)))
 }
 
+func TestTranslateChatCompletionToResponsesResponse_ReasoningStaysOutOfOutputText(t *testing.T) {
+	body := []byte(`{
+	  "id": "chatcmpl-reasoning",
+	  "model": "qwen-test",
+	  "choices": [{
+	    "message": {
+	      "role": "assistant",
+	      "content": "final answer",
+	      "reasoning_content": "thinking chain"
+	    },
+	    "finish_reason": "stop"
+	  }]
+	}`)
+
+	out, err := translateChatCompletionToResponsesResponse(body, "", "", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "final answer", gjson.GetBytes(out, "output_text").String())
+	assert.Equal(t, "final answer", gjson.GetBytes(out, "output.1.content.0.text").String())
+	assert.Equal(t, "reasoning", gjson.GetBytes(out, "output.0.type").String())
+	assert.Equal(t, "thinking chain", gjson.GetBytes(out, "output.0.summary.0.text").String())
+	assert.NotContains(t, gjson.GetBytes(out, "output_text").String(), "<think>")
+}
+
+func TestTranslateChatCompletionToResponsesResponse_StripsThinkFromMergedContent(t *testing.T) {
+	body := []byte(`{
+	  "id": "chatcmpl-reasoning-merged",
+	  "model": "qwen-test",
+	  "choices": [{
+	    "message": {
+	      "role": "assistant",
+	      "content": "<think>internal notes</think>\nfinal answer"
+	    },
+	    "finish_reason": "stop"
+	  }]
+	}`)
+
+	out, err := translateChatCompletionToResponsesResponse(body, "", "", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "final answer", gjson.GetBytes(out, "output_text").String())
+	assert.Equal(t, "final answer", gjson.GetBytes(out, "output.1.content.0.text").String())
+	assert.Equal(t, "reasoning", gjson.GetBytes(out, "output.0.type").String())
+	assert.Equal(t, "internal notes", gjson.GetBytes(out, "output.0.summary.0.text").String())
+	assert.NotContains(t, gjson.GetBytes(out, "output_text").String(), "<think>")
+}
+
+func TestResponsesRequestToChatMessages_ReasoningItemUsesDedicatedField(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "reasoning",
+				"summary": []any{
+					map[string]any{
+						"type": "summary_text",
+						"text": "internal reasoning",
+					},
+				},
+			},
+		},
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "assistant", messages[0]["role"])
+	assert.Equal(t, "", messages[0]["content"])
+	assert.Equal(t, "internal reasoning", messages[0]["reasoning_content"])
+}
+
+func TestResponsesRequestToChatMessages_StripsLegacyThinkFromAssistantContent(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{
+						"type": "output_text",
+						"text": "<think>internal chain</think>\nfinal answer",
+					},
+				},
+			},
+		},
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "assistant", messages[0]["role"])
+	assert.Equal(t, "final answer", messages[0]["content"])
+	assert.Equal(t, "internal chain", messages[0]["reasoning_content"])
+}
+
 func TestNormalizeTranslatedResponsesOutput_AddsToolMetadataForSpecializedToolCalls(t *testing.T) {
 	resp := map[string]any{
 		"id": "resp_test",
@@ -480,6 +603,32 @@ func TestNormalizeTranslatedResponsesOutput_NormalizesShellCommandAndCommands(t 
 	require.True(t, ok)
 	require.Len(t, commands, 2)
 	assert.Equal(t, "pwd", fmt.Sprintf("%v", commands[0]))
+}
+
+func TestNormalizeTranslatedResponsesOutput_NormalizesReasoningItem(t *testing.T) {
+	resp := map[string]any{
+		"id": "resp_test",
+		"output": []any{
+			map[string]any{
+				"type": "reasoning",
+				"summary": []any{
+					map[string]any{
+						"type": "summary_text",
+						"text": "  keep me  ",
+					},
+				},
+			},
+		},
+	}
+
+	normalizeTranslatedResponsesOutput(resp)
+	output := resp["output"].([]any)
+	require.Len(t, output, 1)
+	item := output[0].(map[string]any)
+	assert.Equal(t, "reasoning", item["type"])
+	assert.Equal(t, "keep me", gjson.Get(mustJSONString(item), "summary.0.text").String())
+	assert.NotEmpty(t, strings.TrimSpace(fmt.Sprintf("%v", item["id"])))
+	assert.Equal(t, "", strings.TrimSpace(fmt.Sprintf("%v", resp["output_text"])))
 }
 
 func TestTranslateChatCompletionToResponsesResponse_UnpacksMultiToolUseParallel(t *testing.T) {
@@ -1554,6 +1703,14 @@ func TestIsCodexManagedPlanMode_RequiresBothTagAndPlanMode(t *testing.T) {
 	assert.False(t, isCodexManagedPlanMode(msgs))
 }
 
+func TestIsCodexManagedPlanMode_UsesLatestCollaborationModeBlock(t *testing.T) {
+	msgs := []map[string]any{
+		{"role": "developer", "content": "<collaboration_mode># Plan Mode (Conversational)\nReturn plans only.</collaboration_mode>"},
+		{"role": "developer", "content": "<collaboration_mode># Collaboration Mode: Default\nYou are now in Default mode.</collaboration_mode>"},
+	}
+	assert.False(t, isCodexManagedPlanMode(msgs))
+}
+
 func TestEnforcePlanModeResponse_DoesNotFallbackForEmptyWhenUpstreamNotNormal(t *testing.T) {
 	body := []byte(`{
 		"id":"resp_plan_empty_error",
@@ -1681,7 +1838,7 @@ func TestBuildResponsesBridgeHandler_StreamRetriesBeforeEmittingResponsesSSE(t *
 	assert.NotContains(t, rec.Body.String(), "upstream unavailable")
 }
 
-func TestWriteResponsesStreamFromChatSSE_EmitsReasoningSummaryEvents(t *testing.T) {
+func TestWriteResponsesStreamFromChatSSE_EmitsReasoningAndContentOnSeparateLanes(t *testing.T) {
 	upstream := strings.Join([]string{
 		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"thinking step 1"},"finish_reason":null}]}`,
 		``,
@@ -1696,11 +1853,36 @@ func TestWriteResponsesStreamFromChatSSE_EmitsReasoningSummaryEvents(t *testing.
 	require.NoError(t, err)
 
 	body := rec.Body.String()
-	assert.Contains(t, body, "event: response.reasoning_summary_text.delta")
-	assert.Contains(t, body, "event: response.reasoning_summary_text.done")
 	assert.Contains(t, body, "event: response.output_text.delta")
 	assert.Contains(t, body, "event: response.completed")
+	assert.Contains(t, body, "event: response.reasoning_summary_text.delta")
+	assert.Contains(t, body, "event: response.reasoning_summary_text.done")
 	assert.Contains(t, body, "final answer")
+	assert.Contains(t, body, "thinking step 1")
+}
+
+func TestWriteResponsesStream_ReplaysReasoningItems(t *testing.T) {
+	responseJSON := []byte(`{
+	  "id":"resp_reasoning_stream",
+	  "object":"response",
+	  "created_at":123,
+	  "model":"qwen-test",
+	  "status":"completed",
+	  "output":[
+	    {"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"thinking one"}]},
+	    {"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer one"}]}
+	  ],
+	  "output_text":"answer one"
+	}`)
+
+	rec := httptest.NewRecorder()
+	writeResponsesStream(rec, responseJSON)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, "event: response.reasoning_summary_text.delta")
+	assert.Contains(t, body, "event: response.reasoning_summary_text.done")
+	assert.Contains(t, body, "thinking one")
+	assert.Contains(t, body, "answer one")
 }
 
 func TestWriteResponsesStreamFromChatSSE_EmitsToolCallArgumentDeltas(t *testing.T) {

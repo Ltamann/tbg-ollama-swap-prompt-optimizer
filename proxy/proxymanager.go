@@ -1147,25 +1147,29 @@ func requestLooksLikePlanMode(req map[string]any) bool {
 	if req == nil {
 		return false
 	}
-	combined := strings.ToLower(strings.TrimSpace(
-		extractResponsesInputText(req["instructions"]) + "\n" + extractResponsesInputText(req["input"]),
-	))
+
+	// Collaboration-mode tags must be read only from trusted roles (system/developer),
+	// and when multiple blocks exist the most recent block must win.
+	if mode := extractEffectiveCollaborationModeFromResponsesRequest(req); mode != "" {
+		return mode == "plan"
+	}
+
+	combined := strings.ToLower(strings.TrimSpace(extractResponsesInputText(req["instructions"]) + "\n" + extractResponsesInputText(req["input"])))
 	if combined == "" {
 		return false
 	}
-	if block, _, _, ok := extractTagBlockLoose(combined, "collaboration_mode"); ok {
-		modeText := strings.ToLower(strings.TrimSpace(block))
-		if strings.Contains(modeText, "collaboration mode: default") || strings.Contains(modeText, "default mode") {
-			return false
-		}
-		if strings.Contains(modeText, "collaboration mode: plan") || strings.Contains(modeText, "plan mode (conversational)") {
-			return true
-		}
+
+	// Fallback only for explicit, non-tagged collaboration headers in trusted roles.
+	safeCombined := strings.ToLower(strings.TrimSpace(extractTrustedResponsesInstructionText(req)))
+	defaultIdx := strings.LastIndex(safeCombined, "collaboration mode: default")
+	planIdx := strings.LastIndex(safeCombined, "collaboration mode: plan")
+	if defaultIdx > planIdx && defaultIdx >= 0 {
+		return false
 	}
-	// Fallback only for explicit, non-tagged collaboration headers.
-	if strings.Contains(combined, "collaboration mode: plan") {
+	if planIdx > defaultIdx && planIdx >= 0 {
 		return true
 	}
+
 	if strings.Contains(combined, "/mode plan") || strings.Contains(combined, "mode: plan") {
 		return true
 	}
@@ -1176,21 +1180,28 @@ func requestLooksLikePlanMode(req map[string]any) bool {
 }
 
 func isCodexManagedPlanMode(messages []map[string]any) bool {
+	lastBlock := ""
+	hasTag := false
 	for _, msg := range messages {
 		role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", msg["role"])))
-		if role != "system" {
+		if role != "system" && role != "developer" {
 			continue
 		}
 		content := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", msg["content"])))
 		if content == "" {
 			continue
 		}
-		hasCollabTag := strings.Contains(content, "<collaborationmode>") || strings.Contains(content, "<collaboration_mode>")
-		if hasCollabTag && strings.Contains(content, "plan mode") {
-			return true
+
+		if block, ok := extractLastCollaborationModeTagBlock(content); ok {
+			lastBlock = block
+			hasTag = true
 		}
 	}
-	return false
+	if !hasTag || strings.TrimSpace(lastBlock) == "" {
+		return false
+	}
+	mode := inferCollaborationModeFromTagBlock(lastBlock)
+	return mode == "plan"
 }
 
 func isCodexManagedPlanModeFromResponsesRequest(req map[string]any) bool {
@@ -1199,9 +1210,21 @@ func isCodexManagedPlanModeFromResponsesRequest(req map[string]any) bool {
 	}
 	input, _ := req["input"].([]any)
 	if len(input) == 0 {
-		return false
+		// Allow detection from top-level instructions when input is missing.
+		instructions := strings.TrimSpace(extractResponsesInputText(req["instructions"]))
+		if instructions == "" {
+			return false
+		}
+		return isCodexManagedPlanMode([]map[string]any{{"role": "system", "content": instructions}})
 	}
-	systemMessages := make([]map[string]any, 0, len(input))
+
+	systemMessages := make([]map[string]any, 0, len(input)+1)
+	if instructions := strings.TrimSpace(extractResponsesInputText(req["instructions"])); instructions != "" {
+		systemMessages = append(systemMessages, map[string]any{
+			"role":    "system",
+			"content": instructions,
+		})
+	}
 	for _, raw := range input {
 		item, ok := raw.(map[string]any)
 		if !ok {
@@ -1209,11 +1232,11 @@ func isCodexManagedPlanModeFromResponsesRequest(req map[string]any) bool {
 		}
 		itemType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["type"])))
 		role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["role"])))
-		if itemType != "message" || role != "system" {
+		if itemType != "message" || (role != "system" && role != "developer") {
 			continue
 		}
 		systemMessages = append(systemMessages, map[string]any{
-			"role":    "system",
+			"role":    role,
 			"content": extractResponsesInputText(item["content"]),
 		})
 	}
@@ -1250,6 +1273,109 @@ func extractResponsesRequestReasoningEffort(req map[string]any) string {
 		effort = slashEffort
 	}
 	return normalizeResponsesReasoningEffort(effort)
+}
+
+func extractLastTagBlockLooseWithStart(text, tag string) (content string, blockStart int, ok bool) {
+	lower := strings.ToLower(text)
+	openTag := "<" + strings.ToLower(tag) + ">"
+	openIdx := strings.LastIndex(lower, openTag)
+	if openIdx < 0 {
+		return "", 0, false
+	}
+	start := openIdx + len(openTag)
+	closeTag := "</" + strings.ToLower(tag) + ">"
+	closeRel := strings.Index(lower[start:], closeTag)
+	if closeRel < 0 {
+		return text[start:], openIdx, true
+	}
+	return text[start : start+closeRel], openIdx, true
+}
+
+func extractLastCollaborationModeTagBlock(text string) (string, bool) {
+	blockA, startA, okA := extractLastTagBlockLooseWithStart(text, "collaboration_mode")
+	blockB, startB, okB := extractLastTagBlockLooseWithStart(text, "collaborationmode")
+	switch {
+	case okA && okB:
+		if startA >= startB {
+			return blockA, true
+		}
+		return blockB, true
+	case okA:
+		return blockA, true
+	case okB:
+		return blockB, true
+	default:
+		return "", false
+	}
+}
+
+func inferCollaborationModeFromTagBlock(block string) string {
+	lower := strings.ToLower(strings.TrimSpace(block))
+	if lower == "" {
+		return ""
+	}
+	if strings.Contains(lower, "collaboration mode: default") || strings.Contains(lower, "default mode") {
+		return "default"
+	}
+	if strings.Contains(lower, "collaboration mode: plan") || strings.Contains(lower, "plan mode") {
+		return "plan"
+	}
+	return ""
+}
+
+func extractTrustedResponsesInstructionText(req map[string]any) string {
+	if req == nil {
+		return ""
+	}
+	parts := make([]string, 0, 8)
+	if instructions := strings.TrimSpace(extractResponsesInputText(req["instructions"])); instructions != "" {
+		parts = append(parts, instructions)
+	}
+	if inputArr, ok := req["input"].([]any); ok {
+		for _, rawItem := range inputArr {
+			item, ok := rawItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			if strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["type"]))) != "message" {
+				continue
+			}
+			role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["role"])))
+			if role != "system" && role != "developer" {
+				continue
+			}
+			text := strings.TrimSpace(extractResponsesInputText(item["content"]))
+			if text != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func extractEffectiveCollaborationModeFromResponsesRequest(req map[string]any) string {
+	safeCombined := extractTrustedResponsesInstructionText(req)
+	if safeCombined == "" {
+		return ""
+	}
+
+	lastBlock := ""
+	if block, ok := extractLastCollaborationModeTagBlock(safeCombined); ok {
+		lastBlock = block
+	}
+	if strings.TrimSpace(lastBlock) != "" {
+		return inferCollaborationModeFromTagBlock(lastBlock)
+	}
+	// Non-tagged fallback (trusted roles only).
+	defaultIdx := strings.LastIndex(strings.ToLower(safeCombined), "collaboration mode: default")
+	planIdx := strings.LastIndex(strings.ToLower(safeCombined), "collaboration mode: plan")
+	if defaultIdx > planIdx && defaultIdx >= 0 {
+		return "default"
+	}
+	if planIdx > defaultIdx && planIdx >= 0 {
+		return "plan"
+	}
+	return ""
 }
 
 func sanitizeResponsesInputToolArguments(req map[string]any) bool {
@@ -1774,6 +1900,22 @@ func extractResponsesInputText(input any) string {
 	return strings.Join(parts, "\n")
 }
 
+var thinkTagPrefixRegex = regexp.MustCompile(`(?is)^\s*<think>\s*(.*?)\s*</think>\s*`)
+
+func extractContentAndReasoning(raw string) (content string, reasoning string) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", ""
+	}
+	match := thinkTagPrefixRegex.FindStringSubmatchIndex(trimmed)
+	if match == nil || len(match) < 4 {
+		return trimmed, ""
+	}
+	reasoning = strings.TrimSpace(trimmed[match[2]:match[3]])
+	content = strings.TrimSpace(trimmed[match[1]:])
+	return content, reasoning
+}
+
 func collectResponseText(v any, out *[]string) {
 	switch typed := v.(type) {
 	case string:
@@ -1810,13 +1952,23 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 		normalizedRole := normalizeChatCompletionRole(role)
 		text := extractResponsesInputText(content)
 		text = strings.TrimSpace(cleanFallbackInput(content, text))
-		if text == "" {
+		reasoningText := ""
+		if normalizedRole == "assistant" {
+			var extractedReasoning string
+			text, extractedReasoning = extractContentAndReasoning(text)
+			reasoningText = strings.TrimSpace(extractedReasoning)
+		}
+		if text == "" && reasoningText == "" {
 			return
 		}
-		out = append(out, map[string]any{
+		message := map[string]any{
 			"role":    normalizedRole,
 			"content": text,
-		})
+		}
+		if normalizedRole == "assistant" && reasoningText != "" {
+			message["reasoning_content"] = reasoningText
+		}
+		out = append(out, message)
 	}
 
 	appendAssistantToolCall := func(name string, arguments any, callID string) {
@@ -1893,6 +2045,29 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 			switch itemType {
 			case "message":
 				convertOne(fmt.Sprintf("%v", item["role"]), item["content"])
+			case "reasoning":
+				summary, _ := item["summary"].([]any)
+				reasoningParts := make([]string, 0, len(summary))
+				for _, rawSummary := range summary {
+					summaryPart, ok := rawSummary.(map[string]any)
+					if !ok {
+						continue
+					}
+					summaryText := strings.TrimSpace(extractResponsesInputText(summaryPart))
+					if summaryText != "" {
+						reasoningParts = append(reasoningParts, summaryText)
+					}
+				}
+				reasoningText := strings.TrimSpace(strings.Join(reasoningParts, "\n"))
+				if reasoningText == "" {
+					continue
+				}
+				// Keep reasoning on a dedicated field so it never pollutes assistant content text.
+				out = append(out, map[string]any{
+					"role":              "assistant",
+					"content":           "",
+					"reasoning_content": reasoningText,
+				})
 			case "function_call":
 				appendAssistantToolCall(fmt.Sprintf("%v", item["name"]), item["arguments"], fmt.Sprintf("%v", item["call_id"]))
 			case "function_call_output":
@@ -3294,7 +3469,10 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
 	text := message.Get("content").String()
 	reasoningText := message.Get("reasoning_content").String()
-	reasoningWrapped := wrapReasoningForHistory(reasoningText)
+	text, extractedReasoning := extractContentAndReasoning(text)
+	if strings.TrimSpace(reasoningText) == "" {
+		reasoningText = extractedReasoning
+	}
 	output := make([]any, 0, 2)
 
 	var appendCall func(callID string, name string, arguments string, index int)
@@ -3487,13 +3665,7 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 		text = cleanedText
 	}
 	text = strings.TrimSpace(text)
-	if reasoningWrapped != "" {
-		if text == "" {
-			text = reasoningWrapped
-		} else {
-			text = reasoningWrapped + "\n\n" + text
-		}
-	}
+	reasoningText = strings.TrimSpace(reasoningText)
 	// Completion-style outputs may include a valid patch block in plain text
 	// without emitting a native tool call. Synthesize an apply_patch tool call
 	// so the Responses API client can execute it.
@@ -3547,6 +3719,18 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 	// Preserve any assistant text the upstream emitted, even when tool calls are present.
 	// Codex clients can handle mixed message + tool call output, and keeping the message
 	// improves user-visible progress in streaming UIs.
+	if reasoningText != "" {
+		output = append(output, map[string]any{
+			"id":   fmt.Sprintf("rs_%s_0", id),
+			"type": "reasoning",
+			"summary": []any{
+				map[string]any{
+					"type": "summary_text",
+					"text": reasoningText,
+				},
+			},
+		})
+	}
 	if strings.TrimSpace(text) != "" {
 		channel := "final"
 		if hasToolCalls || hasFunctionCall || len(parsedToolCalls) > 0 || len(parsedReasoningToolCalls) > 0 {
@@ -3678,12 +3862,41 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 			switch {
 			case strings.HasSuffix(itemType, "_call") || itemType == "function_call":
 				item["id"] = fmt.Sprintf("fc_%s_%d", respID, idx)
+			case itemType == "reasoning":
+				item["id"] = fmt.Sprintf("rs_%s_%d", respID, idx)
 			default:
 				item["id"] = fmt.Sprintf("msg_%s_%d", respID, idx)
 			}
 		}
 
 		switch itemType {
+		case "reasoning":
+			summary, _ := item["summary"].([]any)
+			normalizedSummary := make([]any, 0, len(summary))
+			for _, summaryRaw := range summary {
+				summaryItem, ok := summaryRaw.(map[string]any)
+				if !ok {
+					continue
+				}
+				summaryText := strings.TrimSpace(extractResponsesInputText(summaryItem))
+				if summaryText == "" {
+					continue
+				}
+				normalizedSummary = append(normalizedSummary, map[string]any{
+					"type": "summary_text",
+					"text": summaryText,
+				})
+			}
+			if len(normalizedSummary) == 0 {
+				summaryText := strings.TrimSpace(extractResponsesInputText(item["summary"]))
+				if summaryText != "" {
+					normalizedSummary = append(normalizedSummary, map[string]any{
+						"type": "summary_text",
+						"text": summaryText,
+					})
+				}
+			}
+			item["summary"] = normalizedSummary
 		case "message":
 			content, _ := item["content"].([]any)
 			normalizedContent := make([]any, 0, len(content))
@@ -3954,6 +4167,23 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte) {
 						"part":          part,
 					})
 				}
+			}
+		}
+		if itemType == "reasoning" {
+			reasoningText := strings.TrimSpace(extractResponsesInputText(item["summary"]))
+			if reasoningText != "" {
+				writeEvent("response.reasoning_summary_text.delta", map[string]any{
+					"response_id":  respID,
+					"item_id":      item["id"],
+					"output_index": idx,
+					"delta":        reasoningText,
+				})
+				writeEvent("response.reasoning_summary_text.done", map[string]any{
+					"response_id":  respID,
+					"item_id":      item["id"],
+					"output_index": idx,
+					"text":         reasoningText,
+				})
 			}
 		}
 		doneItem := item
@@ -5565,7 +5795,7 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 	msgID := ""
 	fullText := strings.Builder{}
 	reasoningText := strings.Builder{}
-	reasoningStreamOpen := false
+	reasoningSeen := false
 	finishReasonStop := false
 	finishReasonLength := false
 	type toolState struct {
@@ -5793,24 +6023,13 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		}
 
 		if reasoningDelta != "" {
-			reasoningStreamOpen = true
+			reasoningSeen = true
 			reasoningText.WriteString(reasoningDelta)
-			if !isPlanMode {
-				writeEvent("response.reasoning_summary_text.delta", map[string]any{
-					"response_id": respID,
-					"delta":       reasoningDelta,
-				})
-			}
+			writeEvent("response.reasoning_summary_text.delta", map[string]any{
+				"response_id": respID,
+				"delta":       reasoningDelta,
+			})
 			continue
-		}
-		if reasoningStreamOpen {
-			reasoningStreamOpen = false
-			if !isPlanMode {
-				writeEvent("response.reasoning_summary_text.done", map[string]any{
-					"response_id": respID,
-					"text":        strings.TrimSpace(reasoningText.String()),
-				})
-			}
 		}
 		fullText.WriteString(delta)
 		if !isPlanMode {
@@ -5828,24 +6047,8 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 	}
 
 	startStreamIfNeeded()
-	if reasoningStreamOpen {
-		reasoningStreamOpen = false
-		if !isPlanMode {
-			writeEvent("response.reasoning_summary_text.done", map[string]any{
-				"response_id": respID,
-				"text":        strings.TrimSpace(reasoningText.String()),
-			})
-		}
-	}
 
 	finalText := strings.TrimSpace(fullText.String())
-	if wrapped := wrapReasoningForHistory(reasoningText.String()); wrapped != "" {
-		if finalText == "" {
-			finalText = wrapped
-		} else {
-			finalText = wrapped + "\n\n" + finalText
-		}
-	}
 	if isPlanMode {
 		if shouldRewritePlanModeResponseText(finalText) {
 			if strings.TrimSpace(finalText) == "" && !finishReasonStop {
@@ -5868,6 +6071,13 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 				"delta":         finalText,
 			})
 		}
+	}
+	reasoningDoneText := strings.TrimSpace(reasoningText.String())
+	if reasoningSeen {
+		writeEvent("response.reasoning_summary_text.done", map[string]any{
+			"response_id": respID,
+			"text":        reasoningDoneText,
+		})
 	}
 	writeEvent("response.output_text.done", map[string]any{
 		"response_id":   respID,
@@ -5918,8 +6128,32 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		"output":      []any{finalItem},
 		"output_text": finalText,
 	}
+	if reasoningDoneText != "" {
+		fullResponse["output"] = append(fullResponse["output"].([]any), map[string]any{
+			"id":   fmt.Sprintf("rs_%s_0", respID),
+			"type": "reasoning",
+			"summary": []any{
+				map[string]any{
+					"type": "summary_text",
+					"text": reasoningDoneText,
+				},
+			},
+		})
+	}
 	if len(toolOrder) > 0 {
-		mergedOutput := make([]any, 0, 1+len(toolOrder))
+		mergedOutput := make([]any, 0, 2+len(toolOrder))
+		if reasoningDoneText != "" {
+			mergedOutput = append(mergedOutput, map[string]any{
+				"id":   fmt.Sprintf("rs_%s_0", respID),
+				"type": "reasoning",
+				"summary": []any{
+					map[string]any{
+						"type": "summary_text",
+						"text": reasoningDoneText,
+					},
+				},
+			})
+		}
 		mergedOutput = append(mergedOutput, finalItem)
 		for _, toolIdx := range toolOrder {
 			state := toolStates[toolIdx]
