@@ -227,7 +227,8 @@ func TestRewriteResponsesToolCallPayload(t *testing.T) {
 	assert.Equal(t, float64(1000), action["timeout_ms"])
 
 	second, _ := output[1].(map[string]any)
-	assert.Equal(t, "apply_patch_call", second["type"])
+	assert.Equal(t, "function_call", second["type"])
+	assert.Equal(t, "apply_patch", second["name"])
 	operation, _ := second["operation"].(map[string]any)
 	assert.Equal(t, "update_file", operation["type"])
 	assert.Equal(t, "README.md", operation["path"])
@@ -283,7 +284,8 @@ func TestRewriteResponsesToolCallPayload_ApplyPatchAcceptsPatchString(t *testing
 	}
 
 	item, _ := output[0].(map[string]any)
-	assert.Equal(t, "apply_patch_call", item["type"])
+	assert.Equal(t, "function_call", item["type"])
+	assert.Equal(t, "apply_patch", item["name"])
 	operation, ok := item["operation"].(map[string]any)
 	assert.True(t, ok)
 	assert.Equal(t, "update_file", operation["type"])
@@ -316,7 +318,8 @@ func TestRewriteResponsesToolCallPayload_ApplyPatchAcceptsInputString(t *testing
 	}
 
 	item, _ := output[0].(map[string]any)
-	assert.Equal(t, "apply_patch_call", item["type"])
+	assert.Equal(t, "function_call", item["type"])
+	assert.Equal(t, "apply_patch", item["name"])
 	assert.Equal(t, "in_progress", item["status"])
 	operation, ok := item["operation"].(map[string]any)
 	assert.True(t, ok)
@@ -351,7 +354,8 @@ func TestRewriteResponsesToolCallPayload_ApplyPatchCallKeepsInProgressStatus(t *
 		return
 	}
 	item, _ := output[0].(map[string]any)
-	assert.Equal(t, "apply_patch_call", item["type"])
+	assert.Equal(t, "function_call", item["type"])
+	assert.Equal(t, "apply_patch", item["name"])
 	assert.Equal(t, "call_1", item["call_id"])
 	assert.Equal(t, "in_progress", item["status"])
 	assert.Equal(t, "in_progress", payload["status"])

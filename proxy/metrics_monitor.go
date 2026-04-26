@@ -240,6 +240,24 @@ func (mp *metricsMonitor) consumeUpstreamMetric(modelID, path string, requestSta
 	}
 }
 
+func (mp *metricsMonitor) consumeUpstreamMetricAny(modelID string, paths []string, requestStart time.Time, wait time.Duration) *upstreamTimingCandidate {
+	deadline := time.Now().Add(wait)
+	for {
+		for _, path := range paths {
+			if path == "" {
+				continue
+			}
+			if metric := mp.tryConsumeUpstreamMetric(modelID, path, requestStart); metric != nil {
+				return metric
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func (mp *metricsMonitor) tryConsumeUpstreamMetric(modelID, path string, requestStart time.Time) *upstreamTimingCandidate {
 	mp.upstreamMu.Lock()
 	defer mp.upstreamMu.Unlock()
@@ -477,8 +495,15 @@ func (mp *metricsMonitor) wrapHandler(
 		}
 	}
 
-	if request.URL.Path == "/v1/responses" {
-		if upstreamMetric := mp.consumeUpstreamMetric(modelID, request.URL.Path, requestStart, 250*time.Millisecond); upstreamMetric != nil {
+	if isResponsesEndpoint(request.URL.Path) && (tm.PromptPerSecond < 0 || tm.TokensPerSecond < 0) {
+		paths := []string{
+			"/v1/chat/completions",
+			request.URL.Path,
+			"/v1/responses",
+			"/responses",
+			"/completion",
+		}
+		if upstreamMetric := mp.consumeUpstreamMetricAny(modelID, paths, requestStart, 250*time.Millisecond); upstreamMetric != nil {
 			applyUpstreamTimingMetric(&tm, upstreamMetric)
 		}
 	}

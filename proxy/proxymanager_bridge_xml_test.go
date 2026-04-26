@@ -78,13 +78,13 @@ func TestTranslateChatCompletionToResponsesResponse_ConvertsQwenXMLToolCall(t *t
 
 	msg := output[0].(map[string]any)
 	assert.Equal(t, "message", msg["type"])
-	content := msg["content"].([]any)
-	assert.Equal(t, "Planning done.", content[0].(map[string]any)["text"])
+	assert.Equal(t, "Planning done.", gjson.GetBytes(out, "output.0.content.0.text").String())
 
 	call := output[1].(map[string]any)
-	assert.Equal(t, "shell_call", call["type"])
-	action := call["action"].(map[string]any)
-	assert.Equal(t, "pwd", action["command"])
+	assert.Equal(t, "function_call", call["type"])
+	assert.Equal(t, "shell", call["name"])
+	args := parseToolArgsMapString(fmt.Sprintf("%v", call["arguments"]))
+	assert.Equal(t, "pwd", args["command"])
 }
 
 func TestTranslateChatCompletionToResponsesResponse_EmptyApplyPatchArgsBecomeAssistantMessage(t *testing.T) {
@@ -112,12 +112,12 @@ func TestTranslateChatCompletionToResponsesResponse_EmptyApplyPatchArgsBecomeAss
 	output, ok := resp["output"].([]any)
 	require.True(t, ok)
 	require.Len(t, output, 1)
-	msg := output[0].(map[string]any)
-	assert.Equal(t, "message", msg["type"])
-	content := msg["content"].([]any)
-	text := content[0].(map[string]any)["text"].(string)
-	assert.Contains(t, text, "apply_patch call was not executed")
-	assert.Contains(t, text, "Observed arguments:")
+	call := output[0].(map[string]any)
+	assert.Equal(t, "function_call", call["type"])
+	assert.Equal(t, "apply_patch", call["name"])
+	args := parseToolArgsMapString(fmt.Sprintf("%v", call["arguments"]))
+	_, hasOperation := args["operation"]
+	assert.True(t, hasOperation)
 }
 
 func TestTranslateChatCompletionToResponsesResponse_EmptyApplyPatchArgsUsesPatchFromText(t *testing.T) {
@@ -258,6 +258,15 @@ func TestTranslateChatCompletionToResponsesResponse_ApplyPatchInputArgumentMappe
 	assert.Equal(t, "@@\n-old\n+new", operation["diff"])
 }
 
+func TestConvertApplyPatchTextToOperation_HandlesBackslashLineContinuations(t *testing.T) {
+	raw := "*** Begin Patch\\\n*** Add File: demo.txt\\\n+hello\\\n*** End Patch\\\n"
+	op, ok := convertApplyPatchTextToOperation(raw)
+	require.True(t, ok)
+	assert.Equal(t, "create_file", op["type"])
+	assert.Equal(t, "demo.txt", op["path"])
+	assert.Equal(t, "+hello", op["diff"])
+}
+
 func TestTranslateChatCompletionToResponsesResponse_RecoversPrefixedApplyPatchFromXMLParsedArgs(t *testing.T) {
 	body := []byte(`{
 	  "id": "chatcmpl-test",
@@ -304,6 +313,75 @@ func TestShouldForceStrictApplyPatchRetry(t *testing.T) {
 	assert.True(t, shouldForceStrictApplyPatchRetry("invalid_diff"))
 }
 
+func TestExtractResponsesRequestMode_DetectsPlanModeFromCollaborationInstruction(t *testing.T) {
+	req := map[string]any{
+		"instructions": "You are a coding agent.",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "<collaboration_mode># Plan Mode (Conversational)\nReturn plans only.</collaboration_mode>",
+					},
+				},
+			},
+		},
+	}
+	assert.Equal(t, "plan", extractResponsesRequestMode(req))
+}
+
+func TestExtractResponsesRequestMode_DoesNotInferPlanFromDefaultCollaborationModeText(t *testing.T) {
+	req := map[string]any{
+		"instructions": "<collaboration_mode># Collaboration Mode: Default\nKnown mode names are Default and Plan.</collaboration_mode>",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Please continue in default mode.",
+					},
+				},
+			},
+		},
+	}
+	assert.Equal(t, "", extractResponsesRequestMode(req))
+}
+
+func TestEnforcePlanModeResponse_WrapsMissingProposedPlanTag(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_test",
+		"status":"requires_action",
+		"output":[
+			{
+				"id":"msg_1",
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"# Build Plan\n1. Scope\n2. Test"}]
+			},
+			{
+				"id":"call_1",
+				"type":"function_call",
+				"name":"shell",
+				"call_id":"call_1",
+				"arguments":"{\"command\":\"pwd\"}"
+			}
+		],
+		"output_text":"# Build Plan\n1. Scope\n2. Test"
+	}`)
+
+	out := enforcePlanModeResponse(body)
+	assert.True(t, gjson.GetBytes(out, "output.0.content.0.text").Exists())
+	text := gjson.GetBytes(out, "output.0.content.0.text").String()
+	assert.Contains(t, text, "<proposed_plan>")
+	assert.Contains(t, text, "</proposed_plan>")
+	assert.Equal(t, "completed", gjson.GetBytes(out, "status").String())
+	assert.Equal(t, 1, len(gjson.GetBytes(out, "output").Array()))
+}
+
 func TestRequestMapContainsAnyToolOutput(t *testing.T) {
 	req := map[string]any{
 		"input": []any{
@@ -322,7 +400,7 @@ func TestRequestMapContainsAnyToolOutput(t *testing.T) {
 	assert.False(t, requestMapContainsAnyToolOutput(req2))
 }
 
-func TestTranslateChatCompletionToResponsesResponse_ToolOnlyTurnClearsOutputText(t *testing.T) {
+func TestTranslateChatCompletionToResponsesResponse_KeepsAssistantTextWithToolCall(t *testing.T) {
 	body := []byte(`{
 	  "id": "chatcmpl-test",
 	  "model": "qwen-test",
@@ -347,11 +425,15 @@ func TestTranslateChatCompletionToResponsesResponse_ToolOnlyTurnClearsOutputText
 	require.NoError(t, json.Unmarshal(out, &resp))
 	output, ok := resp["output"].([]any)
 	require.True(t, ok)
-	require.Len(t, output, 1)
+	require.Len(t, output, 2)
 
-	call := output[0].(map[string]any)
+	msg := output[0].(map[string]any)
+	assert.Equal(t, "message", msg["type"])
+	assert.Equal(t, "I will run the tool now", gjson.GetBytes(out, "output.0.content.0.text").String())
+
+	call := output[1].(map[string]any)
 	assert.Equal(t, "function_call", call["type"])
-	assert.Equal(t, "", strings.TrimSpace(resp["output_text"].(string)))
+	assert.Equal(t, "I will run the tool now", strings.TrimSpace(resp["output_text"].(string)))
 }
 
 func TestNormalizeTranslatedResponsesOutput_AddsToolMetadataForSpecializedToolCalls(t *testing.T) {
@@ -373,8 +455,123 @@ func TestNormalizeTranslatedResponsesOutput_AddsToolMetadataForSpecializedToolCa
 	output := resp["output"].([]any)
 	call := output[0].(map[string]any)
 	assert.Equal(t, "shell", call["name"])
-	assert.Equal(t, `{"command":"pwd"}`, call["arguments"])
+	assert.Equal(t, `{"command":"pwd","commands":["pwd"]}`, call["arguments"])
 	assert.Equal(t, "", strings.TrimSpace(resp["output_text"].(string)))
+}
+
+func TestNormalizeTranslatedResponsesOutput_NormalizesShellCommandAndCommands(t *testing.T) {
+	resp := map[string]any{
+		"id": "resp_test",
+		"output": []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "shell",
+				"call_id":   "call_shell",
+				"arguments": `{"commands":["pwd","ls -la"]}`,
+			},
+		},
+	}
+
+	normalizeTranslatedResponsesOutput(resp)
+	output := resp["output"].([]any)
+	call := output[0].(map[string]any)
+	args := parseToolArgsMapString(fmt.Sprintf("%v", call["arguments"]))
+	commands, ok := args["commands"].([]any)
+	require.True(t, ok)
+	require.Len(t, commands, 2)
+	assert.Equal(t, "pwd", fmt.Sprintf("%v", commands[0]))
+}
+
+func TestTranslateChatCompletionToResponsesResponse_UnpacksMultiToolUseParallel(t *testing.T) {
+	body := []byte(`{
+	  "id": "chatcmpl-test",
+	  "model": "qwen-test",
+	  "choices": [{
+	    "message": {
+	      "role": "assistant",
+	      "tool_calls": [{
+	        "id":"call_parallel",
+	        "type":"function",
+	        "function":{
+	          "name":"multi_tool_use.parallel",
+	          "arguments":"{\"tool_uses\":[{\"recipient_name\":\"functions.shell_command\",\"parameters\":{\"command\":\"pwd\"}},{\"recipient_name\":\"functions.update_plan\",\"parameters\":{\"plan\":[{\"step\":\"Check logs\",\"status\":\"in_progress\"}]}}]}"
+	        }
+	      }]
+	    },
+	    "finish_reason":"tool_calls"
+	  }]
+	}`)
+
+	out, err := translateChatCompletionToResponsesResponse(body, "", "", "")
+	require.NoError(t, err)
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(out, &resp))
+	output, ok := resp["output"].([]any)
+	require.True(t, ok)
+	require.Len(t, output, 2)
+
+	first := output[0].(map[string]any)
+	assert.Equal(t, "function_call", first["type"])
+	assert.Equal(t, "shell", first["name"])
+	firstArgs := parseToolArgsMapString(fmt.Sprintf("%v", first["arguments"]))
+	assert.Equal(t, "pwd", firstArgs["command"])
+
+	second := output[1].(map[string]any)
+	assert.Equal(t, "function_call", second["type"])
+	assert.Equal(t, "update_plan", second["name"])
+}
+
+func TestTranslateChatCompletionToResponsesResponse_MapsUsageTokenDetails(t *testing.T) {
+	body := []byte(`{
+	  "id":"chatcmpl-usage",
+	  "model":"qwen-test",
+	  "choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+	  "usage":{
+	    "prompt_tokens":42,
+	    "completion_tokens":18,
+	    "total_tokens":60,
+	    "completion_tokens_details":{"reasoning_tokens":11},
+	    "prompt_tokens_details":{"cached_tokens":7}
+	  }
+	}`)
+
+	out, err := translateChatCompletionToResponsesResponse(body, "", "", "")
+	require.NoError(t, err)
+	assert.Equal(t, int64(11), gjson.GetBytes(out, "usage.output_tokens_details.reasoning_tokens").Int())
+	assert.Equal(t, int64(7), gjson.GetBytes(out, "usage.input_tokens_details.cached_tokens").Int())
+}
+
+func TestSanitizeResponsesInputToolArguments_PrefixRuleInjectsSystemMessage(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "function_call",
+				"name": "shell",
+				"arguments": `{"command":"pwd","prefix_rule":"OK:","justification":"why"}`,
+			},
+		},
+	}
+
+	changed := sanitizeResponsesInputToolArguments(req)
+	require.True(t, changed)
+	input := req["input"].([]any)
+	require.GreaterOrEqual(t, len(input), 2)
+	sysMsg := input[0].(map[string]any)
+	assert.Equal(t, "message", sysMsg["type"])
+	assert.Equal(t, "system", sysMsg["role"])
+	assert.Contains(t, extractResponsesInputText(sysMsg["content"]), "Safety constraint:")
+	call := input[1].(map[string]any)
+	args := parseToolArgsMapString(fmt.Sprintf("%v", call["arguments"]))
+	_, hasPrefixRule := args["prefix_rule"]
+	_, hasJustification := args["justification"]
+	assert.False(t, hasPrefixRule)
+	assert.False(t, hasJustification)
+}
+
+func TestBodyLooksLikeArchitectureUnsupported_DetectsDeltaSignals(t *testing.T) {
+	assert.True(t, bodyLooksLikeArchitectureUnsupported([]byte("unknown arch: gated_delta")))
+	assert.True(t, bodyLooksLikeArchitectureUnsupported([]byte("not implemented: delta op")))
+	assert.False(t, bodyLooksLikeArchitectureUnsupported([]byte("generic timeout")))
 }
 
 func TestTranslateChatCompletionToResponsesResponse_ToolOnlyTurnIsInProgress(t *testing.T) {
@@ -1098,6 +1295,65 @@ func TestTranslateResponsesToChatCompletionsRequest_MediumReasoningRespectsExpli
 	assert.Equal(t, "root ::= custom", gjson.GetBytes(out, "grammar").String())
 }
 
+func TestTranslateResponsesToChatCompletionsRequest_ToolsStripGrammarConstraints(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.2",
+		"reasoning":{"effort":"medium","summary":"auto"},
+		"tools":[{"type":"function","name":"shell_command","parameters":{"type":"object"}}],
+		"grammar":"root ::= custom",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"run diagnostics"}]}]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	assert.True(t, gjson.GetBytes(out, "tools").Exists())
+	assert.False(t, gjson.GetBytes(out, "grammar").Exists())
+	assert.Equal(t, true, gjson.GetBytes(out, "chat_template_kwargs.enable_thinking").Bool())
+}
+
+func TestNormalizeResponsesRequest_AcceptsApplyPatchAliases(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"tools":[
+			{"type":"applypatch"},
+			{"type":"custom","name":"applypatch"},
+			{"type":"apply_patch"}
+		],
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"patch file"}]}]
+	}`)
+
+	out, adapted, unsupported, err := normalizeResponsesRequest(body)
+	require.NoError(t, err)
+	require.Empty(t, unsupported)
+	assert.Contains(t, adapted, "apply_patch")
+	tools := gjson.GetBytes(out, "tools").Array()
+	require.Len(t, tools, 3)
+	for _, tool := range tools {
+		assert.Equal(t, "function", tool.Get("type").String())
+		assert.Equal(t, "__llamaswap_apply_patch", tool.Get("name").String())
+	}
+}
+
+func TestNormalizeResponsesInputItem_AcceptsApplyPatchCallAlias(t *testing.T) {
+	item := map[string]any{
+		"type":    "applypatch_call",
+		"call_id": "call_1",
+		"operation": map[string]any{
+			"type": "update_file",
+			"path": "README.md",
+			"diff": "@@\n-a\n+b",
+		},
+	}
+
+	mapped, changed := normalizeResponsesInputItem(item)
+	require.True(t, changed)
+	m, ok := mapped.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "function_call", m["type"])
+	assert.Equal(t, "__llamaswap_apply_patch", m["name"])
+}
+
 func TestTranslateResponsesToChatCompletionsRequest_NoReasoningEffortLeavesThinkingDefault(t *testing.T) {
 	body := []byte(`{
 		"model":"gpt-5.2",
@@ -1213,8 +1469,7 @@ func TestBuildResponsesBridgeHandler_ForwardsNativeStreamWhenSafe(t *testing.T) 
 	body := []byte(`{
 		"model":"gpt-5.2",
 		"stream":true,
-		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Explain distributed systems"}]}],
-		"tools":[{"type":"function","name":"shell_command"}]
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Explain distributed systems"}]}]
 	}`)
 
 	var upstreamPath string
@@ -1250,4 +1505,127 @@ func TestBuildResponsesBridgeHandler_ForwardsNativeStreamWhenSafe(t *testing.T) 
 	assert.Contains(t, rec.Body.String(), "event: response.completed")
 	assert.Contains(t, rec.Body.String(), "Hello")
 	assert.NotContains(t, rec.Body.String(), "chat.completion.chunk")
+}
+
+func TestBuildResponsesBridgeHandler_StreamRetriesBeforeEmittingResponsesSSE(t *testing.T) {
+	pm := &ProxyManager{}
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"stream":true,
+		"tools":[{"type":"apply_patch"}],
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"patch file now"}]}]
+	}`)
+
+	attempts := 0
+	nextHandler := func(_ string, w http.ResponseWriter, r *http.Request) error {
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":"upstream unavailable"}`))
+			return nil
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered stream\"},\"finish_reason\":null}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		return nil
+	}
+
+	handler := pm.buildResponsesBridgeHandler("gpt-5.3-codex", body, nextHandler)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	req.Header.Set("Accept", "text/event-stream")
+	rec := httptest.NewRecorder()
+	err := handler("gpt-5.3-codex", rec, req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, attempts)
+	assert.Contains(t, rec.Body.String(), "event: response.created")
+	assert.Contains(t, rec.Body.String(), "event: response.output_text.delta")
+	assert.Contains(t, rec.Body.String(), "Recovered stream")
+	assert.Contains(t, rec.Body.String(), "event: response.completed")
+	assert.NotContains(t, rec.Body.String(), "upstream unavailable")
+}
+
+func TestWriteResponsesStreamFromChatSSE_EmitsReasoningSummaryEvents(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"thinking step 1"},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"final answer"},"finish_reason":null}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	err := writeResponsesStreamFromChatSSE(rec, strings.NewReader(upstream), false)
+	require.NoError(t, err)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, "event: response.reasoning_summary_text.delta")
+	assert.Contains(t, body, "event: response.reasoning_summary_text.done")
+	assert.Contains(t, body, "event: response.output_text.delta")
+	assert.Contains(t, body, "event: response.completed")
+	assert.Contains(t, body, "final answer")
+}
+
+func TestWriteResponsesStreamFromChatSSE_EmitsToolCallArgumentDeltas(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Running tool...","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\""}}]},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"pwd\"}"}}]},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	err := writeResponsesStreamFromChatSSE(rec, strings.NewReader(upstream), false)
+	require.NoError(t, err)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, "event: response.function_call_arguments.delta")
+	assert.Contains(t, body, "event: response.function_call_arguments.done")
+	assert.Contains(t, body, `"name":"shell"`)
+	assert.Contains(t, body, `"status":"requires_action"`)
+	assert.Contains(t, body, `"channel":"commentary"`)
+}
+
+func TestWriteResponsesStreamFromChatSSE_PlanModeWrapsOutputAsProposedPlan(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl-plan","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"1. Scope\n2. Risks\n3. Validation"},"finish_reason":null}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	err := writeResponsesStreamFromChatSSE(rec, strings.NewReader(upstream), true)
+	require.NoError(t, err)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, `\u003cproposed_plan\u003e`)
+	assert.Contains(t, body, `\u003c/proposed_plan\u003e`)
+	assert.Contains(t, body, "event: response.output_text.delta")
+	assert.Contains(t, body, "event: response.completed")
+}
+
+func TestRequestLooksLikePlanMode_DetectsSlashAndFlagSignals(t *testing.T) {
+	reqSlash := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "/mode plan\noutline migration"},
+				},
+			},
+		},
+	}
+	assert.True(t, requestLooksLikePlanMode(reqSlash))
+
+	reqFlag := map[string]any{
+		"instructions": "codex run --plan",
+		"input":        []any{},
+	}
+	assert.True(t, requestLooksLikePlanMode(reqFlag))
 }

@@ -1094,6 +1094,38 @@ func TestNormalizeChatCompletionTools(t *testing.T) {
 	assert.Equal(t, "object", parameters["type"])
 }
 
+func TestStripGrammarToolsConflictJSON_StripsGrammarAndJSONSchema(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"messages":[{"role":"user","content":"hello"}],
+		"tools":[{"type":"function","function":{"name":"say_hello","parameters":{"type":"object"}}}],
+		"grammar":"root ::= custom",
+		"response_format":{"type":"json_schema","json_schema":{"name":"demo","schema":{"type":"object"}}}
+	}`)
+
+	out, result, err := stripGrammarToolsConflictJSON(body)
+	assert.NoError(t, err)
+	assert.True(t, result.removedGrammar)
+	assert.True(t, result.removedJSONSchemaResponse)
+	assert.False(t, gjson.GetBytes(out, "grammar").Exists())
+	assert.False(t, gjson.GetBytes(out, "response_format").Exists())
+}
+
+func TestStripGrammarToolsConflictJSON_KeepsJSONObjectMode(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"messages":[{"role":"user","content":"hello"}],
+		"tools":[{"type":"function","function":{"name":"say_hello","parameters":{"type":"object"}}}],
+		"response_format":{"type":"json_object"}
+	}`)
+
+	out, result, err := stripGrammarToolsConflictJSON(body)
+	assert.NoError(t, err)
+	assert.False(t, result.removedGrammar)
+	assert.False(t, result.removedJSONSchemaResponse)
+	assert.Equal(t, "json_object", gjson.GetBytes(out, "response_format.type").String())
+}
+
 func TestProxyManager_ChatCompletionPreservesNativeToolShape(t *testing.T) {
 	config := config.AddDefaultGroupToConfig(config.Config{
 		HealthCheckTimeout: 15,
@@ -1142,6 +1174,78 @@ func TestProxyManager_ChatCompletionPreservesNativeToolShape(t *testing.T) {
 	assert.Contains(t, requestBody, `"description":"Say hello"`)
 	assert.NotContains(t, requestBody, `"function":{"description":"Say hello","name":"say_hello","parameters"`)
 	assert.NotContains(t, requestBody, `"parallel_tool_calls":false`)
+}
+
+func TestProxyManager_ChatCompletionStripsGrammarWhenToolsPresent(t *testing.T) {
+	config := config.AddDefaultGroupToConfig(config.Config{
+		HealthCheckTimeout: 15,
+		LogLevel:           "error",
+		Models: map[string]config.ModelConfig{
+			"model1": getTestSimpleResponderConfig("model1"),
+		},
+	})
+
+	proxy := New(config)
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+
+	reqBody := `{
+		"model":"model1",
+		"messages":[{"role":"user","content":"run"}],
+		"tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
+		"grammar":"root ::= custom",
+		"response_format":{"type":"json_schema","json_schema":{"name":"demo","schema":{"type":"object"}}}
+	}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+	w := CreateTestResponseRecorder()
+
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var response map[string]any
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+
+	requestBody, ok := response["request_body"].(string)
+	if !assert.True(t, ok) {
+		return
+	}
+
+	assert.NotContains(t, requestBody, `"grammar"`)
+	assert.NotContains(t, requestBody, `"response_format":{"type":"json_schema"`)
+}
+
+func TestProxyManager_ChatCompletionKeepsJSONResponseObjectWhenToolsPresent(t *testing.T) {
+	config := config.AddDefaultGroupToConfig(config.Config{
+		HealthCheckTimeout: 15,
+		LogLevel:           "error",
+		Models: map[string]config.ModelConfig{
+			"model1": getTestSimpleResponderConfig("model1"),
+		},
+	})
+
+	proxy := New(config)
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+
+	reqBody := `{
+		"model":"model1",
+		"messages":[{"role":"user","content":"run"}],
+		"tools":[{"type":"function","function":{"name":"shell","parameters":{"type":"object"}}}],
+		"response_format":{"type":"json_object"}
+	}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(reqBody))
+	w := CreateTestResponseRecorder()
+
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var response map[string]any
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+
+	requestBody, ok := response["request_body"].(string)
+	if !assert.True(t, ok) {
+		return
+	}
+
+	assert.Contains(t, requestBody, `"response_format":{"type":"json_object"}`)
 }
 
 func TestNormalizeResponsesRequest_AdaptsBuiltInTools(t *testing.T) {

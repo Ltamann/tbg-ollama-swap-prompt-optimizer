@@ -135,14 +135,7 @@ func parseQwenXMLToolCalls(text string) ([]ParsedToolCall, string) {
 		if len(calls) > 0 {
 			return calls, remaining
 		}
-		calls, remaining = parsePlainNumberedPlanCalls(text)
-		if len(calls) > 0 {
-			return calls, remaining
-		}
-		calls, remaining = parseDecoratedPlanCalls(text)
-		if len(calls) > 0 {
-			return calls, remaining
-		}
+		// Do not synthesize planning tool calls from plain prose blocks.
 		if _, stripped := parseGenericTaggedCalls(text); strings.TrimSpace(stripped) != strings.TrimSpace(text) {
 			return nil, stripped
 		}
@@ -270,10 +263,6 @@ func parseQwenTaggedEnvelopeCalls(text string) ([]ParsedToolCall, string) {
 	calls = append(calls, shellCalls...)
 	working = next
 
-	planCalls, next := parseQwenPlanTaggedCalls(working)
-	calls = append(calls, planCalls...)
-	working = next
-
 	toolUseCalls, next := parseQwenToolUseTaggedCalls(working)
 	calls = append(calls, toolUseCalls...)
 	working = next
@@ -320,8 +309,6 @@ func inferToolNameFromGenericTag(tag string, block string) string {
 		return "apply_patch"
 	case "shell", "shell_command", "terminal", "bash", "sh", "command":
 		return "shell_command"
-	case "update_plan", "proposed_plan", "plan", "todo_list":
-		return "update_plan"
 	case "web_search", "websearch":
 		return "web_search"
 	}
@@ -332,9 +319,6 @@ func inferToolNameFromGenericTag(tag string, block string) string {
 	}
 	if strings.Contains(lower, "\"command\"") {
 		return "shell_command"
-	}
-	if strings.Contains(lower, "\"steps\"") || strings.Contains(lower, "\"plan\"") || strings.Contains(lower, "summary:") {
-		return "update_plan"
 	}
 	return ""
 }
@@ -359,13 +343,6 @@ func buildGenericTaggedToolCall(toolName string, block string) (ParsedToolCall, 
 			patchText = normalizeApplyPatchText(patchText)
 		}
 		call.Arguments["input"] = patchText
-		return call, true
-	case "update_plan":
-		plan := normalizeTaggedPlanSteps(raw)
-		if len(plan) == 0 {
-			return ParsedToolCall{}, false
-		}
-		call.Arguments["plan"] = plan
 		return call, true
 	case "shell_command":
 		cmd := ""
@@ -838,7 +815,7 @@ func parseQwenFunctionStyleToolCalls(text string) ([]ParsedToolCall, string) {
 		return nil, ""
 	}
 	lower := strings.ToLower(trimmed)
-	candidates := []string{"apply_patch(", "shell(", "shell_command(", "update_plan(", "web_search(", "file_search(", "code_interpreter(", "image_generation(", "computer("}
+	candidates := []string{"apply_patch(", "shell(", "shell_command(", "web_search(", "file_search(", "code_interpreter(", "image_generation(", "computer("}
 	callStart := -1
 	for _, c := range candidates {
 		if idx := strings.Index(lower, c); idx >= 0 && (callStart < 0 || idx < callStart) {
@@ -875,18 +852,6 @@ func parseQwenFunctionStyleToolCalls(text string) ([]ParsedToolCall, string) {
 		Name:      name,
 		Arguments: args,
 	}
-	if strings.EqualFold(strings.TrimSpace(call.Name), "update_plan") {
-		if planAny, ok := call.Arguments["steps"]; ok {
-			if normalized := normalizeFunctionStylePlan(planAny); len(normalized) > 0 {
-				call.Arguments = map[string]any{"plan": normalized}
-			}
-		} else if planAny, ok := call.Arguments["plan"]; ok {
-			if normalized := normalizeFunctionStylePlan(planAny); len(normalized) > 0 {
-				call.Arguments = map[string]any{"plan": normalized}
-			}
-		}
-	}
-
 	prefix := strings.TrimSpace(trimmed[:callStart])
 	suffix := strings.TrimSpace(trimmed[closeParen+1:])
 	remaining := strings.TrimSpace(strings.Join([]string{prefix, suffix}, "\n\n"))
