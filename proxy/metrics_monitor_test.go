@@ -234,6 +234,49 @@ data: [DONE]
 	}
 }
 
+func TestMetricsMonitor_WrapHandler_ResponsesBridgeZeroTimingsUsesUpstreamChatCompletionsTimings(t *testing.T) {
+	mm := newMetricsMonitor(testLogger, 10, 0)
+
+	streamBody := `data: {"type":"response.completed","response":{"usage":{"input_tokens":14,"output_tokens":2,"total_tokens":16},"timings":{"prompt_n":14,"predicted_n":2,"prompt_per_second":0,"predicted_per_second":0,"prompt_ms":0,"predicted_ms":0}}}
+
+data: [DONE]
+`
+
+	nextHandler := func(modelID string, w http.ResponseWriter, r *http.Request) error {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			logChunk := strings.Join([]string{
+				"prompt eval time =     258.99 ms /    14 tokens (   18.50 ms per token,    54.06 tokens per second)",
+				"       eval time =      55.05 ms /     2 tokens (   27.52 ms per token,    36.33 tokens per second)",
+				"      total time =     314.03 ms /    16 tokens",
+				"srv  log_server_r: done request: POST /v1/chat/completions 127.0.0.1 200",
+			}, "\n") + "\n"
+			mm.ingestUpstreamLog(modelID, []byte(logChunk))
+		}()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(streamBody))
+		return nil
+	}
+
+	req := httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(`{"model":"test","stream":true}`))
+	rec := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(rec)
+
+	err := mm.wrapHandler("test-model", ginCtx.Writer, req, nextHandler)
+	assert.NoError(t, err)
+
+	metrics := mm.getMetrics()
+	if assert.Len(t, metrics, 1) {
+		assert.Equal(t, 14, metrics[0].InputTokens)
+		assert.Equal(t, 2, metrics[0].OutputTokens)
+		assert.InDelta(t, 54.06, metrics[0].PromptPerSecond, 0.01)
+		assert.InDelta(t, 36.33, metrics[0].TokensPerSecond, 0.01)
+		assert.Equal(t, 314, metrics[0].DurationMs)
+	}
+}
+
 func TestMetricsMonitor_GetMetrics(t *testing.T) {
 	t.Run("returns empty slice when no metrics", func(t *testing.T) {
 		mm := newMetricsMonitor(testLogger, 10, 0)

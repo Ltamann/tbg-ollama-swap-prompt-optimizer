@@ -11,6 +11,7 @@ import (
 // ChatSSEvent is sent through the SSE stream for the Live chat UI.
 type ChatSSEvent struct {
 	ID                int                 `json:"id"`
+	TraceID           string              `json:"trace_id,omitempty"`
 	Timestamp         string              `json:"timestamp"`
 	Model             string              `json:"model"`
 	Endpoint          string              `json:"endpoint"`
@@ -85,6 +86,7 @@ func parseChatEvent(reqPath string, reqBody, respBody []byte, tm TokenMetrics) *
 	evt := &ChatSSEvent{
 		Endpoint:     reqPath,
 		ID:           tm.ID,
+		TraceID:      tm.TraceID,
 		Timestamp:    ts,
 		Model:        model,
 		Status:       tm.StatusCode,
@@ -305,6 +307,14 @@ func parseAssistantResponseFromBody(respBody []byte) *AssistantResponse {
 			if text != "" {
 				contentParts = append(contentParts, text)
 			}
+		case "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done":
+			text := strings.TrimSpace(data.Get("delta").String())
+			if text == "" {
+				text = strings.TrimSpace(data.Get("text").String())
+			}
+			if text != "" {
+				reasoningParts = append(reasoningParts, text)
+			}
 		case "response.completed":
 			stopReason = data.Get("response.status").String()
 		default:
@@ -517,6 +527,15 @@ func parseTimelineFromSSEResponse(respBody []byte) []ChatTimelineEntry {
 				timeline = append(timeline, ChatTimelineEntry{
 					Kind:    "assistant_delta",
 					Title:   "Assistant Stream",
+					Content: text,
+				})
+			}
+		case "response.reasoning_summary_text.delta":
+			text := data.Get("delta").String()
+			if strings.TrimSpace(text) != "" {
+				timeline = append(timeline, ChatTimelineEntry{
+					Kind:    "reasoning",
+					Title:   "Reasoning",
 					Content: text,
 				})
 			}

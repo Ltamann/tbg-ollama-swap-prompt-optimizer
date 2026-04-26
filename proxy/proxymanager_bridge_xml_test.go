@@ -373,7 +373,7 @@ func TestEnforcePlanModeResponse_WrapsMissingProposedPlanTag(t *testing.T) {
 		"output_text":"# Build Plan\n1. Scope\n2. Test"
 	}`)
 
-	out := enforcePlanModeResponse(body)
+	out := enforcePlanModeResponse(body, true)
 	assert.True(t, gjson.GetBytes(out, "output.0.content.0.text").Exists())
 	text := gjson.GetBytes(out, "output.0.content.0.text").String()
 	assert.Contains(t, text, "<proposed_plan>")
@@ -545,8 +545,8 @@ func TestSanitizeResponsesInputToolArguments_PrefixRuleInjectsSystemMessage(t *t
 	req := map[string]any{
 		"input": []any{
 			map[string]any{
-				"type": "function_call",
-				"name": "shell",
+				"type":      "function_call",
+				"name":      "shell",
 				"arguments": `{"command":"pwd","prefix_rule":"OK:","justification":"why"}`,
 			},
 		},
@@ -1162,6 +1162,26 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanModeDisablesToolsAndKeep
 	assert.Contains(t, string(out), "Build a chat app")
 }
 
+func TestTranslateResponsesToChatCompletionsRequest_CodexManagedPlanModeLeavesProxyEnforcementOff(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.2",
+		"mode":"plan",
+		"stream":true,
+		"tools":[{"type":"apply_patch"}],
+		"input":[
+			{"type":"message","role":"system","content":[{"type":"input_text","text":"<collaborationmode>Plan Mode\nConversational work in 3 phases...</collaborationmode>"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Plan the migration"}]}
+		]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	assert.Equal(t, true, gjson.GetBytes(out, "stream").Bool())
+	assert.True(t, gjson.GetBytes(out, "tools").Exists())
+	assert.NotContains(t, string(out), "Planning mode is active. Do NOT execute tasks")
+}
+
 func TestTranslateResponsesToChatCompletionsRequest_SlashModeAndReasoningCommands(t *testing.T) {
 	body := []byte(`{
 		"model":"gpt-5.2",
@@ -1437,7 +1457,7 @@ func TestEnforcePlanModeResponse_RewritesExecutionAndDropsToolCalls(t *testing.T
 		]
 	}`)
 
-	out := enforcePlanModeResponse(body)
+	out := enforcePlanModeResponse(body, true)
 	assert.Contains(t, gjson.GetBytes(out, "output.0.content.0.text").String(), "Planning mode is active")
 	assert.False(t, gjson.GetBytes(out, "output.1").Exists())
 	assert.Equal(t, "completed", gjson.GetBytes(out, "status").String())
@@ -1458,10 +1478,125 @@ func TestEnforcePlanModeResponse_PreservesValidPlanText(t *testing.T) {
 		]
 	}`)
 
-	out := enforcePlanModeResponse(body)
+	out := enforcePlanModeResponse(body, true)
 	text := gjson.GetBytes(out, "output.0.content.0.text").String()
 	assert.Contains(t, text, "1. Define requirements and constraints.")
 	assert.NotContains(t, text, "Planning mode is active. Here is a structured plan only:")
+}
+
+func TestEnforcePlanModeResponse_PreservesPlanTextWithDiffPatchWords(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_plan_patch_words",
+		"object":"response",
+		"status":"completed",
+		"output":[
+			{
+				"id":"msg_1",
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"1. Review the diff to scope changes.\n2. Plan the patch sequencing by module.\n3. Validate rollout and rollback steps."}]
+			}
+		]
+	}`)
+
+	out := enforcePlanModeResponse(body, true)
+	text := gjson.GetBytes(out, "output.0.content.0.text").String()
+	assert.Contains(t, text, "Review the diff")
+	assert.Contains(t, text, "Plan the patch sequencing")
+	assert.NotContains(t, text, "Planning mode is active. Here is a structured plan only:")
+}
+
+func TestEnforcePlanModeResponse_RewritesPhaseOneExplorationWithShellTags(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_plan_phase1_shell",
+		"object":"response",
+		"status":"completed",
+		"output":[
+			{
+				"id":"msg_1",
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"Let me first check if there is existing project context.\n<shell_commands><commands>[{\"command\":\"Get-ChildItem -Force\"}]</commands></shell_commands>"}]
+			}
+		]
+	}`)
+
+	out := enforcePlanModeResponse(body, true)
+	text := gjson.GetBytes(out, "output.0.content.0.text").String()
+	assert.Contains(t, text, "Planning mode is active. Here is a structured plan only:")
+}
+
+func TestIsCodexManagedPlanMode_DetectsCollaborationModeTag(t *testing.T) {
+	msgs := []map[string]any{
+		{"role": "system", "content": "...<collaborationmode>Plan Mode\nConversational work in 3 phases...</collaborationmode>..."},
+	}
+	assert.True(t, isCodexManagedPlanMode(msgs))
+}
+
+func TestIsCodexManagedPlanMode_IgnoresUserMessage(t *testing.T) {
+	msgs := []map[string]any{
+		{"role": "user", "content": "<collaborationmode>Plan Mode</collaborationmode>"},
+	}
+	assert.False(t, isCodexManagedPlanMode(msgs))
+}
+
+func TestIsCodexManagedPlanMode_FalseForPlainSystemPrompt(t *testing.T) {
+	msgs := []map[string]any{
+		{"role": "system", "content": "You are a helpful assistant."},
+	}
+	assert.False(t, isCodexManagedPlanMode(msgs))
+}
+
+func TestIsCodexManagedPlanMode_RequiresBothTagAndPlanMode(t *testing.T) {
+	msgs := []map[string]any{
+		{"role": "system", "content": "<collaborationmode>Default</collaborationmode>"},
+	}
+	assert.False(t, isCodexManagedPlanMode(msgs))
+}
+
+func TestEnforcePlanModeResponse_DoesNotFallbackForEmptyWhenUpstreamNotNormal(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_plan_empty_error",
+		"object":"response",
+		"status":"completed",
+		"output":[
+			{
+				"id":"msg_1",
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":""}]
+			}
+		],
+		"output_text":""
+	}`)
+
+	out := enforcePlanModeResponse(body, false)
+	assert.Equal(t, "", gjson.GetBytes(out, "output.0.content.0.text").String())
+	assert.NotContains(t, string(out), "Planning mode is active. Here is a structured plan only:")
+}
+
+func TestEnforcePlanModeResponse_EmitsLengthDiagnosticForEmptyLengthFinish(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_plan_empty_length",
+		"object":"response",
+		"choices":[{"finish_reason":"length"}],
+		"status":"completed",
+		"output":[
+			{
+				"id":"msg_1",
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":""}]
+			}
+		],
+		"output_text":""
+	}`)
+
+	out := enforcePlanModeResponse(body, false)
+	text := gjson.GetBytes(out, "output.0.content.0.text").String()
+	assert.Contains(t, text, `finish_reason: "length"`)
+	assert.Contains(t, text, "Retry with a higher output token limit")
+	assert.Contains(t, text, "<proposed_plan>")
 }
 
 func TestBuildResponsesBridgeHandler_ForwardsNativeStreamWhenSafe(t *testing.T) {
@@ -1605,6 +1740,25 @@ func TestWriteResponsesStreamFromChatSSE_PlanModeWrapsOutputAsProposedPlan(t *te
 	body := rec.Body.String()
 	assert.Contains(t, body, `\u003cproposed_plan\u003e`)
 	assert.Contains(t, body, `\u003c/proposed_plan\u003e`)
+	assert.Contains(t, body, "event: response.output_text.delta")
+	assert.Contains(t, body, "event: response.completed")
+}
+
+func TestWriteResponsesStreamFromChatSSE_PlanModeLengthEmitsDiagnostic(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl-plan","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	err := writeResponsesStreamFromChatSSE(rec, strings.NewReader(upstream), true)
+	require.NoError(t, err)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, `finish_reason: \"length\"`)
+	assert.Contains(t, body, "Retry with a higher output token limit")
 	assert.Contains(t, body, "event: response.output_text.delta")
 	assert.Contains(t, body, "event: response.completed")
 }

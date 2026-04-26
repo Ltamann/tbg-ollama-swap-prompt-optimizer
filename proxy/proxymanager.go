@@ -1175,6 +1175,62 @@ func requestLooksLikePlanMode(req map[string]any) bool {
 	return false
 }
 
+func isCodexManagedPlanMode(messages []map[string]any) bool {
+	for _, msg := range messages {
+		role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", msg["role"])))
+		if role != "system" {
+			continue
+		}
+		content := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", msg["content"])))
+		if content == "" {
+			continue
+		}
+		hasCollabTag := strings.Contains(content, "<collaborationmode>") || strings.Contains(content, "<collaboration_mode>")
+		if hasCollabTag && strings.Contains(content, "plan mode") {
+			return true
+		}
+	}
+	return false
+}
+
+func isCodexManagedPlanModeFromResponsesRequest(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	input, _ := req["input"].([]any)
+	if len(input) == 0 {
+		return false
+	}
+	systemMessages := make([]map[string]any, 0, len(input))
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["type"])))
+		role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["role"])))
+		if itemType != "message" || role != "system" {
+			continue
+		}
+		systemMessages = append(systemMessages, map[string]any{
+			"role":    "system",
+			"content": extractResponsesInputText(item["content"]),
+		})
+	}
+	return isCodexManagedPlanMode(systemMessages)
+}
+
+func isCodexManagedPlanModeFromResponsesBody(body []byte) bool {
+	if !gjson.ValidBytes(body) {
+		return false
+	}
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return false
+	}
+	return isCodexManagedPlanModeFromResponsesRequest(req)
+}
+
 func extractResponsesRequestReasoningEffort(req map[string]any) string {
 	if req == nil {
 		return ""
@@ -1343,11 +1399,13 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	// (e.g. Qwen variants) never see non-leading system messages.
 	_ = normalizeResponsesInputMap(req)
 	mode := extractResponsesRequestMode(req)
+	codexManagedPlanMode := isCodexManagedPlanModeFromResponsesRequest(req)
+	proxyPlanEnforcement := mode == "plan" && !codexManagedPlanMode
 	reasoningEffort := extractResponsesRequestReasoningEffort(req)
 	stripSlashDirectivesFromResponsesInput(req)
 	sanitizeResponsesInputToolArguments(req)
 
-	if mode == "plan" {
+	if proxyPlanEnforcement {
 		prependSystemInstructionOnce(req, "Planning mode is active. Do NOT execute tasks, claim execution, or start implementing changes.")
 		prependSystemInstructionOnce(req, "Return only a structured plan: numbered phases, assumptions, risks, and validation steps.")
 		prependSystemInstructionOnce(req, "Wrap the final answer in <proposed_plan>...</proposed_plan> tags exactly.")
@@ -1359,7 +1417,7 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 
 	out := map[string]any{}
 	hasToolRequests := false
-	if mode != "plan" {
+	if !proxyPlanEnforcement {
 		if toolsRaw, ok := req["tools"].([]any); ok {
 			hasToolRequests = len(normalizeBridgeChatTools(toolsRaw)) > 0
 		}
@@ -1417,13 +1475,13 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 			}
 		}
 	}
-	if mode != "plan" {
+	if !proxyPlanEnforcement {
 		if v, ok := req["parallel_tool_calls"]; ok {
 			out["parallel_tool_calls"] = v
 		}
 	}
 
-	if mode != "plan" {
+	if !proxyPlanEnforcement {
 		if toolsRaw, ok := req["tools"].([]any); ok {
 			if normalized := normalizeBridgeChatTools(toolsRaw); len(normalized) > 0 {
 				out["tools"] = normalized
@@ -3495,9 +3553,9 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 			channel = "commentary"
 		}
 		output = append(output, map[string]any{
-			"id":   "msg_" + id,
-			"type": "message",
-			"role": "assistant",
+			"id":      "msg_" + id,
+			"type":    "message",
+			"role":    "assistant",
 			"channel": channel,
 			"content": []any{
 				map[string]any{
@@ -4528,6 +4586,8 @@ func shouldRewritePlanModeResponseText(text string) bool {
 	if planHints >= 2 &&
 		!strings.Contains(lower, "```diff") &&
 		!strings.Contains(lower, "```patch") &&
+		!strings.Contains(lower, "*** begin patch") &&
+		!strings.Contains(lower, "*** end patch") &&
 		!strings.Contains(lower, "saved to") &&
 		!strings.Contains(lower, "open the file") {
 		return false
@@ -4565,6 +4625,13 @@ func enforcedPlanModeText() string {
 		"</proposed_plan>"
 }
 
+func planModeLengthDiagnosticText() string {
+	return "<proposed_plan>\n" +
+		"The model stopped early because it hit the max output limit (finish_reason: \"length\") before completing the plan.\n" +
+		"Retry with a higher output token limit or a shorter prompt/context.\n" +
+		"</proposed_plan>"
+}
+
 func ensureProposedPlanWrapper(text string) string {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
@@ -4577,7 +4644,7 @@ func ensureProposedPlanWrapper(text string) string {
 	return "<proposed_plan>\n" + trimmed + "\n</proposed_plan>"
 }
 
-func enforcePlanModeResponse(responseBody []byte) []byte {
+func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool) []byte {
 	if !gjson.ValidBytes(responseBody) {
 		return responseBody
 	}
@@ -4610,7 +4677,25 @@ func enforcePlanModeResponse(responseBody []byte) []byte {
 	}
 
 	planText := strings.TrimSpace(strings.Join(textParts, "\n\n"))
+	finishReason := strings.TrimSpace(strings.ToLower(gjson.GetBytes(responseBody, "choices.0.finish_reason").String()))
 	if shouldRewritePlanModeResponseText(planText) {
+		if planText == "" && !upstreamFinishedNormally {
+			if finishReason == "length" {
+				planText = planModeLengthDiagnosticText()
+			} else {
+				return responseBody
+			}
+		} else {
+			planText = enforcedPlanModeText()
+		}
+	}
+	if strings.TrimSpace(planText) == "" && finishReason == "length" {
+		planText = planModeLengthDiagnosticText()
+	}
+	if strings.TrimSpace(planText) == "" && !upstreamFinishedNormally {
+		return responseBody
+	}
+	if strings.TrimSpace(planText) == "" {
 		planText = enforcedPlanModeText()
 	}
 	planText = ensureProposedPlanWrapper(planText)
@@ -5481,6 +5566,8 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 	fullText := strings.Builder{}
 	reasoningText := strings.Builder{}
 	reasoningStreamOpen := false
+	finishReasonStop := false
+	finishReasonLength := false
 	type toolState struct {
 		index      int
 		itemID     string
@@ -5531,9 +5618,9 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		writeEvent("response.in_progress", map[string]any{"response": responseSkeleton})
 
 		item := map[string]any{
-			"id":   msgID,
-			"type": "message",
-			"role": "assistant",
+			"id":      msgID,
+			"type":    "message",
+			"role":    "assistant",
 			"channel": "final",
 			"content": []any{
 				map[string]any{"type": "output_text", "text": ""},
@@ -5586,6 +5673,12 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		}
 		if chunkModel := strings.TrimSpace(gjson.Get(payload, "model").String()); chunkModel != "" && model == "" {
 			model = chunkModel
+		}
+		if strings.EqualFold(strings.TrimSpace(gjson.Get(payload, "choices.0.finish_reason").String()), "stop") {
+			finishReasonStop = true
+		}
+		if strings.EqualFold(strings.TrimSpace(gjson.Get(payload, "choices.0.finish_reason").String()), "length") {
+			finishReasonLength = true
 		}
 		if usage := gjson.Get(payload, "usage"); usage.Exists() {
 			usageMap := map[string]any{
@@ -5755,16 +5848,26 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 	}
 	if isPlanMode {
 		if shouldRewritePlanModeResponseText(finalText) {
-			finalText = enforcedPlanModeText()
+			if strings.TrimSpace(finalText) == "" && !finishReasonStop {
+				// Upstream did not finish normally; preserve empty/error-shaped output
+				// instead of replacing it with a synthetic plan fallback.
+				if finishReasonLength {
+					finalText = planModeLengthDiagnosticText()
+				}
+			} else {
+				finalText = enforcedPlanModeText()
+			}
 		}
-		finalText = ensureProposedPlanWrapper(finalText)
-		writeEvent("response.output_text.delta", map[string]any{
-			"response_id":   respID,
-			"item_id":       msgID,
-			"output_index":  0,
-			"content_index": 0,
-			"delta":         finalText,
-		})
+		if strings.TrimSpace(finalText) != "" {
+			finalText = ensureProposedPlanWrapper(finalText)
+			writeEvent("response.output_text.delta", map[string]any{
+				"response_id":   respID,
+				"item_id":       msgID,
+				"output_index":  0,
+				"content_index": 0,
+				"delta":         finalText,
+			})
+		}
 	}
 	writeEvent("response.output_text.done", map[string]any{
 		"response_id":   respID,
@@ -5802,10 +5905,10 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 	})
 
 	fullResponse := map[string]any{
-		"id":          respID,
-		"object":      "response",
-		"created_at":  createdAt,
-		"model":       model,
+		"id":         respID,
+		"object":     "response",
+		"created_at": createdAt,
+		"model":      model,
 		"status": func() string {
 			if len(toolOrder) > 0 {
 				return "requires_action"
@@ -5904,6 +6007,8 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 		var initialReq map[string]any
 		_ = json.Unmarshal(bodyBytes, &initialReq)
 		useNativeStreamForward := responsesRequestedStream && shouldUseNativeResponsesBridgeStream(initialReq)
+		addCaptureStage(r.Context(), "bridge.responses_request", bodyBytes)
+		emitMonitor(r.Context(), modelID, "bridge", "in", r.URL.Path, "responses.request", summarizeJSONForLog(bodyBytes), false)
 		execResponsesStreamRequest := func(responsesReq []byte) (int, http.Header, []byte, error) {
 			translated, err := translateResponsesToChatCompletionsRequest(responsesReq)
 			if err != nil {
@@ -5918,6 +6023,8 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 				translated, _ = sjson.SetBytes(translated, "tool_choice", "none")
 				translated, _ = sjson.SetBytes(translated, "parallel_tool_calls", false)
 			}
+			addCaptureStage(r.Context(), "bridge.chat_completions_request", translated)
+			emitMonitor(r.Context(), modelID, "bridge", "out", "/v1/chat/completions", "chat.request", summarizeJSONForLog(translated), false)
 			logTextTransform(pm.transformLogger, modelID, "bridge_request_controls", summarizeResponsesBridgeControls(responsesReq))
 			logTextTransform(pm.transformLogger, modelID, "bridge_sampling_controls", summarizeBridgeSamplingControls(translated))
 			logBodyTransform(pm.transformLogger, modelID, "bridge_translate_responses_to_chat_stream", responsesReq, translated)
@@ -5940,13 +6047,16 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 				bridgeReq.Header.Set("Accept", "text/event-stream")
 
 				rr := httptest.NewRecorder()
-				if err := nextHandler(modelID, rr, bridgeReq); err != nil {
+				upstreamMon := newSSEMonitor(r.Context(), modelID, "upstream_sse", "in", bridgeReq.URL.Path)
+				teeRR := &teeResponseWriter{w: rr, onWrite: upstreamMon.writeChunk}
+				if err := nextHandler(modelID, teeRR, bridgeReq); err != nil {
 					lastErr = err
 					logTextTransform(pm.transformLogger, modelID, "bridge_stream_retry", fmt.Sprintf("class=handler_error attempt=%d/%d error=%v", attempt, maxBridgeAttempts, err))
 				} else {
 					lastCode = rr.Code
 					lastHeader = rr.Header()
 					lastBody = rr.Body.Bytes()
+					addCaptureStage(r.Context(), "bridge.chat_completions_response", lastBody)
 					if rr.Code >= 200 && rr.Code < 300 {
 						return rr.Code, rr.Header(), rr.Body.Bytes(), nil
 					}
@@ -5973,6 +6083,10 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 			return 0, nil, nil, fmt.Errorf("responses bridge stream failed after retries")
 		}
 		execResponsesRequest := func(responsesReq []byte) (int, http.Header, []byte, []byte, error) {
+			isPlanModeRequested := extractResponsesRequestModeFromBody(responsesReq) == "plan"
+			codexManagedPlanMode := isCodexManagedPlanModeFromResponsesBody(responsesReq)
+			enforceProxyPlanMode := isPlanModeRequested && !codexManagedPlanMode
+
 			translated, err := translateResponsesToChatCompletionsRequest(responsesReq)
 			if err != nil {
 				return 0, nil, nil, nil, fmt.Errorf("invalid responses request: %w", err)
@@ -6046,8 +6160,9 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 							if rewritten, changed, rewriteErr := rewriteResponsesToolCallPayload(out, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint); rewriteErr == nil && changed {
 								out = rewritten
 							}
-							if extractResponsesRequestModeFromBody(responsesReq) == "plan" {
-								out = enforcePlanModeResponse(out)
+							if enforceProxyPlanMode {
+								upstreamFinishedNormally := strings.EqualFold(strings.TrimSpace(gjson.GetBytes(lastBody, "choices.0.finish_reason").String()), "stop")
+								out = enforcePlanModeResponse(out, upstreamFinishedNormally)
 							}
 							if strings.Contains(strings.ToLower(string(out)), "apply_patch") {
 								appendApplyPatchTrace("bridge.responses_output", map[string]any{
@@ -6089,6 +6204,83 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 		}
 
 		if responsesRequestedStream {
+			isPlanModeRequested := extractResponsesRequestModeFromBody(bodyBytes) == "plan"
+			codexManagedPlanMode := isCodexManagedPlanModeFromResponsesBody(bodyBytes)
+			enforceProxyPlanMode := isPlanModeRequested && !codexManagedPlanMode
+
+			if useNativeStreamForward || codexManagedPlanMode {
+				translated, err := translateResponsesToChatCompletionsRequest(bodyBytes)
+				if err != nil {
+					return fmt.Errorf("invalid responses request: %w", err)
+				}
+				translated, err = sjson.SetBytes(translated, "stream", true)
+				if err != nil {
+					return fmt.Errorf("error enabling stream for bridge request: %w", err)
+				}
+				// Native fast-forward path strips tools by design. Codex-managed plan mode
+				// should stay transparent and preserve translated tool settings.
+				if useNativeStreamForward && !codexManagedPlanMode {
+					translated, _ = sjson.DeleteBytes(translated, "tools")
+					translated, _ = sjson.SetBytes(translated, "tool_choice", "none")
+					translated, _ = sjson.SetBytes(translated, "parallel_tool_calls", false)
+				}
+				addCaptureStage(r.Context(), "bridge.chat_completions_request", translated)
+				logTextTransform(pm.transformLogger, modelID, "bridge_request_controls", summarizeResponsesBridgeControls(bodyBytes))
+				logTextTransform(pm.transformLogger, modelID, "bridge_sampling_controls", summarizeBridgeSamplingControls(translated))
+				logBodyTransform(pm.transformLogger, modelID, "bridge_translate_responses_to_chat_stream", bodyBytes, translated)
+
+				bridgeReq := r.Clone(r.Context())
+				bridgeReq.URL.Path = "/v1/chat/completions"
+				bridgeReq.Body = io.NopCloser(bytes.NewReader(translated))
+				bridgeReq.ContentLength = int64(len(translated))
+				bridgeReq.Header = r.Header.Clone()
+				bridgeReq.Header.Del("transfer-encoding")
+				bridgeReq.Header.Set("content-length", strconv.Itoa(len(translated)))
+				bridgeReq.Header.Set("Content-Type", "application/json")
+				bridgeReq.Header.Set("Accept", "text/event-stream")
+
+				pr, pw := io.Pipe()
+				upstreamMon := newSSEMonitor(r.Context(), modelID, "upstream_sse", "in", bridgeReq.URL.Path)
+				pwWriter := newPipeResponseWriter(pw)
+				teePW := &teeResponseWriter{w: pwWriter, onWrite: upstreamMon.writeChunk}
+
+				errCh := make(chan error, 1)
+				go func() {
+					err := nextHandler(modelID, teePW, bridgeReq)
+					_ = pw.CloseWithError(err)
+					errCh <- err
+				}()
+
+				var snap headerSnapshot
+				select {
+				case snap = <-pwWriter.headerCh:
+				case err := <-errCh:
+					if err != nil {
+						return err
+					}
+					return fmt.Errorf("upstream stream ended before sending headers")
+				case <-time.After(2 * time.Second):
+					return fmt.Errorf("timeout waiting for upstream stream headers")
+				}
+				if snap.code < 200 || snap.code >= 300 {
+					for k, values := range snap.header {
+						for _, value := range values {
+							w.Header().Add(k, value)
+						}
+					}
+					w.WriteHeader(snap.code)
+					_, _ = io.Copy(w, pr)
+					<-errCh
+					return nil
+				}
+
+				outMon := newSSEMonitor(r.Context(), modelID, "outgoing_sse", "out", r.URL.Path)
+				teeOut := &teeResponseWriter{w: w, onWrite: outMon.writeChunk}
+				err = writeResponsesStreamFromChatSSE(teeOut, pr, enforceProxyPlanMode)
+				<-errCh
+				return err
+			}
+
 			status, headers, streamBody, err := execResponsesStreamRequest(bodyBytes)
 			if err != nil {
 				return err
@@ -6103,8 +6295,9 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 				_, _ = w.Write(streamBody)
 				return nil
 			}
-			isPlanMode := extractResponsesRequestModeFromBody(bodyBytes) == "plan"
-			return writeResponsesStreamFromChatSSE(w, bytes.NewReader(streamBody), isPlanMode)
+			outMon := newSSEMonitor(r.Context(), modelID, "outgoing_sse", "out", r.URL.Path)
+			teeOut := &teeResponseWriter{w: w, onWrite: outMon.writeChunk}
+			return writeResponsesStreamFromChatSSE(teeOut, bytes.NewReader(streamBody), enforceProxyPlanMode)
 		}
 
 		status, headers, _, out, err := execResponsesRequest(bodyBytes)

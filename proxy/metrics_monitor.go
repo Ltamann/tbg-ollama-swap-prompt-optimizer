@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ var errNoStreamingMetrics = errors.New("stream contained no usage/timings payloa
 // TokenMetrics represents parsed token statistics from llama-server logs
 type TokenMetrics struct {
 	ID              int       `json:"id"`
+	TraceID         string    `json:"trace_id,omitempty"`
 	Timestamp       time.Time `json:"timestamp"`
 	Model           string    `json:"model"`
 	StatusCode      int       `json:"status_code"`
@@ -44,6 +46,12 @@ type ReqRespCapture struct {
 	ReqBody     []byte            `json:"req_body"`
 	RespHeaders map[string]string `json:"resp_headers"`
 	RespBody    []byte            `json:"resp_body"`
+	Stages      []CaptureStage    `json:"stages,omitempty"`
+}
+
+type CaptureStage struct {
+	Name    string `json:"name"`
+	Payload []byte `json:"payload"`
 }
 
 // Size returns the approximate memory usage of this capture in bytes
@@ -54,6 +62,9 @@ func (c *ReqRespCapture) Size() int {
 	}
 	for k, v := range c.RespHeaders {
 		size += len(k) + len(v)
+	}
+	for _, s := range c.Stages {
+		size += len(s.Name) + len(s.Payload)
 	}
 	return size
 }
@@ -390,6 +401,21 @@ func (mp *metricsMonitor) wrapHandler(
 	request *http.Request,
 	next func(modelID string, w http.ResponseWriter, r *http.Request) error,
 ) error {
+	traceID := ""
+	if v, ok := request.Context().Value(proxyCtxKey("trace_id")).(string); ok {
+		traceID = strings.TrimSpace(v)
+	}
+	if traceID == "" {
+		traceID = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	limiter := newMonitorLimiter(5000)
+	stageStore := newCaptureStagesStore()
+
+	ctx := context.WithValue(request.Context(), proxyCtxKey("trace_id"), traceID)
+	ctx = context.WithValue(ctx, proxyCtxKey("monitor_limiter"), limiter)
+	ctx = context.WithValue(ctx, proxyCtxKey("capture_stages"), stageStore)
+	request = request.WithContext(ctx)
+
 	requestStart := time.Now()
 
 	// Capture request body and headers if captures enabled
@@ -430,6 +456,7 @@ func (mp *metricsMonitor) wrapHandler(
 
 	// Initialize default metrics - these will always be recorded
 	tm := TokenMetrics{
+		TraceID:    traceID,
 		Timestamp:  time.Now(),
 		Model:      modelID,
 		StatusCode: recorder.Status(),
@@ -495,7 +522,9 @@ func (mp *metricsMonitor) wrapHandler(
 		}
 	}
 
-	if isResponsesEndpoint(request.URL.Path) && (tm.PromptPerSecond < 0 || tm.TokensPerSecond < 0) {
+	// Bridge payloads can report zeroed timing fields; treat non-positive as missing
+	// and recover real timings from llama.cpp upstream logs when available.
+	if isResponsesEndpoint(request.URL.Path) && (tm.PromptPerSecond <= 0 || tm.TokensPerSecond <= 0) {
 		paths := []string{
 			"/v1/chat/completions",
 			request.URL.Path,
@@ -530,12 +559,14 @@ func (mp *metricsMonitor) finalizeMetricCapture(
 		}
 		redactHeaders(respHeaders)
 		delete(respHeaders, "Content-Encoding")
+		stages := getCaptureStages(request.Context())
 		capture = &ReqRespCapture{
 			ReqPath:     request.URL.Path,
 			ReqHeaders:  reqHeaders,
 			ReqBody:     reqBody,
 			RespHeaders: respHeaders,
 			RespBody:    body,
+			Stages:      stages,
 		}
 		// Only set HasCapture if the capture will actually be stored (not too large)
 		if capture.Size() <= mp.maxCaptureSize {

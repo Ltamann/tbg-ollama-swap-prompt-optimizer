@@ -1,18 +1,55 @@
 <script lang="ts">
-  import { liveChatEvents } from "../stores/api";
-  import type { LiveChatEvent, LiveChatTimelineEntry } from "../lib/types";
+  import { liveChatEvents, liveMonitorEvents } from "../stores/api";
+  import type { LiveChatEvent, LiveChatTimelineEntry, LiveMonitorEvent } from "../lib/types";
   import { renderMarkdown } from "../lib/markdown";
   import { Copy, Check, ChevronRight, Brain, Wrench, TerminalSquare, FileText } from "lucide-svelte";
 
   let events = $state<LiveChatEvent[]>([]);
+  let monitor = $state<LiveMonitorEvent[]>([]);
   let scrollContainer: HTMLDivElement | undefined = undefined;
   let isAtBottom = $state(true);
   let copiedId = $state<number | null>(null);
   let reasoningStates = $state<Record<number, boolean>>({});
   let timelineExpandStates = $state<Record<string, boolean>>({});
+  let monitorExpandStates = $state<Record<number, boolean>>({});
+  let monitorByTrace = $state<Record<string, LiveMonitorEvent[]>>({});
+  let userMessagesByEvent = $state<Record<number, Array<{ role: string; content: string }>>>({});
+  let systemMessagesByEvent = $state<Record<number, Array<{ role: string; content: string }>>>({});
+  let recentMonitorItems = $state<LiveMonitorEvent[]>([]);
 
   $effect(() => {
     events = [...$liveChatEvents];
+  });
+
+  $effect(() => {
+    monitor = [...$liveMonitorEvents];
+  });
+
+  $effect(() => {
+    const grouped: Record<string, LiveMonitorEvent[]> = {};
+    for (const item of monitor) {
+      const trace = item.trace_id || "";
+      if (!trace) continue;
+      if (!grouped[trace]) grouped[trace] = [];
+      grouped[trace].push(item);
+    }
+    for (const trace of Object.keys(grouped)) {
+      const items = grouped[trace];
+      grouped[trace] = items.length > 160 ? items.slice(-160) : items;
+    }
+    monitorByTrace = grouped;
+    recentMonitorItems = monitor.length > 160 ? monitor.slice(-160) : monitor;
+  });
+
+  $effect(() => {
+    const users: Record<number, Array<{ role: string; content: string }>> = {};
+    const systems: Record<number, Array<{ role: string; content: string }>> = {};
+    for (const event of events) {
+      users[event.id] = event.messages.filter((m) => m.role === "user");
+      systems[event.id] = event.messages.filter((m) => m.role === "system");
+    }
+    userMessagesByEvent = users;
+    systemMessagesByEvent = systems;
   });
 
   function checkBottom(): void {
@@ -103,6 +140,36 @@
   function evtTimeline(evt: LiveChatEvent): LiveChatTimelineEntry[] {
     return evt.timeline || [];
   }
+
+  function evtTraceID(evt: LiveChatEvent): string {
+    return evt.trace_id || "";
+  }
+
+  function toggleMonitor(eventId: number): void {
+    monitorExpandStates = { ...monitorExpandStates, [eventId]: !monitorExpandStates[eventId] };
+  }
+
+  function isMonitorExpanded(eventId: number): boolean {
+    return !!monitorExpandStates[eventId];
+  }
+
+  function monitorForEvent(evt: LiveChatEvent): LiveMonitorEvent[] {
+    const trace = evtTraceID(evt);
+    if (!trace) return [];
+    return monitorByTrace[trace] || [];
+  }
+
+  function recentMonitor(): LiveMonitorEvent[] {
+    return recentMonitorItems;
+  }
+
+  function userMessagesForEvent(eventId: number): Array<{ role: string; content: string }> {
+    return userMessagesByEvent[eventId] || [];
+  }
+
+  function systemMessagesForEvent(eventId: number): Array<{ role: string; content: string }> {
+    return systemMessagesByEvent[eventId] || [];
+  }
 </script>
 
 <div class="h-full flex flex-col">
@@ -121,6 +188,32 @@
 
   <div class="flex-1 overflow-y-auto" bind:this={scrollContainer}>
     <div class="max-w-4xl mx-auto w-full py-4 px-4 space-y-6">
+      {#if monitor.length > 0}
+        <details class="border border-gray-200 dark:border-white/10 rounded bg-surface p-3">
+          <summary class="cursor-pointer text-xs font-semibold text-txtsecondary">
+            Monitor feed ({monitor.length})
+          </summary>
+          <div class="mt-2 border border-gray-200 dark:border-white/10 rounded bg-surface max-h-[240px] overflow-auto">
+            {#each recentMonitor() as m, idx (m.timestamp + ':' + idx)}
+              <div class="px-3 py-2 border-b border-gray-200 dark:border-white/10 text-[11px] font-mono">
+                <div class="flex flex-wrap gap-x-2 gap-y-1 text-txtsecondary">
+                  <span class="opacity-70">{formatTime(m.timestamp)}</span>
+                  <span class="opacity-50">trace {m.trace_id.slice(-8)}</span>
+                  <span class="text-primary">{m.stage}</span>
+                  <span>{m.direction}</span>
+                  {#if m.endpoint}<span class="opacity-70">{m.endpoint}</span>{/if}
+                  {#if m.event}<span class="opacity-70">{m.event}</span>{/if}
+                  {#if m.truncated}<span class="opacity-70">(truncated)</span>{/if}
+                </div>
+                {#if m.data}
+                  <pre class="mt-1 whitespace-pre-wrap break-all text-txtsecondary">{m.data}</pre>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </details>
+      {/if}
+
       {#each events as event (event.id)}
         {#if evtHasContent(event) || event.messages.length > 0}
           <div class="space-y-4">
@@ -136,10 +229,13 @@
               {#if event.cached_tokens > 0}
                 <span class="text-green-500 opacity-70">· {event.cached_tokens} cached</span>
               {/if}
+              {#if evtTraceID(event)}
+                <span class="opacity-50">· trace {evtTraceID(event).slice(-8)}</span>
+              {/if}
             </div>
 
             <!-- User messages -->
-            {#each event.messages.filter(function(m) { return m.role === "user"; }) as msg (msg.content + event.id)}
+            {#each userMessagesForEvent(event.id) as msg (msg.content + event.id)}
               <div class="flex justify-end">
                 <div class="max-w-[78%] rounded-[1.35rem] px-4 py-3 bg-surface border border-gray-200 dark:border-white/10 shadow-sm">
                   <div class="whitespace-pre-wrap text-txtmain text-sm">{msg.content}</div>
@@ -148,7 +244,7 @@
             {/each}
 
             <!-- System messages -->
-            {#each event.messages.filter(function(m) { return m.role === "system"; }) as msg (msg.content + event.id)}
+            {#each systemMessagesForEvent(event.id) as msg (msg.content + event.id)}
               <div class="flex justify-start">
                 <div class="max-w-full rounded-xl px-4 py-3 bg-surface border border-gray-200 dark:border-white/10 shadow-sm">
                   <div class="whitespace-pre-wrap text-txtsecondary text-sm">{msg.content}</div>
@@ -266,6 +362,34 @@
                     </div>
                   {/if}
                 {/each}
+              </div>
+            {/if}
+
+            {#if monitorForEvent(event).length > 0}
+              <div class="space-y-2">
+                <button class="btn btn--sm" onclick={function() { toggleMonitor(event.id); }}>
+                  {isMonitorExpanded(event.id) ? "Hide" : "Show"} monitor ({monitorForEvent(event).length})
+                </button>
+
+                {#if isMonitorExpanded(event.id)}
+                  <div class="border border-gray-200 dark:border-white/10 rounded bg-surface max-h-[240px] overflow-auto">
+                    {#each monitorForEvent(event) as m, idx (m.timestamp + ':' + idx)}
+                      <div class="px-3 py-2 border-b border-gray-200 dark:border-white/10 text-[11px] font-mono">
+                        <div class="flex flex-wrap gap-x-2 gap-y-1 text-txtsecondary">
+                          <span class="opacity-70">{formatTime(m.timestamp)}</span>
+                          <span class="text-primary">{m.stage}</span>
+                          <span>{m.direction}</span>
+                          {#if m.endpoint}<span class="opacity-70">{m.endpoint}</span>{/if}
+                          {#if m.event}<span class="opacity-70">{m.event}</span>{/if}
+                          {#if m.truncated}<span class="opacity-70">(truncated)</span>{/if}
+                        </div>
+                        {#if m.data}
+                          <pre class="mt-1 whitespace-pre-wrap break-all text-txtsecondary">{m.data}</pre>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
               </div>
             {/if}
           </div>

@@ -103,6 +103,14 @@
       if (data === "[DONE]") continue;
       try {
         const parsed = JSON.parse(data);
+        if (parsed?.type === "response.output_text.delta" && typeof parsed?.delta === "string") {
+          result.content += parsed.delta;
+          continue;
+        }
+        if (parsed?.type === "response.reasoning_summary_text.delta" && typeof parsed?.delta === "string") {
+          result.reasoning += parsed.delta;
+          continue;
+        }
         const delta = parsed.choices?.[0]?.delta;
         if (delta?.content) result.content += delta.content;
         if (delta?.reasoning_content) result.reasoning += delta.reasoning_content;
@@ -285,6 +293,33 @@
             </div>
           {/if}
         </details>
+
+        {#if capture.stages && capture.stages.length > 0}
+          <details class="group" open>
+            <summary
+              class="cursor-pointer font-semibold text-sm uppercase tracking-wider text-txtsecondary hover:text-txtmain"
+            >
+              Stages
+            </summary>
+            <div class="mt-2 space-y-2">
+              {#each capture.stages as stage (stage.name)}
+                <details class="group border border-card-border rounded bg-background overflow-hidden">
+                  <summary class="cursor-pointer px-3 py-2 font-mono text-xs text-primary hover:bg-black/5 dark:hover:bg-white/5">
+                    {stage.name}
+                  </summary>
+                  <div class="p-3 space-y-2">
+                    <button class="tab-btn" onclick={() => copyToClipboard(decodeBody(stage.payload), "resp")}>
+                      Copy
+                    </button>
+                    <div class="bg-background rounded border border-card-border overflow-auto max-h-96">
+                      <pre class="p-3 text-sm font-mono whitespace-pre-wrap break-all">{formatJson(decodeBody(stage.payload))}</pre>
+                    </div>
+                  </div>
+                </details>
+              {/each}
+            </div>
+          </details>
+        {/if}
 
         <!-- Response Headers -->
         <details class="group" open>

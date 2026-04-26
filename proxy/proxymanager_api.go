@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
 	"github.com/gin-gonic/gin"
@@ -353,6 +354,7 @@ const (
 	msgTypeLogData     messageType = "logData"
 	msgTypeMetrics     messageType = "metrics"
 	msgTypeChatEvent   messageType = "chatEvent"
+	msgTypeMonitor     messageType = "monitorEvent"
 )
 
 type messageEnvelope struct {
@@ -369,8 +371,11 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 	// prevent nginx from buffering SSE
 	c.Header("X-Accel-Buffering", "no")
 
-	sendBuffer := make(chan messageEnvelope, 25)
+	priorityBuffer := make(chan messageEnvelope, 250)
+	sendBuffer := make(chan messageEnvelope, 250)
 	ctx, cancel := context.WithCancel(c.Request.Context())
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
 	sendModels := func() {
 		data, err := json.Marshal(pm.getModelStatus())
 		if err == nil {
@@ -421,7 +426,20 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 			return
 		}
 		select {
-		case sendBuffer <- messageEnvelope{Type: msgTypeChatEvent, Data: string(jsonData)}:
+		case priorityBuffer <- messageEnvelope{Type: msgTypeChatEvent, Data: string(jsonData)}:
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+
+	sendMonitorEvent := func(evt LiveMonitorEvent) {
+		jsonData, err := json.Marshal(evt)
+		if err != nil {
+			return
+		}
+		select {
+		case priorityBuffer <- messageEnvelope{Type: msgTypeMonitor, Data: string(jsonData)}:
 		case <-ctx.Done():
 			return
 		default:
@@ -460,6 +478,9 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 	defer pm.metricsMonitor.OnChatCapture(func(reqPath string, reqBody, respBody []byte, tm TokenMetrics) {
 		sendChatEvent(parseChatEvent(reqPath, reqBody, respBody, tm))
 	})()
+	defer event.On(func(e MonitorEvent) {
+		sendMonitorEvent(e.Event)
+	})()
 
 	// send initial batch of data
 	sendLogData("proxy", pm.proxyLogger.GetHistory())
@@ -479,6 +500,38 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 		case <-pm.shutdownCtx.Done():
 			cancel()
 			return
+		case <-ticker.C:
+			_, _ = c.Writer.Write([]byte(": ping\n\n"))
+			c.Writer.Flush()
+			continue
+		default:
+		}
+
+		select {
+		case msg := <-priorityBuffer:
+			c.SSEvent("message", msg)
+			c.Writer.Flush()
+			continue
+		case <-ticker.C:
+			_, _ = c.Writer.Write([]byte(": ping\n\n"))
+			c.Writer.Flush()
+			continue
+		default:
+		}
+
+		select {
+		case <-c.Request.Context().Done():
+			cancel()
+			return
+		case <-pm.shutdownCtx.Done():
+			cancel()
+			return
+		case <-ticker.C:
+			_, _ = c.Writer.Write([]byte(": ping\n\n"))
+			c.Writer.Flush()
+		case msg := <-priorityBuffer:
+			c.SSEvent("message", msg)
+			c.Writer.Flush()
 		case msg := <-sendBuffer:
 			c.SSEvent("message", msg)
 			c.Writer.Flush()

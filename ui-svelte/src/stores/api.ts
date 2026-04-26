@@ -1,5 +1,5 @@
 import { writable } from "svelte/store";
-import type { Model, Metrics, VersionInfo, LogData, APIEventEnvelope, ReqRespCapture, LiveChatEvent } from "../lib/types";
+import type { Model, Metrics, VersionInfo, LogData, APIEventEnvelope, ReqRespCapture, LiveChatEvent, LiveMonitorEvent } from "../lib/types";
 import { connectionState } from "./theme";
 export interface LiveLogEntry {
   id: number;
@@ -35,6 +35,30 @@ function appendLog(newData: string, store: typeof proxyLogs | typeof upstreamLog
 
 export const liveLogEntries = writable<LiveLogEntry[]>([]);
 export const liveChatEvents = writable<LiveChatEvent[]>([]);
+export const liveMonitorEvents = writable<LiveMonitorEvent[]>([]);
+const LIVE_MONITOR_MAX = 1500;
+const LIVE_MONITOR_FLUSH_MS = 120;
+let monitorBuffer: LiveMonitorEvent[] = [];
+let monitorFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function flushMonitorBuffer(): void {
+  if (monitorBuffer.length === 0) return;
+  const chunk = monitorBuffer;
+  monitorBuffer = [];
+  liveMonitorEvents.update((events) => {
+    const updated = [...events, ...chunk];
+    return updated.length > LIVE_MONITOR_MAX ? updated.slice(-LIVE_MONITOR_MAX) : updated;
+  });
+}
+
+function enqueueMonitorEvent(event: LiveMonitorEvent): void {
+  monitorBuffer.push(event);
+  if (monitorFlushTimer) return;
+  monitorFlushTimer = setTimeout(() => {
+    monitorFlushTimer = null;
+    flushMonitorBuffer();
+  }, LIVE_MONITOR_FLUSH_MS);
+}
 
 function appendToLiveLogs(source: "proxy" | "upstream" | "transform", data: string): void {
   if (!data || data.trim() === "") return;
@@ -130,6 +154,12 @@ export function enableAPIEvents(enabled: boolean): void {
               updated.sort((a, b) => a.id - b.id);
               return updated.length > 500 ? updated.slice(-500) : updated;
             });
+            break;
+          }
+
+          case "monitorEvent": {
+            const monitorEvt = JSON.parse(message.data) as LiveMonitorEvent;
+            enqueueMonitorEvent(monitorEvt);
             break;
           }
         }

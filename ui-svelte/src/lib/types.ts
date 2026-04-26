@@ -47,6 +47,7 @@ export interface ReqRespCapture {
   req_body: string; // base64 encoded bytes
   resp_headers: Record<string, string>;
   resp_body: string; // base64 encoded bytes
+  stages?: Array<{ name: string; payload: string }>;
 }
 
 export interface LogData {
@@ -55,7 +56,7 @@ export interface LogData {
 }
 
 export interface APIEventEnvelope {
-  type: "modelStatus" | "logData" | "metrics" | "chatEvent";
+  type: "modelStatus" | "logData" | "metrics" | "chatEvent" | "monitorEvent";
   data: string;
 }
 
@@ -84,6 +85,7 @@ export interface LiveChatTimelineEntry {
 
 export interface LiveChatEvent {
   id: number;
+  trace_id?: string;
   timestamp: string;
   model: string;
   endpoint?: string;
@@ -95,6 +97,18 @@ export interface LiveChatEvent {
   messages: LiveChatMessage[];
   timeline?: LiveChatTimelineEntry[];
   assistant_response?: LiveAssistantResponse;
+}
+
+export interface LiveMonitorEvent {
+  trace_id: string;
+  timestamp: string;
+  model: string;
+  stage: string;
+  direction: string;
+  endpoint?: string;
+  event?: string;
+  data?: string;
+  truncated?: boolean;
 }
 
 export interface VersionInfo {
