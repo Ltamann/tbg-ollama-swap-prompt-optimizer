@@ -47,9 +47,15 @@
     const activeModel = selectedModel || readyModel || localModels[0];
     const modelId = activeModel?.id || "";
     const modelCtx = activeModel?.ctxConfigured || activeModel?.ctxReference || 0;
+
     contextSize.update((current) => {
       if (!modelId || modelCtx <= 0) {
-        if (current.modelId === "" && current.modelCtx === 0 && current.inputCtx === 0 && current.optimizedCtx === 0) {
+        if (
+          current.modelId === "" &&
+          current.modelCtx === 0 &&
+          current.inputCtx === 0 &&
+          current.optimizedCtx === 0
+        ) {
           return current;
         }
         return { modelId: "", modelCtx: 0, inputCtx: 0, optimizedCtx: 0 };
@@ -114,6 +120,14 @@
       Logs
     </a>
     <a
+      href="/live"
+      use:link
+      class="text-gray-600 hover:text-black dark:text-gray-300 dark:hover:text-gray-100 p-1 whitespace-nowrap"
+      class:font-semibold={isActive("/live", $location)}
+    >
+      Live
+    </a>
+    <a
       href="/settings"
       use:link
       class="text-gray-600 hover:text-black dark:text-gray-300 dark:hover:text-gray-100 p-1 whitespace-nowrap"
@@ -121,6 +135,7 @@
     >
       Settings
     </a>
+
     <button onclick={toggleTheme} title="Toggle theme">
       {#if $isDarkMode}
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
@@ -138,6 +153,7 @@
         </svg>
       {/if}
     </button>
+
     <ConnectionStatus />
   </menu>
 

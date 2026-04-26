@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 )
@@ -111,8 +113,45 @@ func (pg *ProcessGroup) EnsureStarted(modelID string) error {
 	if process.CurrentState() == StateReady {
 		return nil
 	}
+	const maxStartAttempts = 8
+	var lastErr error
+	for attempt := 1; attempt <= maxStartAttempts; attempt++ {
+		if process.CurrentState() == StateReady {
+			return nil
+		}
+		if err := process.start(); err != nil {
+			lastErr = err
+			if !isTransientStartError(err) || attempt == maxStartAttempts {
+				return err
+			}
+			pg.proxyLogger.Infof("<%s> transient startup failure in EnsureStarted, retrying (%d/%d): %v", modelID, attempt, maxStartAttempts, err)
+			time.Sleep(time.Duration(attempt) * 250 * time.Millisecond)
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
 
-	return process.start()
+func isTransientStartError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if msg == "" {
+		return false
+	}
+	transientMarkers := []string{
+		"upstream command exited prematurely but successfully",
+		"process was already starting but wound up in state stopped",
+		"processes was in state starting when start() was called",
+	}
+	for _, marker := range transientMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (pg *ProcessGroup) StopProcess(modelID string, strategy StopStrategy) error {

@@ -90,6 +90,8 @@ type Process struct {
 	runtimeFitMode atomic.Int32
 	// 0 = use --ctx-size as selected target, 1 = use --fit-ctx as minimum floor
 	runtimeFitCtxMode atomic.Int32
+	// unix nano timestamp of last unexpected exit (not part of a requested stop)
+	lastUnexpectedExitUnixNano atomic.Int64
 }
 
 func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, processLogger *LogMonitor, proxyLogger *LogMonitor, transformLogger *LogMonitor) *Process {
@@ -153,18 +155,16 @@ func normalizeResponsesToolCallResponse(resp *http.Response, transformLogger *Lo
 		return nil
 	}
 
-	adapterHeader := resp.Request.Header.Get(llamaSwapResponseToolAdapterHeader)
-	if strings.TrimSpace(adapterHeader) == "" {
-		return nil
-	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
 	resp.Body.Close()
 
-	updated, changed, err := rewriteResponsesToolCallPayload(body)
+	pathHint := strings.TrimSpace(resp.Request.Header.Get(llamaSwapApplyPatchPathHintHeader))
+	contentHint := strings.TrimSpace(resp.Request.Header.Get(llamaSwapApplyPatchContentHintHeader))
+	typeHint := strings.TrimSpace(resp.Request.Header.Get(llamaSwapApplyPatchTypeHintHeader))
+	updated, changed, err := rewriteResponsesToolCallPayload(body, pathHint, contentHint, typeHint)
 	if err != nil {
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		resp.ContentLength = int64(len(body))
@@ -186,7 +186,7 @@ func normalizeResponsesToolCallResponse(resp *http.Response, transformLogger *Lo
 	return nil
 }
 
-func rewriteResponsesToolCallPayload(body []byte) ([]byte, bool, error) {
+func rewriteResponsesToolCallPayload(body []byte, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string) ([]byte, bool, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, false, err
@@ -200,7 +200,7 @@ func rewriteResponsesToolCallPayload(body []byte) ([]byte, bool, error) {
 	changed := false
 	normalized := make([]any, 0, len(output))
 	for _, rawItem := range output {
-		item, itemChanged := rewriteResponsesOutputItem(rawItem)
+		item, itemChanged := rewriteResponsesOutputItem(rawItem, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint)
 		if itemChanged {
 			changed = true
 		}
@@ -212,6 +212,9 @@ func rewriteResponsesToolCallPayload(body []byte) ([]byte, bool, error) {
 	}
 
 	payload["output"] = normalized
+	if responseNeedsToolContinuation(mustJSONBytes(payload)) {
+		payload["status"] = "in_progress"
+	}
 	updated, err := json.Marshal(payload)
 	if err != nil {
 		return nil, false, err
@@ -219,13 +222,67 @@ func rewriteResponsesToolCallPayload(body []byte) ([]byte, bool, error) {
 	return updated, true, nil
 }
 
-func rewriteResponsesOutputItem(rawItem any) (any, bool) {
+func rewriteResponsesOutputItem(rawItem any, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string) (any, bool) {
 	item, ok := rawItem.(map[string]any)
 	if !ok {
 		return rawItem, false
 	}
 
 	itemType, _ := item["type"].(string)
+	if itemType == "apply_patch_call" {
+		operation := normalizeApplyPatchOperation(item["operation"])
+		if opMap, ok := operation.(map[string]any); ok && strings.TrimSpace(applyPatchPathHint) != "" {
+			opType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", opMap["type"])))
+			opPath := strings.TrimSpace(fmt.Sprintf("%v", opMap["path"]))
+			if (opType == "create_file" || opType == "update_file" || opType == "delete_file") &&
+				looksLikeAbsoluteWindowsOrUNCPath(opPath) {
+				opMap["path"] = normalizeApplyPatchPathForWorkspace(applyPatchPathHint)
+				operation = opMap
+			}
+		}
+		if (!hasNonEmptyApplyPatchOperation(operation) || !applyPatchOperationPayloadValid(operation)) &&
+			strings.TrimSpace(applyPatchPathHint) != "" {
+			fallbackType := normalizeApplyPatchTypeHint(applyPatchTypeHint)
+			if fallbackType == "" {
+				fallbackType = "create_file"
+			}
+			recovered := map[string]any{
+				"type": fallbackType,
+				"path": normalizeApplyPatchPathForWorkspace(applyPatchPathHint),
+			}
+			if strings.TrimSpace(applyPatchContentHint) != "" {
+				recovered["content"] = strings.TrimSpace(applyPatchContentHint)
+			}
+			if applyPatchOperationPayloadValid(recovered) {
+				operation = recovered
+			}
+		}
+		if !hasNonEmptyApplyPatchOperation(operation) || !applyPatchOperationPayloadValid(operation) {
+			rewritten := map[string]any{
+				"id":   fmt.Sprintf("msg_%v_apply_patch_invalid", item["id"]),
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{
+						"type": "output_text",
+						"text": "apply_patch call was not executed because operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update.",
+					},
+				},
+			}
+			return rewritten, true
+		}
+		rewritten := cloneMap(item)
+		// Prefer `function_call` so Codex CLI can dispatch apply_patch as a tool.
+		rewritten["type"] = "function_call"
+		rewritten["status"] = "in_progress"
+		rewritten["operation"] = operation
+		input := strings.TrimSpace(buildApplyPatchInputFromOperation(operation))
+		payload := map[string]any{"input": input, "operation": operation}
+		rewritten["name"] = "apply_patch"
+		rewritten["arguments"] = mustJSONString(payload)
+		delete(rewritten, "input")
+		return rewritten, true
+	}
 	if itemType != "function_call" {
 		return rawItem, false
 	}
@@ -251,18 +308,67 @@ func rewriteResponsesOutputItem(rawItem any) (any, bool) {
 		delete(rewritten, "name")
 		rewritten["action"] = action
 		return rewritten, true
-	case llamaSwapApplyPatchFunctionName:
-		operation := map[string]any{}
-		if args := parseJSONMapString(item["arguments"]); args != nil {
-			if rawOperation, ok := args["operation"].(map[string]any); ok {
-				operation = rawOperation
+	case llamaSwapApplyPatchFunctionName, "apply_patch":
+		var operation any = map[string]any{}
+		args := parseJSONMapString(item["arguments"])
+		if args != nil {
+			operation = selectApplyPatchOperation(args)
+			if (!hasNonEmptyApplyPatchOperation(operation) || !applyPatchOperationPayloadValid(operation)) &&
+				strings.TrimSpace(applyPatchPathHint) != "" {
+				fallbackType := normalizeApplyPatchTypeHint(applyPatchTypeHint)
+				if fallbackType == "" {
+					fallbackType = "create_file"
+				}
+				recovered := map[string]any{
+					"type": fallbackType,
+					"path": normalizeApplyPatchPathForWorkspace(applyPatchPathHint),
+				}
+				patch := strings.TrimSpace(fmt.Sprintf("%v", args["patch"]))
+				input := strings.TrimSpace(fmt.Sprintf("%v", args["input"]))
+				diff := normalizeApplyPatchDiff(strings.TrimSpace(fmt.Sprintf("%v", args["diff"])))
+				content := strings.TrimSpace(fmt.Sprintf("%v", args["content"]))
+				switch {
+				case content != "":
+					recovered["content"] = content
+				case diff != "":
+					recovered["diff"] = diff
+				case patch != "" && !looksLikeFilePathHint(patch):
+					recovered["content"] = patch
+				case input != "" && !looksLikeFilePathHint(input):
+					recovered["content"] = input
+				case strings.TrimSpace(applyPatchContentHint) != "":
+					recovered["content"] = strings.TrimSpace(applyPatchContentHint)
+				}
+				if applyPatchOperationPayloadValid(recovered) {
+					operation = recovered
+				}
 			}
 		}
+		if !hasNonEmptyApplyPatchOperation(operation) || !applyPatchOperationPayloadValid(operation) {
+			rewritten := map[string]any{
+				"id":   fmt.Sprintf("msg_%v_apply_patch_invalid", item["id"]),
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{
+						"type": "output_text",
+						"text": "apply_patch call was not executed because operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update.",
+					},
+				},
+			}
+			return rewritten, true
+		}
 		rewritten := cloneMap(item)
-		rewritten["type"] = "apply_patch_call"
-		delete(rewritten, "arguments")
-		delete(rewritten, "name")
-		rewritten["operation"] = operation
+		// Keep as `function_call` so Codex CLI can dispatch apply_patch as a tool.
+		rewritten["type"] = "function_call"
+		rewritten["status"] = "in_progress"
+		normalizedOperation := normalizeApplyPatchOperation(operation)
+		rewritten["operation"] = normalizedOperation
+		input := strings.TrimSpace(buildApplyPatchInputFromOperation(normalizedOperation))
+		payload := map[string]any{"input": input, "operation": normalizedOperation}
+		rewritten["name"] = "apply_patch"
+		rewritten["arguments"] = mustJSONString(payload)
+		delete(rewritten, "input")
 		return rewritten, true
 	case llamaSwapWebSearchFunctionName:
 		action := map[string]any{}
@@ -506,6 +612,18 @@ func (p *Process) start() error {
 
 	// waitStarting.Add(1) is now called atomically in swapState() when transitioning to StateStarting
 	defer p.waitStarting.Done()
+
+	// Avoid immediate restart thrash after unexpected exits (common with GPU backends).
+	if last := p.lastUnexpectedExitUnixNano.Load(); last > 0 {
+		elapsed := time.Since(time.Unix(0, last))
+		const minRestartDelay = 1500 * time.Millisecond
+		if elapsed < minRestartDelay {
+			waitFor := minRestartDelay - elapsed
+			p.proxyLogger.Debugf("<%s> delaying restart for %v after unexpected exit", p.ID, waitFor)
+			time.Sleep(waitFor)
+		}
+	}
+
 	cmdContext, ctxCancelUpstream := context.WithCancel(context.Background())
 
 	p.cmd = exec.CommandContext(cmdContext, args[0], args[1:]...)
@@ -1027,6 +1145,7 @@ func (p *Process) waitForCmd() {
 		}
 	default:
 		p.proxyLogger.Infof("<%s> process exited but not StateStopping, current state: %s", p.ID, currentState)
+		p.lastUnexpectedExitUnixNano.Store(time.Now().UnixNano())
 		p.forceState(StateStopped) // force it to be in this state
 	}
 

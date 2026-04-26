@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,10 +15,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
+
+var errNoStreamingMetrics = errors.New("stream contained no usage/timings payload")
 
 // TokenMetrics represents parsed token statistics from llama-server logs
 type TokenMetrics struct {
@@ -79,6 +82,10 @@ type metricsMonitor struct {
 	captureSize    int                    // current total size in bytes
 	maxCaptureSize int                    // max bytes for captures
 
+	// chatEvent callbacks — invoked when a chat capture is added
+	chatMu        sync.RWMutex
+	chatCallbacks []func(reqPath string, reqBody, respBody []byte, tm TokenMetrics)
+
 	upstreamMu       sync.Mutex
 	upstreamStates   map[string]*upstreamLogState
 	maxUpstreamQueue int
@@ -88,15 +95,15 @@ type metricsMonitor struct {
 // capture buffer size in megabytes; 0 disables captures.
 func newMetricsMonitor(logger *LogMonitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
 	return &metricsMonitor{
-		logger:         logger,
-		metrics:        make([]TokenMetrics, 0),
-		maxMetrics:     maxMetrics,
-		enableCaptures: captureBufferMB > 0,
-		captures:       make(map[int]ReqRespCapture),
-		captureOrder:   make([]int, 0),
-		captureSize:    0,
-		maxCaptureSize: captureBufferMB * 1024 * 1024,
-		upstreamStates: make(map[string]*upstreamLogState),
+		logger:           logger,
+		metrics:          make([]TokenMetrics, 0),
+		maxMetrics:       maxMetrics,
+		enableCaptures:   captureBufferMB > 0,
+		captures:         make(map[int]ReqRespCapture),
+		captureOrder:     make([]int, 0),
+		captureSize:      0,
+		maxCaptureSize:   captureBufferMB * 1024 * 1024,
+		upstreamStates:   make(map[string]*upstreamLogState),
 		maxUpstreamQueue: 32,
 	}
 }
@@ -308,11 +315,32 @@ func (mp *metricsMonitor) addCapture(capture ReqRespCapture) {
 func (mp *metricsMonitor) getCaptureByID(id int) *ReqRespCapture {
 	mp.mu.RLock()
 	defer mp.mu.RUnlock()
-
-	if capture, exists := mp.captures[id]; exists {
-		return &capture
+	capture, ok := mp.captures[id]
+	if !ok {
+		return nil
 	}
-	return nil
+	return &capture
+}
+
+// OnChatCapture registers a callback that is invoked when a chat request/response
+// capture is added. Returns a function to unregister the callback.
+func (mp *metricsMonitor) OnChatCapture(fn func(reqPath string, reqBody, respBody []byte, tm TokenMetrics)) func() {
+	mp.chatMu.Lock()
+	defer mp.chatMu.Unlock()
+	mp.chatCallbacks = append(mp.chatCallbacks, fn)
+	return func() {}
+}
+
+// invokeChatCaptureCallbacks calls all registered chat capture callbacks.
+func (mp *metricsMonitor) invokeChatCaptureCallbacks(reqPath string, reqBody, respBody []byte, tm TokenMetrics) {
+	mp.chatMu.RLock()
+	fns := make([]func(reqPath string, reqBody, respBody []byte, tm TokenMetrics), len(mp.chatCallbacks))
+	copy(fns, mp.chatCallbacks)
+	mp.chatMu.RUnlock()
+
+	for _, fn := range fns {
+		fn(reqPath, reqBody, respBody, tm)
+	}
 }
 
 // getMetrics returns a copy of the current metrics
@@ -411,7 +439,11 @@ func (mp *metricsMonitor) wrapHandler(
 	}
 	if strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
 		if parsed, err := processStreamingResponse(modelID, requestStart, body); err != nil {
-			mp.logger.Warnf("error processing streaming response: %v, path=%s, recording minimal metrics", err, request.URL.Path)
+			if errors.Is(err, errNoStreamingMetrics) {
+				mp.logger.Debugf("streaming response had no usage/timings payload, path=%s", request.URL.Path)
+			} else {
+				mp.logger.Warnf("error processing streaming response: %v, path=%s, recording minimal metrics", err, request.URL.Path)
+			}
 		} else {
 			tm = parsed
 			tm.StatusCode = recorder.Status()
@@ -494,10 +526,22 @@ func (mp *metricsMonitor) finalizeMetricCapture(
 		mp.addCapture(*capture)
 	}
 
+	// Invoke chat event callbacks for streaming live UI
+	mp.invokeChatCaptureCallbacks(request.URL.Path, reqBody, body, tm)
+
 	return nil
 }
 
 func processStreamingResponse(modelID string, start time.Time, body []byte) (TokenMetrics, error) {
+	if gjson.ValidBytes(body) {
+		parsed := gjson.ParseBytes(body)
+		usage, timings := extractUsageAndTimings(parsed)
+		if usage.Exists() || timings.Exists() {
+			return parseMetrics(modelID, start, usage, timings)
+		}
+		return TokenMetrics{}, errNoStreamingMetrics
+	}
+
 	// Iterate **backwards** through the body looking for the data payload with
 	// usage data. This avoids allocating a slice of all lines via bytes.Split.
 
@@ -537,8 +581,7 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Tok
 
 		if gjson.ValidBytes(data) {
 			parsed := gjson.ParseBytes(data)
-			usage := parsed.Get("usage")
-			timings := parsed.Get("timings")
+			usage, timings := extractUsageAndTimings(parsed)
 
 			if usage.Exists() || timings.Exists() {
 				return parseMetrics(modelID, start, usage, timings)
@@ -546,7 +589,21 @@ func processStreamingResponse(modelID string, start time.Time, body []byte) (Tok
 		}
 	}
 
-	return TokenMetrics{}, fmt.Errorf("no valid JSON data found in stream")
+	return TokenMetrics{}, errNoStreamingMetrics
+}
+
+func extractUsageAndTimings(parsed gjson.Result) (gjson.Result, gjson.Result) {
+	usage := parsed.Get("usage")
+	timings := parsed.Get("timings")
+
+	// Responses streaming payloads often nest metrics under response.{usage,timings}.
+	if !usage.Exists() {
+		usage = parsed.Get("response.usage")
+	}
+	if !timings.Exists() {
+		timings = parsed.Get("response.timings")
+	}
+	return usage, timings
 }
 
 func parseMetrics(modelID string, start time.Time, usage, timings gjson.Result) (TokenMetrics, error) {

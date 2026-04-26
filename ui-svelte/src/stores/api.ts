@@ -1,6 +1,14 @@
 import { writable } from "svelte/store";
-import type { Model, Metrics, VersionInfo, LogData, APIEventEnvelope, ReqRespCapture } from "../lib/types";
+import type { Model, Metrics, VersionInfo, LogData, APIEventEnvelope, ReqRespCapture, LiveChatEvent } from "../lib/types";
 import { connectionState } from "./theme";
+export interface LiveLogEntry {
+  id: number;
+  source: "proxy" | "upstream" | "transform";
+  timestamp: Date;
+  content: string;
+}
+
+let logEntryId = 0;
 
 const LOG_LENGTH_LIMIT = 1024 * 100; /* 100KB of log data */
 
@@ -22,6 +30,23 @@ function appendLog(newData: string, store: typeof proxyLogs | typeof upstreamLog
   store.update((prev) => {
     const updatedLog = prev + newData;
     return updatedLog.length > LOG_LENGTH_LIMIT ? updatedLog.slice(-LOG_LENGTH_LIMIT) : updatedLog;
+  });
+}
+
+export const liveLogEntries = writable<LiveLogEntry[]>([]);
+export const liveChatEvents = writable<LiveChatEvent[]>([]);
+
+function appendToLiveLogs(source: "proxy" | "upstream" | "transform", data: string): void {
+  if (!data || data.trim() === "") return;
+  liveLogEntries.update((entries) => {
+    const newEntry: LiveLogEntry = {
+      id: ++logEntryId,
+      source,
+      timestamp: new Date(),
+      content: data,
+    };
+    const updated = [...entries, newEntry];
+    return updated.length > 2000 ? updated.slice(-2000) : updated;
   });
 }
 
@@ -71,12 +96,15 @@ export function enableAPIEvents(enabled: boolean): void {
             switch (logData.source) {
               case "proxy":
                 appendLog(logData.data, proxyLogs);
+                appendToLiveLogs("proxy", logData.data);
                 break;
               case "upstream":
                 appendLog(logData.data, upstreamLogs);
+                appendToLiveLogs("upstream", logData.data);
                 break;
               case "transform":
                 appendLog(logData.data, transformLogs);
+                appendToLiveLogs("transform", logData.data);
                 break;
             }
             break;
@@ -85,6 +113,23 @@ export function enableAPIEvents(enabled: boolean): void {
           case "metrics": {
             const newMetrics = JSON.parse(message.data) as Metrics[];
             metrics.update((prevMetrics) => [...newMetrics, ...prevMetrics]);
+            break;
+          }
+
+          case "chatEvent": {
+            const chatEvt = JSON.parse(message.data) as LiveChatEvent;
+            liveChatEvents.update((events) => {
+              const existingIdx = events.findIndex((e) => e.id === chatEvt.id);
+              let updated: LiveChatEvent[];
+              if (existingIdx >= 0) {
+                updated = [...events];
+                updated[existingIdx] = chatEvt;
+              } else {
+                updated = [...events, chatEvt];
+              }
+              updated.sort((a, b) => a.id - b.id);
+              return updated.length > 500 ? updated.slice(-500) : updated;
+            });
             break;
           }
         }

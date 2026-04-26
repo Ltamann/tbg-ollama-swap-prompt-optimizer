@@ -55,8 +55,46 @@ export interface LogData {
 }
 
 export interface APIEventEnvelope {
-  type: "modelStatus" | "logData" | "metrics";
+  type: "modelStatus" | "logData" | "metrics" | "chatEvent";
   data: string;
+}
+
+export interface LiveChatMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
+export interface LiveAssistantResponse {
+  content?: string;
+  reasoning_content?: string;
+  stop_reason?: string;
+}
+
+export interface LiveChatTimelineEntry {
+  kind: string;
+  role?: string;
+  title?: string;
+  content?: string;
+  tool_name?: string;
+  call_id?: string;
+  status?: string;
+  output_preview?: string;
+  truncated?: boolean;
+}
+
+export interface LiveChatEvent {
+  id: number;
+  timestamp: string;
+  model: string;
+  endpoint?: string;
+  status: number;
+  duration_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  messages: LiveChatMessage[];
+  timeline?: LiveChatTimelineEntry[];
+  assistant_response?: LiveAssistantResponse;
 }
 
 export interface VersionInfo {

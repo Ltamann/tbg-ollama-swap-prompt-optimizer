@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -98,6 +98,34 @@ func TestMetricsMonitor_AddMetrics(t *testing.T) {
 			t.Fatal("timeout waiting for event")
 		}
 	})
+}
+
+func TestProcessStreamingResponse_ParsesPlainJSONBody(t *testing.T) {
+	start := time.Now()
+	body := []byte(`{"usage":{"prompt_tokens":7,"completion_tokens":9}}`)
+	metrics, err := processStreamingResponse("test-model", start, body)
+	assert.NoError(t, err)
+	assert.Equal(t, 7, metrics.InputTokens)
+	assert.Equal(t, 9, metrics.OutputTokens)
+}
+
+func TestProcessStreamingResponse_ParsesResponsesNestedUsage(t *testing.T) {
+	start := time.Now()
+	body := []byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":34}}}
+
+data: [DONE]
+`)
+	metrics, err := processStreamingResponse("test-model", start, body)
+	assert.NoError(t, err)
+	assert.Equal(t, 12, metrics.InputTokens)
+	assert.Equal(t, 34, metrics.OutputTokens)
+}
+
+func TestProcessStreamingResponse_NoMetricsPayloadReturnsSentinel(t *testing.T) {
+	start := time.Now()
+	body := []byte("event: response.created\ndata: {\"foo\":\"bar\"}\n\n")
+	_, err := processStreamingResponse("test-model", start, body)
+	assert.ErrorIs(t, err, errNoStreamingMetrics)
 }
 
 func TestMetricsMonitor_UpstreamLogParsing(t *testing.T) {

@@ -3,6 +3,9 @@ package config
 import (
 	"errors"
 	"runtime"
+	"slices"
+	"sort"
+	"strings"
 )
 
 type ModelConfig struct {
@@ -108,4 +111,69 @@ func (m *ModelFilters) UnmarshalYAML(unmarshal func(interface{}) error) error {
 // Returns ([]string, error) to match existing API
 func (f ModelFilters) SanitizedStripParams() ([]string, error) {
 	return f.Filters.SanitizedStripParams(), nil
+}
+
+// ProtectedParams is a list of parameters that cannot be set or stripped via filters.
+var ProtectedParams = []string{"model"}
+
+// Filters contains filter settings for modifying request parameters.
+type Filters struct {
+	// StripParams is a comma-separated list of parameters to remove from requests.
+	StripParams string `yaml:"stripParams"`
+	// SetParams is a dictionary of parameters to set/override in requests.
+	SetParams map[string]any `yaml:"setParams"`
+}
+
+// SanitizedStripParams returns a sorted list of parameters to strip with
+// duplicates/empty/protected params removed.
+func (f Filters) SanitizedStripParams() []string {
+	if f.StripParams == "" {
+		return nil
+	}
+
+	params := strings.Split(f.StripParams, ",")
+	cleaned := make([]string, 0, len(params))
+	seen := make(map[string]bool)
+
+	for _, param := range params {
+		trimmed := strings.TrimSpace(param)
+		if slices.Contains(ProtectedParams, trimmed) || trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		cleaned = append(cleaned, trimmed)
+	}
+
+	if len(cleaned) == 0 {
+		return nil
+	}
+
+	slices.Sort(cleaned)
+	return cleaned
+}
+
+// SanitizedSetParams returns a copy of SetParams with protected params removed
+// and keys sorted for consistent iteration order.
+func (f Filters) SanitizedSetParams() (map[string]any, []string) {
+	if len(f.SetParams) == 0 {
+		return nil, nil
+	}
+
+	result := make(map[string]any, len(f.SetParams))
+	keys := make([]string, 0, len(f.SetParams))
+
+	for key, value := range f.SetParams {
+		if slices.Contains(ProtectedParams, key) {
+			continue
+		}
+		result[key] = value
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+	if len(result) == 0 {
+		return nil, nil
+	}
+
+	return result, keys
 }

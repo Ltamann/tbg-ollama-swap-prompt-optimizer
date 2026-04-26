@@ -1094,7 +1094,7 @@ func TestNormalizeChatCompletionTools(t *testing.T) {
 	assert.Equal(t, "object", parameters["type"])
 }
 
-func TestProxyManager_ChatCompletionNormalizesResponsesStyleTools(t *testing.T) {
+func TestProxyManager_ChatCompletionPreservesNativeToolShape(t *testing.T) {
 	config := config.AddDefaultGroupToConfig(config.Config{
 		HealthCheckTimeout: 15,
 		LogLevel:           "error",
@@ -1136,9 +1136,12 @@ func TestProxyManager_ChatCompletionNormalizesResponsesStyleTools(t *testing.T) 
 		return
 	}
 
+	assert.Contains(t, requestBody, `"tools":[`)
 	assert.Contains(t, requestBody, `"type":"function"`)
-	assert.Contains(t, requestBody, `"function":{"description":"Say hello","name":"say_hello","parameters"`)
-	assert.NotContains(t, requestBody, `"tools":[{"description":"Say hello","name":"say_hello"`)
+	assert.Contains(t, requestBody, `"name":"say_hello"`)
+	assert.Contains(t, requestBody, `"description":"Say hello"`)
+	assert.NotContains(t, requestBody, `"function":{"description":"Say hello","name":"say_hello","parameters"`)
+	assert.NotContains(t, requestBody, `"parallel_tool_calls":false`)
 }
 
 func TestNormalizeResponsesRequest_AdaptsBuiltInTools(t *testing.T) {
@@ -1184,6 +1187,14 @@ func TestNormalizeResponsesRequest_AdaptsBuiltInTools(t *testing.T) {
 	assert.Equal(t, llamaSwapShellFunctionName, first["name"])
 	assert.Equal(t, "function", second["type"])
 	assert.Equal(t, llamaSwapApplyPatchFunctionName, second["name"])
+	secondParams, ok := second["parameters"].(map[string]any)
+	if assert.True(t, ok) {
+		props, ok := secondParams["properties"].(map[string]any)
+		if assert.True(t, ok) {
+			_, hasOperation := props["operation"]
+			assert.True(t, hasOperation, "apply_patch bridge tool should expose an operation argument for Responses compatibility")
+		}
+	}
 	assert.Equal(t, "function", third["type"])
 	assert.Equal(t, llamaSwapWebSearchFunctionName, third["name"])
 	assert.Equal(t, "function", fourth["type"])
@@ -1200,7 +1211,7 @@ func TestNormalizeResponsesRequest_AdaptsBuiltInTools(t *testing.T) {
 	assert.Equal(t, "echo", ninth["name"])
 }
 
-func TestNormalizeResponsesRequest_RejectsUnsupportedBuiltInTools(t *testing.T) {
+func TestNormalizeResponsesRequest_AdaptsComputerUsePreviewTool(t *testing.T) {
 	body := []byte(`{
 		"model":"gpt-5.3-codex",
 		"input":"hello",
@@ -1210,10 +1221,67 @@ func TestNormalizeResponsesRequest_RejectsUnsupportedBuiltInTools(t *testing.T) 
 		]
 	}`)
 
-	_, adapted, unsupported, err := normalizeResponsesRequest(body)
+	normalized, adapted, unsupported, err := normalizeResponsesRequest(body)
 	assert.NoError(t, err)
-	assert.Empty(t, adapted)
-	assert.Equal(t, []string{"computer_use_preview"}, unsupported)
+	assert.Equal(t, []string{"computer"}, adapted)
+	assert.Empty(t, unsupported)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(normalized, &payload))
+
+	tools, ok := payload["tools"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, tools, 2) {
+		return
+	}
+
+	first, _ := tools[0].(map[string]any)
+	second, _ := tools[1].(map[string]any)
+	assert.Equal(t, "function", first["type"])
+	assert.Equal(t, llamaSwapComputerFunctionName, first["name"])
+	assert.Equal(t, "function", second["type"])
+	assert.Equal(t, "echo", second["name"])
+}
+
+func TestNormalizeResponsesRequest_AdaptsCustomApplyPatchTool(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"input":"hello",
+		"tools":[
+			{
+				"type":"custom",
+				"name":"apply_patch",
+				"description":"Use the apply_patch tool.",
+				"format":{"type":"grammar","syntax":"lark","definition":"start: begin_patch"}
+			}
+		]
+	}`)
+
+	normalized, adapted, unsupported, err := normalizeResponsesRequest(body)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"apply_patch"}, adapted)
+	assert.Empty(t, unsupported)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(normalized, &payload))
+
+	tools, ok := payload["tools"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, tools, 1) {
+		return
+	}
+
+	first, _ := tools[0].(map[string]any)
+	assert.Equal(t, "function", first["type"])
+	assert.Equal(t, llamaSwapApplyPatchFunctionName, first["name"])
+	params, ok := first["parameters"].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+	props, ok := params["properties"].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+	_, hasOperation := props["operation"]
+	assert.True(t, hasOperation)
 }
 
 func TestNormalizeResponsesRequest_RewritesToolOutputs(t *testing.T) {
@@ -1293,7 +1361,100 @@ func TestNormalizeResponsesRequest_RewritesToolOutputs(t *testing.T) {
 	assert.Equal(t, "call_11", fourteenth["call_id"])
 }
 
-func TestNormalizeResponsesRequest_RewritesDeveloperRoleToSystem(t *testing.T) {
+func TestResponsesRequestToChatMessages_ApplyPatchOperationMappedToOperation(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":    "apply_patch_call",
+				"call_id": "call_patch_1",
+				"operation": map[string]any{
+					"type": "create_file",
+					"path": "x.txt",
+					"diff": "+ok",
+				},
+			},
+		},
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	if !assert.Len(t, messages, 1) {
+		return
+	}
+	assert.Equal(t, "assistant", messages[0]["role"])
+
+	toolCalls, ok := messages[0]["tool_calls"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, toolCalls, 1) {
+		return
+	}
+	toolCall, _ := toolCalls[0].(map[string]any)
+	fn, _ := toolCall["function"].(map[string]any)
+	assert.Equal(t, "apply_patch", fn["name"])
+
+	argsRaw, _ := fn["arguments"].(string)
+	var args map[string]any
+	assert.NoError(t, json.Unmarshal([]byte(argsRaw), &args))
+	operation, ok := args["operation"].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
+	assert.Equal(t, "create_file", operation["type"])
+	assert.Equal(t, "x.txt", operation["path"])
+	assert.Equal(t, "+ok", operation["diff"])
+}
+
+func TestResponsesRequestToChatMessages_ApplyPatchEmptyOperationSkipped(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":      "apply_patch_call",
+				"call_id":   "call_patch_empty",
+				"operation": map[string]any{},
+			},
+		},
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	assert.Len(t, messages, 0)
+}
+
+func TestResponsesRequestToChatMessages_PreservesRoleForUntypedRoleContentInput(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"role":    "developer",
+				"content": []any{map[string]any{"type": "input_text", "text": "dev rules"}},
+			},
+			map[string]any{
+				"role":    "user",
+				"content": []any{map[string]any{"type": "input_text", "text": "hello"}},
+			},
+		},
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	if !assert.Len(t, messages, 2) {
+		return
+	}
+	assert.Equal(t, "system", messages[0]["role"])
+	assert.Equal(t, "dev rules", messages[0]["content"])
+	assert.Equal(t, "user", messages[1]["role"])
+	assert.Equal(t, "hello", messages[1]["content"])
+}
+
+func TestNormalizePossiblyMixedToolArguments_ExtractsXMLInputTag(t *testing.T) {
+	raw := `<tool_call><function=apply_patch><input>*** Begin Patch
+*** Add File: z.txt
++ok
+*** End Patch
+</input></function></tool_call>`
+
+	normalized := normalizePossiblyMixedToolArguments(raw)
+	var args map[string]any
+	assert.NoError(t, json.Unmarshal([]byte(normalized), &args))
+	assert.Equal(t, "*** Begin Patch\n*** Add File: z.txt\n+ok\n*** End Patch", args["input"])
+}
+
+func TestNormalizeResponsesRequest_PreservesDeveloperRole(t *testing.T) {
 	body := []byte(`{
 		"model":"gpt-5.3-codex",
 		"input":[
@@ -1325,7 +1486,7 @@ func TestNormalizeResponsesRequest_RewritesDeveloperRoleToSystem(t *testing.T) {
 	}
 
 	assert.Equal(t, "message", first["type"])
-	assert.Equal(t, "system", first["role"])
+	assert.Equal(t, "developer", first["role"])
 	assert.Equal(t, "message", second["type"])
 	assert.Equal(t, "user", second["role"])
 }
@@ -1350,7 +1511,7 @@ func TestNormalizeResponsesRequest_MovesSystemMessagesToFront(t *testing.T) {
 	assert.NoError(t, json.Unmarshal(normalized, &payload))
 
 	input, ok := payload["input"].([]any)
-	if !assert.True(t, ok) || !assert.Len(t, input, 3) {
+	if !assert.True(t, ok) || !assert.Len(t, input, 4) {
 		return
 	}
 
@@ -1364,7 +1525,7 @@ func TestNormalizeResponsesRequest_MovesSystemMessagesToFront(t *testing.T) {
 		roles = append(roles, role)
 	}
 
-	assert.Equal(t, []string{"system", "user", "user"}, roles)
+	assert.Equal(t, []string{"system", "user", "developer", "user"}, roles)
 }
 
 func TestNormalizeResponsesRequest_MergesLeadingSystemMessages(t *testing.T) {
@@ -1386,7 +1547,7 @@ func TestNormalizeResponsesRequest_MergesLeadingSystemMessages(t *testing.T) {
 	assert.NoError(t, json.Unmarshal(normalized, &payload))
 
 	input, ok := payload["input"].([]any)
-	if !assert.True(t, ok) || !assert.Len(t, input, 2) {
+	if !assert.True(t, ok) || !assert.Len(t, input, 3) {
 		return
 	}
 
@@ -1398,13 +1559,48 @@ func TestNormalizeResponsesRequest_MergesLeadingSystemMessages(t *testing.T) {
 	if !assert.True(t, ok) {
 		return
 	}
+	third, ok := input[2].(map[string]any)
+	if !assert.True(t, ok) {
+		return
+	}
 
 	assert.Equal(t, "system", first["role"])
 	content, ok := first["content"].([]any)
-	if !assert.True(t, ok) || !assert.Len(t, content, 2) {
+	if !assert.True(t, ok) || !assert.Len(t, content, 1) {
 		return
 	}
+	assert.Equal(t, "developer", second["role"])
+	assert.Equal(t, "user", third["role"])
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_MergesDeveloperIntoLeadingSystem(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.2",
+		"instructions":"base system",
+		"input":[
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"developer rules"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+		]
+	}`)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	assert.NoError(t, err)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(translated, &payload))
+
+	messages, ok := payload["messages"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, messages, 2) {
+		return
+	}
+
+	first, _ := messages[0].(map[string]any)
+	second, _ := messages[1].(map[string]any)
+	assert.Equal(t, "system", first["role"])
+	assert.Contains(t, first["content"], "base system")
+	assert.Contains(t, first["content"], "developer rules")
 	assert.Equal(t, "user", second["role"])
+	assert.Equal(t, "hello", second["content"])
 }
 
 func TestNormalizeResponsesRequest_InjectsQwenToolPolicyForBuiltInTools(t *testing.T) {
@@ -1488,7 +1684,7 @@ func TestNormalizeResponsesRequest_DoesNotInjectQwenToolPolicyForNonQwenModels(t
 	assert.Equal(t, "You are a coding agent.", content)
 }
 
-func TestProxyManager_ResponsesStartsModelBeforeUnsupportedToolError(t *testing.T) {
+func TestProxyManager_ResponsesStartsModelWithComputerUsePreviewTool(t *testing.T) {
 	config := config.AddDefaultGroupToConfig(config.Config{
 		HealthCheckTimeout: 15,
 		LogLevel:           "error",
@@ -1509,8 +1705,7 @@ func TestProxyManager_ResponsesStartsModelBeforeUnsupportedToolError(t *testing.
 	w := CreateTestResponseRecorder()
 
 	proxy.ServeHTTP(w, req)
-	assert.Equal(t, http.StatusBadRequest, w.Code)
-	assert.Contains(t, w.Body.String(), "unsupported /v1/responses tool types for local backend")
+	assert.Equal(t, http.StatusOK, w.Code)
 
 	processGroup := proxy.findGroupByModelName("model1")
 	if assert.NotNil(t, processGroup) {

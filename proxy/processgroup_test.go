@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -115,5 +116,45 @@ func TestProcessGroup_ProxyRequestSwapIsFalse(t *testing.T) {
 	// make sure all the processes are running
 	for _, process := range pg.processes {
 		assert.Equal(t, StateReady, process.CurrentState())
+	}
+}
+
+func TestIsTransientStartError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "premature_successful_exit",
+			err:  fmt.Errorf("unable to start process: upstream command exited prematurely but successfully"),
+			want: true,
+		},
+		{
+			name: "already_starting_then_stopped",
+			err:  fmt.Errorf("process was already starting but wound up in state stopped"),
+			want: true,
+		},
+		{
+			name: "state_starting_typo_variant",
+			err:  fmt.Errorf("processes was in state starting when start() was called"),
+			want: true,
+		},
+		{
+			name: "non_transient_error",
+			err:  fmt.Errorf("start() failed for command 'x': exit status 127"),
+			want: false,
+		},
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isTransientStartError(tc.err))
+		})
 	}
 }

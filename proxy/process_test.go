@@ -210,7 +210,7 @@ func TestRewriteResponsesToolCallPayload(t *testing.T) {
 		]
 	}`)
 
-	updated, changed, err := rewriteResponsesToolCallPayload(body)
+	updated, changed, err := rewriteResponsesToolCallPayload(body, "", "", "")
 	assert.NoError(t, err)
 	assert.True(t, changed)
 
@@ -256,6 +256,105 @@ func TestRewriteResponsesToolCallPayload(t *testing.T) {
 	assert.Equal(t, "computer_call", seventh["type"])
 	action, _ = seventh["action"].(map[string]any)
 	assert.Equal(t, "click", action["action"])
+}
+
+func TestRewriteResponsesToolCallPayload_ApplyPatchAcceptsPatchString(t *testing.T) {
+	body := []byte(`{
+		"output":[
+			{
+				"type":"function_call",
+				"call_id":"call_patch",
+				"name":"__llamaswap_apply_patch",
+				"arguments":"{\"patch\":\"*** Begin Patch\\n*** Update File: README.md\\n@@\\n-old\\n+new\\n*** End Patch\\n\"}",
+				"status":"completed"
+			}
+		]
+	}`)
+
+	updated, changed, err := rewriteResponsesToolCallPayload(body, "", "", "")
+	assert.NoError(t, err)
+	assert.True(t, changed)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(updated, &payload))
+	output, ok := payload["output"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, output, 1) {
+		return
+	}
+
+	item, _ := output[0].(map[string]any)
+	assert.Equal(t, "apply_patch_call", item["type"])
+	operation, ok := item["operation"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "update_file", operation["type"])
+	assert.Equal(t, "README.md", operation["path"])
+	assert.Equal(t, "@@\n-old\n+new", operation["diff"])
+}
+
+func TestRewriteResponsesToolCallPayload_ApplyPatchAcceptsInputString(t *testing.T) {
+	body := []byte(`{
+		"output":[
+			{
+				"type":"function_call",
+				"call_id":"call_patch",
+				"name":"__llamaswap_apply_patch",
+				"arguments":"{\"input\":\"*** Begin Patch\\n*** Update File: README.md\\n@@\\n-old\\n+new\\n*** End Patch\\n\"}",
+				"status":"completed"
+			}
+		]
+	}`)
+
+	updated, changed, err := rewriteResponsesToolCallPayload(body, "", "", "")
+	assert.NoError(t, err)
+	assert.True(t, changed)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(updated, &payload))
+	output, ok := payload["output"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, output, 1) {
+		return
+	}
+
+	item, _ := output[0].(map[string]any)
+	assert.Equal(t, "apply_patch_call", item["type"])
+	assert.Equal(t, "in_progress", item["status"])
+	operation, ok := item["operation"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "update_file", operation["type"])
+	assert.Equal(t, "README.md", operation["path"])
+	assert.Equal(t, "@@\n-old\n+new", operation["diff"])
+	assert.Equal(t, "in_progress", payload["status"])
+}
+
+func TestRewriteResponsesToolCallPayload_ApplyPatchCallKeepsInProgressStatus(t *testing.T) {
+	body := []byte(`{
+		"status":"completed",
+		"output":[
+			{
+				"type":"apply_patch_call",
+				"id":"apc_1",
+				"call_id":"call_1",
+				"operation":{"type":"update_file","path":"README.md","diff":"@@\n-old\n+new"},
+				"status":"completed"
+			}
+		]
+	}`)
+
+	updated, changed, err := rewriteResponsesToolCallPayload(body, "", "", "")
+	assert.NoError(t, err)
+	assert.True(t, changed)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(updated, &payload))
+	output, ok := payload["output"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, output, 1) {
+		return
+	}
+	item, _ := output[0].(map[string]any)
+	assert.Equal(t, "apply_patch_call", item["type"])
+	assert.Equal(t, "call_1", item["call_id"])
+	assert.Equal(t, "in_progress", item["status"])
+	assert.Equal(t, "in_progress", payload["status"])
 }
 
 func TestProcess_LowTTLValue(t *testing.T) {

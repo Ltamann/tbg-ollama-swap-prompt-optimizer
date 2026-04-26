@@ -352,6 +352,7 @@ const (
 	msgTypeModelStatus messageType = "modelStatus"
 	msgTypeLogData     messageType = "logData"
 	msgTypeMetrics     messageType = "metrics"
+	msgTypeChatEvent   messageType = "chatEvent"
 )
 
 type messageEnvelope struct {
@@ -411,6 +412,22 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 		}
 	}
 
+	sendChatEvent := func(evt *ChatSSEvent) {
+		if evt == nil {
+			return
+		}
+		jsonData, err := json.Marshal(evt)
+		if err != nil {
+			return
+		}
+		select {
+		case sendBuffer <- messageEnvelope{Type: msgTypeChatEvent, Data: string(jsonData)}:
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
+
 	/**
 	 * Send updated models list
 	 */
@@ -440,6 +457,9 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 	defer event.On(func(e TokenMetricsEvent) {
 		sendMetrics([]TokenMetrics{e.Metrics})
 	})()
+	defer pm.metricsMonitor.OnChatCapture(func(reqPath string, reqBody, respBody []byte, tm TokenMetrics) {
+		sendChatEvent(parseChatEvent(reqPath, reqBody, respBody, tm))
+	})()
 
 	// send initial batch of data
 	sendLogData("proxy", pm.proxyLogger.GetHistory())
@@ -447,6 +467,9 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 	sendLogData("transform", pm.transformLogger.GetHistory())
 	sendModels()
 	sendMetrics(pm.metricsMonitor.getMetrics())
+	for _, evt := range pm.buildRecentChatEvents(200) {
+		sendChatEvent(evt)
+	}
 
 	for {
 		select {
@@ -461,6 +484,38 @@ func (pm *ProxyManager) apiSendEvents(c *gin.Context) {
 			c.Writer.Flush()
 		}
 	}
+}
+
+func (pm *ProxyManager) buildRecentChatEvents(limit int) []*ChatSSEvent {
+	if pm.metricsMonitor == nil {
+		return nil
+	}
+	metrics := pm.metricsMonitor.getMetrics()
+	if len(metrics) == 0 {
+		return nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	start := 0
+	if len(metrics) > limit {
+		start = len(metrics) - limit
+	}
+	out := make([]*ChatSSEvent, 0, limit)
+	for _, m := range metrics[start:] {
+		if !m.HasCapture {
+			continue
+		}
+		capture := pm.metricsMonitor.getCaptureByID(m.ID)
+		if capture == nil {
+			continue
+		}
+		evt := parseChatEvent(capture.ReqPath, capture.ReqBody, capture.RespBody, m)
+		if evt != nil {
+			out = append(out, evt)
+		}
+	}
+	return out
 }
 
 func (pm *ProxyManager) apiGetMetrics(c *gin.Context) {
