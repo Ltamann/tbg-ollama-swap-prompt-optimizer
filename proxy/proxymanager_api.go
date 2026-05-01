@@ -40,6 +40,16 @@ type Model struct {
 	FrequencyPenaltyConfigured float64 `json:"frequencyPenaltyConfigured"`
 }
 
+type WebSearchSettings struct {
+	Enabled        bool   `json:"enabled"`
+	Engine         string `json:"engine"`
+	URL            string `json:"url"`
+	ManagedEnabled bool   `json:"managedEnabled"`
+	ManagedCommand string `json:"managedCommand"`
+	ManagedStopCmd string `json:"managedStopCommand"`
+	ManagedStatus  string `json:"managedStatus"`
+}
+
 func addApiHandlers(pm *ProxyManager) {
 	// Add API endpoints for React to consume
 	// Protected with API key authentication
@@ -55,6 +65,8 @@ func addApiHandlers(pm *ProxyManager) {
 		apiGroup.GET("/version", pm.apiGetVersion)
 		apiGroup.GET("/captures/:id", pm.apiGetCapture)
 		apiGroup.GET("/config/path", pm.apiGetConfigPath)
+		apiGroup.GET("/settings/web-search", pm.apiGetWebSearchSettings)
+		apiGroup.POST("/settings/web-search", pm.apiSetWebSearchSettings)
 	}
 
 	// Add ctx-size endpoint handlers
@@ -126,6 +138,45 @@ func (pm *ProxyManager) apiRestart(c *gin.Context) {
 		ReloadingState: ReloadingStateStart,
 	})
 	c.JSON(http.StatusOK, gin.H{"msg": "ok"})
+}
+
+func (pm *ProxyManager) apiGetWebSearchSettings(c *gin.Context) {
+	enabled, engine, endpoint := pm.getWebSearchFallbackSettings()
+	managedEnabled, managedCommand, managedStopCmd := pm.getManagedWebSearchSettings()
+	c.JSON(http.StatusOK, WebSearchSettings{
+		Enabled:        enabled,
+		Engine:         engine,
+		URL:            endpoint,
+		ManagedEnabled: managedEnabled,
+		ManagedCommand: managedCommand,
+		ManagedStopCmd: managedStopCmd,
+		ManagedStatus:  pm.managedWebSearchStatus(),
+	})
+}
+
+func (pm *ProxyManager) apiSetWebSearchSettings(c *gin.Context) {
+	var req WebSearchSettings
+	if err := c.ShouldBindJSON(&req); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("invalid web search settings payload: %v", err))
+		return
+	}
+	pm.setWebSearchFallbackSettings(req.Enabled, req.Engine, req.URL)
+	pm.setManagedWebSearchSettings(req.ManagedEnabled, req.ManagedCommand, req.ManagedStopCmd)
+	if err := pm.syncManagedWebSearchProcess(); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("failed to apply managed SearXNG settings: %v", err))
+		return
+	}
+	enabled, engine, endpoint := pm.getWebSearchFallbackSettings()
+	managedEnabled, managedCommand, managedStopCmd := pm.getManagedWebSearchSettings()
+	c.JSON(http.StatusOK, WebSearchSettings{
+		Enabled:        enabled,
+		Engine:         engine,
+		URL:            endpoint,
+		ManagedEnabled: managedEnabled,
+		ManagedCommand: managedCommand,
+		ManagedStopCmd: managedStopCmd,
+		ManagedStatus:  pm.managedWebSearchStatus(),
+	})
 }
 
 func (pm *ProxyManager) getModelStatus() []Model {

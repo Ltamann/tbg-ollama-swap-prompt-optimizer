@@ -89,3 +89,129 @@
 - Unknown/unmappable XML-like blocks are stripped from assistant text so they do not carry into the next prompt.
 - Added regression tests for generic terminal tag conversion and unknown-tag stripping.
 - Rebuild/copy/restart cycle executed again.
+
+## 2026-04-28 14:12:00 +0200
+- Intent: Resolve client continuation execution behavior versus forced local apply_patch fallback.
+- Hypothesis: isApplyPatchIntent path is still auto-executing valid apply_patch locally, causing continuation mismatch/no-final-message behavior; default should preserve native apply_patch_call and only local-exec when explicitly forced.
+
+- Change applied: default path now preserves native client continuation for valid apply_patch_call; local execution fallback runs only when `llamaswap_force_local_apply_patch` is explicitly true (top-level or metadata flag).
+- Tests: focused proxy tests for force-local flag + shell/apply_patch normalization/translation passed.
+- Runtime probe (Windows Codex gpt-5.3-codex): no forced local fallback observed; run produced reasoning-only output with no tool call (`tmp/win_cont_events.jsonl`), and codex stderr ended with `no last agent message`.
+- Status: continuation-vs-forced-fallback regression fixed in bridge logic; upstream no-tool-call behavior remains a separate issue for apply_patch reliability.
+
+## 2026-05-01 15:05:00 +0200
+- Intent: Add a Codex UI workaround for hidden reasoning by mirroring extracted think text onto a visible `commentary` channel message while preserving native Responses reasoning items.
+- Change applied in `proxy/proxymanager.go`:
+  - `writeResponsesStreamFromChatSSE(...)` now starts a second assistant message lane with `channel:"commentary"` when reasoning deltas appear.
+  - The bridge streams the same extracted reasoning text into both:
+    - native `type:"reasoning"` summary events
+    - visible `type:"message", channel:"commentary"` output text events
+  - Final assistant content continues on the separate `channel:"final"` lane.
+  - This keeps the intended output order for think-bearing turns: reasoning -> commentary -> final.
+- Regression coverage added in `proxy/proxymanager_bridge_xml_test.go`:
+  - `TestWriteResponsesStreamFromChatSSE_EmitsReasoningAndContentOnSeparateLanes`
+  - `TestWriteResponsesStreamFromChatSSE_StreamsReasoningIntoCommentaryAndKeepsFinalClean`
+- Focused tests passed:
+  - `TestWriteResponsesStreamFromChatSSE_EmitsReasoningAndContentOnSeparateLanes`
+  - `TestWriteResponsesStreamFromChatSSE_StreamsReasoningIntoCommentaryAndKeepsFinalClean`
+  - `TestExtractContentAndReasoning_DropsPreThinkPreambleAndClosingTagLeak`
+  - `TestShouldEnforcePlanModeSyntheticRewrite_OnlyForProxyPlanMode`
+  - `TestWriteResponsesStreamFromChatSSE_EmitsToolCallArgumentDeltas`
+  - `TestWriteResponsesStreamFromChatSSE_ToolFirstUsesOutputIndexZeroWithoutEmptyMessage`
+- Status: workaround is ready for live rebuild/restart validation against the Codex UI.
+
+## 2026-05-01 15:35:00 +0200
+- Documentary finding:
+  - Native Responses reasoning delivery is not sufficient to guarantee visible thinking in Codex UI for local model IDs.
+  - We observed valid `rs_...` reasoning items and valid `response.reasoning_summary_text.*` events that still did not render in the Codex thinking panel.
+  - Because of that, a UI-facing workaround is required when Codex is used with local `.gguf` model identities.
+- Workaround conclusion:
+  - Keep native `reasoning` events for compatibility.
+  - Add visible `channel:"commentary"` assistant output as the fallback display path.
+  - Keep `channel:"final"` separate for the user-facing answer.
+- Follow-up design concern:
+  - `commentary` may become part of replayed assistant history, so using it for full raw reasoning is risky.
+  - Preferred long-term direction is to use `commentary` for a short summary, not full reasoning text.
+  - Sending full reasoning as a synthetic function call is not recommended because it pollutes tool-call semantics and continuation history.
+- Stable write-up added under `docs/codex-reasoning-ui-study.md`.
+
+## 2026-05-01 16:05:00 +0200
+- Root cause refinement:
+  - The first `commentary` workaround patch only covered `writeResponsesStreamFromChatSSE(...)`.
+  - Some captured Codex sessions replayed through `writeResponsesStream(...)` instead, so those streams still showed only:
+    - reasoning item at output index 0
+    - final message at output index 1
+  - This made it look like the workaround was undeployed when the real issue was an uncovered second stream path.
+- Change applied:
+  - Added the same synthetic `channel:"commentary"` mirror to `writeResponsesStream(...)` for replayed Responses payloads.
+  - Replay path now appends a visible commentary message immediately after a reasoning item whenever reasoning text exists.
+- Tests:
+  - `TestWriteResponsesStream_ReplaysReasoningItems`
+  - `TestWriteResponsesStream_CompletesForToolPhase`
+  - `TestWriteResponsesStreamFromChatSSE_EmitsReasoningAndContentOnSeparateLanes`
+  - `TestWriteResponsesStreamFromChatSSE_StreamsReasoningIntoCommentaryAndKeepsFinalClean`
+- Status:
+  - Both bridge stream paths now mirror reasoning into `commentary`; future missing-commentary captures should be treated as stale session/client-state unless proven otherwise.
+
+## 2026-05-01 17:05:00 +0200
+- Pre-read snapshot:
+  - Re-checked the May 1 rollouts and local capture set before patching.
+  - Corrected the earlier analysis:
+    - the Spain quiz file mutation did not happen inside the same plan turn that produced the plan
+    - the later mutation happened after a fresh `default` turn began
+    - the empty shell `{}` call was rejected before OS execution
+    - reasoning is emitted in valid Responses shape, but only as one buffered summary delta instead of continuous incremental updates
+    - commentary mirroring is the lane the user actually sees in Codex UI
+  - Recorded the corrected bug matrix in `docs/codex-bug-fix-loop.md`.
+
+## 2026-05-01 17:05:00 +0200
+- Iteration intent:
+  - Harden malformed shell validation in the bridge's non-stream response-normalization path.
+  - Goal: treat empty shell arguments the same way broken apply_patch payloads are treated now, with a structured bridge validation message instead of an executable-looking tool call.
+
+## 2026-05-01 17:05:00 +0200
+- Iteration outcome:
+  - Added shell-argument validation to `validateBridgeToolCallItem(...)`.
+  - Empty `shell` / `shell_command` `function_call` payloads now fail bridge validation when neither `command` nor `commands` contains a usable value.
+  - Added regression test:
+    - `TestTranslateChatCompletionToResponsesResponse_EmptyShellArgumentsBecomeValidationMessage`
+  - Focused tests passed:
+    - `TestTranslateChatCompletionToResponsesResponse_EmptyShellArgumentsBecomeValidationMessage`
+    - `TestTranslateChatCompletionToResponsesResponse_ApplyPatchWarningFieldUsesNeutralWording`
+    - `TestTranslateChatCompletionToResponsesResponse_ToolValidationMessagesAvoidToolBlamingText`
+  - Rebuilt and redeployed:
+    - binary hash: `02ab78682d9b6b0164afdd29c4a2988c8f8688f6f2197e6f5ba8c92b8f1796e2`
+    - deployed hash matched `/home/admmin/bin/llama-swap`
+  - Restart result:
+    - `llama-swap` came back on `0.0.0.0:8080`
+    - `/health` returned `status: ok`
+  - Remaining scope note:
+    - this iteration hardens the non-stream normalization path only
+    - live stream-path handling of malformed shell tool calls remains open in `docs/codex-bug-fix-loop.md`
+
+## 2026-05-01 17:32:00 +0200
+- Iteration intent:
+  - Close the remaining streamed-shell gap in `writeResponsesStreamFromChatSSE(...)`.
+  - Goal: do not expose malformed live `shell` tool calls to Codex as executable `function_call` items when the streamed arguments never produce a usable `command` or `commands` payload.
+
+## 2026-05-01 17:32:00 +0200
+- Iteration outcome:
+  - Added delayed visibility for streamed shell tool calls in `writeResponsesStreamFromChatSSE(...)`.
+  - Streamed tool items are now exposed only after their buffered shell arguments normalize to a usable `command` string or `commands` array.
+  - Empty streamed shell payloads now stay out of the live tool lane and fall back to a bridge validation assistant message instead of a visible `function_call`.
+  - Added regression test:
+    - `TestWriteResponsesStreamFromChatSSE_EmptyShellArgumentsBecomeValidationMessage`
+  - Focused tests passed:
+    - `TestWriteResponsesStreamFromChatSSE_EmitsToolCallArgumentDeltas`
+    - `TestWriteResponsesStreamFromChatSSE_EmptyShellArgumentsBecomeValidationMessage`
+    - `TestWriteResponsesStreamFromChatSSE_EmitsEachReasoningChunkWithoutCoalescing`
+    - `TestWriteResponsesStreamFromChatSSE_ApplyPatchUsesFreeformPatchArguments`
+    - `TestWriteResponsesStreamFromChatSSE_ToolFirstUsesOutputIndexZeroWithoutEmptyMessage`
+    - `TestTranslateChatCompletionToResponsesResponse_EmptyShellArgumentsBecomeValidationMessage`
+  - Investigation result:
+    - added a focused stream test proving the bridge emits one `response.reasoning_summary_text.delta` per upstream reasoning chunk
+    - this exonerates `writeResponsesStreamFromChatSSE(...)` from chunk coalescing when upstream actually sends multiple reasoning pieces
+    - remaining live-buffering suspicion is now upstream/model-side or in an uncovered replay/client path, not in the tested direct chat-SSE bridge loop
+  - Next confirmed scope after redeploy:
+    - instrument why reasoning arrives as a buffered summary chunk instead of true incremental live streaming
+    - reduce commentary from full reasoning mirror toward short summary mode to lower history contamination risk

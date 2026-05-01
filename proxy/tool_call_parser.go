@@ -61,6 +61,11 @@ func parseModelSpecificToolCalls(modelName, content string) ([]ParsedToolCall, s
 
 type qwenXMLToolCallParser struct{}
 
+var (
+	qwenFunctionAttrNameRe  = regexp.MustCompile(`(?is)<function\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*>`)
+	qwenParameterAttrNameRe = regexp.MustCompile(`(?is)<parameter\b[^>]*\bname\s*=\s*"([^"]+)"[^>]*>`)
+)
+
 func (qwenXMLToolCallParser) Name() string { return "qwen_xml" }
 
 func (qwenXMLToolCallParser) MatchesModel(modelName string) bool {
@@ -135,6 +140,10 @@ func parseQwenXMLToolCalls(text string) ([]ParsedToolCall, string) {
 		if len(calls) > 0 {
 			return calls, remaining
 		}
+		calls, remaining = parseDecoratedPlanCalls(text)
+		if len(calls) > 0 {
+			return calls, remaining
+		}
 		// Do not synthesize planning tool calls from plain prose blocks.
 		if _, stripped := parseGenericTaggedCalls(text); strings.TrimSpace(stripped) != strings.TrimSpace(text) {
 			return nil, stripped
@@ -184,7 +193,15 @@ func parseQwenToolsEnvelopeCalls(text string) ([]ParsedToolCall, string) {
 	}
 	if name == "shell_command" {
 		if cmd := normalizeShellCommandArgument(args["command"]); cmd != "" {
-			args["command"] = cmd
+			args["commands"] = []any{cmd}
+			delete(args, "command")
+		} else if cmds := normalizeShellCommandsFromAny(args["commands"]); len(cmds) > 0 {
+			arr := make([]any, 0, len(cmds))
+			for _, c := range cmds {
+				arr = append(arr, c)
+			}
+			args["commands"] = arr
+			delete(args, "command")
 		}
 	}
 
@@ -211,10 +228,10 @@ func inferToolsEnvelopeFunctionName(args map[string]any) string {
 	if _, ok := args["command"]; ok {
 		return "shell_command"
 	}
-	if _, ok := args["operation"]; ok {
-		return "apply_patch"
+	if _, ok := args["commands"]; ok {
+		return "shell_command"
 	}
-	if _, ok := args["input"]; ok {
+	if _, ok := args["operation"]; ok {
 		return "apply_patch"
 	}
 	return ""
@@ -242,6 +259,76 @@ func normalizeShellCommandArgument(raw any) string {
 	}
 }
 
+func normalizeShellCommandsFromAny(raw any) []string {
+	switch typed := raw.(type) {
+	case nil:
+		return nil
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			s := strings.TrimSpace(fmt.Sprintf("%v", item))
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		out := make([]string, 0, len(typed))
+		for _, s := range typed {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case string:
+		s := strings.TrimSpace(typed)
+		if s == "" {
+			return nil
+		}
+		var arr []string
+		if json.Unmarshal([]byte(s), &arr) == nil {
+			out := make([]string, 0, len(arr))
+			for _, item := range arr {
+				item = strings.TrimSpace(item)
+				if item != "" {
+					out = append(out, item)
+				}
+			}
+			return out
+		}
+		return []string{s}
+	default:
+		s := strings.TrimSpace(fmt.Sprintf("%v", typed))
+		if s == "" {
+			return nil
+		}
+		return []string{s}
+	}
+}
+
+func normalizeShellArgsMapForOutput(args map[string]any) map[string]any {
+	if args == nil {
+		return map[string]any{}
+	}
+	out := map[string]any{}
+	for k, v := range args {
+		if k != "command" && k != "commands" {
+			out[k] = v
+		}
+	}
+	commands := normalizeShellCommandsFromAny(args["commands"])
+	if len(commands) == 0 {
+		if cmd := normalizeShellCommandArgument(args["command"]); cmd != "" {
+			commands = []string{cmd}
+		}
+	}
+	if len(commands) > 0 {
+		out["commands"] = commands
+	}
+	return out
+}
+
 func parseQwenTaggedEnvelopeCalls(text string) ([]ParsedToolCall, string) {
 	normalized := strings.TrimSpace(text)
 	if normalized == "" {
@@ -265,6 +352,10 @@ func parseQwenTaggedEnvelopeCalls(text string) ([]ParsedToolCall, string) {
 
 	toolUseCalls, next := parseQwenToolUseTaggedCalls(working)
 	calls = append(calls, toolUseCalls...)
+	working = next
+
+	planCalls, next := parseQwenPlanTaggedCalls(working)
+	calls = append(calls, planCalls...)
 	working = next
 
 	genericCalls, next := parseGenericTaggedCalls(working)
@@ -313,13 +404,6 @@ func inferToolNameFromGenericTag(tag string, block string) string {
 		return "web_search"
 	}
 
-	lower := strings.ToLower(block)
-	if strings.Contains(lower, "*** add file:") || strings.Contains(lower, "*** update file:") || strings.Contains(lower, "*** delete file:") {
-		return "apply_patch"
-	}
-	if strings.Contains(lower, "\"command\"") {
-		return "shell_command"
-	}
 	return ""
 }
 
@@ -350,13 +434,18 @@ func buildGenericTaggedToolCall(toolName string, block string) (ParsedToolCall, 
 		if json.Unmarshal([]byte(raw), &obj) == nil {
 			if c := normalizeShellCommandArgument(obj["command"]); c != "" {
 				cmd = c
+			} else if list := normalizeShellCommandsFromAny(obj["commands"]); len(list) > 0 {
+				return ParsedToolCall{
+					CallID: fmt.Sprintf("call_%d", time.Now().UnixNano()),
+					Name:   toolName,
+					Arguments: map[string]any{
+						"commands": list,
+					},
+				}, true
 			}
 		}
 		if cmd == "" {
 			cmd = parseTaggedSingleShellCommand(raw)
-		}
-		if cmd == "" {
-			cmd = parseDanglingAngleShellCommand(raw)
 		}
 		if cmd == "" && !strings.Contains(raw, "<") {
 			cmd = strings.TrimSpace(raw)
@@ -364,7 +453,7 @@ func buildGenericTaggedToolCall(toolName string, block string) (ParsedToolCall, 
 		if cmd == "" {
 			return ParsedToolCall{}, false
 		}
-		call.Arguments["command"] = cmd
+		call.Arguments["commands"] = []string{cmd}
 		return call, true
 	default:
 		return ParsedToolCall{}, false
@@ -408,7 +497,8 @@ func parseQwenShellCommandsTaggedCalls(text string) ([]ParsedToolCall, string) {
 			if !ok {
 				break
 			}
-			out = append(out, parseTaggedShellCommandsFromBlock(block)...)
+			parsed := parseTaggedShellCommandsFromBlock(block)
+			out = append(out, parsed...)
 			working = strings.TrimSpace(working[:blockStart] + "\n" + working[blockEnd:])
 		}
 	}
@@ -430,13 +520,22 @@ func parseTaggedShellCommandsFromBlock(block string) []ParsedToolCall {
 			}
 			command := normalizeShellCommandArgument(obj["command"])
 			if command == "" {
+				if list := normalizeShellCommandsFromAny(obj["commands"]); len(list) > 0 {
+					out = append(out, ParsedToolCall{
+						CallID: fmt.Sprintf("call_%d", time.Now().UnixNano()),
+						Name:   "shell_command",
+						Arguments: map[string]any{
+							"commands": list,
+						},
+					})
+				}
 				continue
 			}
 			out = append(out, ParsedToolCall{
 				CallID: fmt.Sprintf("call_%d", time.Now().UnixNano()),
 				Name:   "shell_command",
 				Arguments: map[string]any{
-					"command": command,
+					"commands": []string{command},
 				},
 			})
 		}
@@ -447,25 +546,7 @@ func parseTaggedShellCommandsFromBlock(block string) []ParsedToolCall {
 			CallID: fmt.Sprintf("call_%d", time.Now().UnixNano()),
 			Name:   "shell_command",
 			Arguments: map[string]any{
-				"command": command,
-			},
-		}}
-	}
-	if command := parseDanglingAngleShellCommand(block); command != "" {
-		return []ParsedToolCall{{
-			CallID: fmt.Sprintf("call_%d", time.Now().UnixNano()),
-			Name:   "shell_command",
-			Arguments: map[string]any{
-				"command": command,
-			},
-		}}
-	}
-	if command := strings.TrimSpace(block); command != "" && !strings.Contains(command, "<") {
-		return []ParsedToolCall{{
-			CallID: fmt.Sprintf("call_%d", time.Now().UnixNano()),
-			Name:   "shell_command",
-			Arguments: map[string]any{
-				"command": command,
+				"commands": []string{command},
 			},
 		}}
 	}
@@ -518,21 +599,12 @@ func parseQwenToolUseTaggedCalls(text string) ([]ParsedToolCall, string) {
 }
 
 func parseTaggedToolUseFromBlock(block string) []ParsedToolCall {
-	// Recover common malformed wrapper:
-	// <tool_use><file_read><path>...</path></file_read></tool_use>
-	if path, ok := firstTaggedPath(block, []string{"file_read", "read_file", "open_file"}); ok {
-		command := `cat "` + strings.ReplaceAll(path, `"`, `\"`) + `"`
-		return []ParsedToolCall{{
-			CallID: fmt.Sprintf("call_%d", time.Now().UnixNano()),
-			Name:   "shell_command",
-			Arguments: map[string]any{
-				"command": command,
-			},
-		}}
-	}
 	// Recover nested shell-style tags inside generic wrapper.
-	if calls := parseTaggedShellCommandsFromBlock(block); len(calls) > 0 {
-		return calls
+	lower := strings.ToLower(block)
+	if strings.Contains(lower, "<shell") || strings.Contains(lower, "<shell_command") || strings.Contains(lower, "<shell_commands") {
+		if calls := parseTaggedShellCommandsFromBlock(block); len(calls) > 0 {
+			return calls
+		}
 	}
 	// Recover update/proposed plan blocks nested inside wrapper.
 	if nested, _, _, ok := extractTagBlockLoose(block, "update_plan"); ok {
@@ -558,22 +630,6 @@ func parseTaggedToolUseFromBlock(block string) []ParsedToolCall {
 		}
 	}
 	return nil
-}
-
-func firstTaggedPath(block string, containerTags []string) (string, bool) {
-	for _, tag := range containerTags {
-		inner, _, _, ok := extractTagBlockLoose(block, tag)
-		if !ok {
-			continue
-		}
-		if path, _, _, ok := extractTagBlockLoose(inner, "path"); ok {
-			path = strings.TrimSpace(path)
-			if path != "" {
-				return path, true
-			}
-		}
-	}
-	return "", false
 }
 
 func normalizeTaggedPlanSteps(raw string) []map[string]any {
@@ -605,12 +661,6 @@ func normalizeTaggedPlanSteps(raw string) []map[string]any {
 	if plan := parsePlanStepsFromLooseString(raw); len(plan) > 0 {
 		return plan
 	}
-	if plan := parseNumberedPlanLines(raw); len(plan) > 0 {
-		return plan
-	}
-	if plan := parseSummaryPlanLine(raw); len(plan) > 0 {
-		return plan
-	}
 	var steps []any
 	if err := json.Unmarshal([]byte(raw), &steps); err != nil {
 		return nil
@@ -638,50 +688,6 @@ func normalizeTaggedPlanSteps(raw string) []map[string]any {
 		})
 	}
 	return out
-}
-
-func parseNumberedPlanLines(text string) []map[string]any {
-	lines := strings.Split(strings.TrimSpace(text), "\n")
-	steps := make([]map[string]any, 0, 4)
-	for _, line := range lines {
-		s := strings.TrimSpace(line)
-		if len(s) < 3 {
-			continue
-		}
-		if s[0] >= '1' && s[0] <= '9' && strings.HasPrefix(s[1:], ". ") {
-			stepText := strings.TrimSpace(s[3:])
-			if stepText == "" {
-				continue
-			}
-			status := "pending"
-			if len(steps) == 0 {
-				status = "in_progress"
-			}
-			steps = append(steps, map[string]any{
-				"step":   stepText,
-				"status": status,
-			})
-		}
-	}
-	return steps
-}
-
-func parseSummaryPlanLine(text string) []map[string]any {
-	lines := strings.Split(strings.TrimSpace(text), "\n")
-	for _, line := range lines {
-		s := strings.TrimSpace(line)
-		if strings.HasPrefix(strings.ToLower(s), "summary:") {
-			summary := strings.TrimSpace(s[len("summary:"):])
-			if summary == "" {
-				continue
-			}
-			return []map[string]any{{
-				"step":   summary,
-				"status": "in_progress",
-			}}
-		}
-	}
-	return nil
 }
 
 func mapValueAsString(obj map[string]any, key string) string {
@@ -726,46 +732,39 @@ func extractTagBlockLoose(text, tag string) (content string, blockStart int, blo
 }
 
 func parseTaggedSingleShellCommand(block string) string {
-	for _, tag := range []string{"command", "cat", "ls", "dir"} {
-		if inner, _, _, ok := extractTagBlock(block, tag); ok {
+	lowerBlock := strings.ToLower(block)
+	if strings.Contains(lowerBlock, "</command>") {
+		if inner, _, _, ok := extractTagBlock(block, "command"); ok {
 			inner = strings.TrimSpace(inner)
-			if inner == "" {
-				continue
-			}
-			if tag == "command" {
+			if inner != "" {
 				return inner
 			}
-			return strings.TrimSpace(tag + " " + inner)
 		}
 	}
-	return ""
-}
-
-func parseDanglingAngleShellCommand(block string) string {
 	trimmed := strings.TrimSpace(block)
-	if !strings.HasPrefix(trimmed, "<") {
+	if !strings.HasPrefix(trimmed, "<") || !strings.Contains(trimmed, "</") {
 		return ""
 	}
-	newline := strings.IndexAny(trimmed, "\r\n")
-	firstLine := trimmed
-	if newline >= 0 {
-		firstLine = strings.TrimSpace(trimmed[:newline])
-	}
-	if strings.Contains(firstLine, ">") {
+	start := strings.Index(trimmed, "<")
+	end := strings.Index(trimmed[start+1:], ">")
+	if start < 0 || end < 0 {
 		return ""
 	}
-	firstLine = strings.TrimPrefix(firstLine, "<")
-	fields := strings.Fields(firstLine)
-	if len(fields) == 0 {
+	end += start + 1
+	tagName := strings.TrimSpace(trimmed[start+1 : end])
+	if tagName == "" || strings.ContainsAny(tagName, "<>\"'") {
 		return ""
 	}
-	cmd := strings.ToLower(fields[0])
-	switch cmd {
-	case "ls", "dir", "cat", "pwd":
-		return strings.TrimSpace(firstLine)
-	default:
+	closeTag := "</" + tagName + ">"
+	closeIdx := strings.LastIndex(strings.ToLower(trimmed), strings.ToLower(closeTag))
+	if closeIdx <= end {
 		return ""
 	}
+	body := strings.TrimSpace(trimmed[end+1 : closeIdx])
+	if body == "" {
+		return strings.TrimSpace(tagName)
+	}
+	return strings.TrimSpace(tagName + " " + body)
 }
 
 func parseQwenBareFunctionBlocks(text string) ([]ParsedToolCall, string) {
@@ -815,7 +814,7 @@ func parseQwenFunctionStyleToolCalls(text string) ([]ParsedToolCall, string) {
 		return nil, ""
 	}
 	lower := strings.ToLower(trimmed)
-	candidates := []string{"apply_patch(", "shell(", "shell_command(", "web_search(", "file_search(", "code_interpreter(", "image_generation(", "computer("}
+	candidates := []string{"apply_patch(", "shell(", "shell_command(", "web_search(", "file_search(", "code_interpreter(", "image_generation(", "computer(", "update_plan(", "spawn_agent(", "send_input(", "resume_agent(", "wait_agent(", "close_agent("}
 	callStart := -1
 	for _, c := range candidates {
 		if idx := strings.Index(lower, c); idx >= 0 && (callStart < 0 || idx < callStart) {
@@ -851,6 +850,21 @@ func parseQwenFunctionStyleToolCalls(text string) ([]ParsedToolCall, string) {
 		CallID:    fmt.Sprintf("call_%d", time.Now().UnixNano()),
 		Name:      name,
 		Arguments: args,
+	}
+	if strings.EqualFold(name, "shell") || strings.EqualFold(name, "shell_command") {
+		call.Arguments = normalizeShellArgsMapForOutput(call.Arguments)
+	}
+	if strings.EqualFold(name, "update_plan") {
+		if steps, ok := call.Arguments["steps"]; ok {
+			if plan := normalizeFunctionStylePlan(steps); len(plan) > 0 {
+				call.Arguments = map[string]any{"plan": plan}
+			}
+		}
+		if planRaw, ok := call.Arguments["plan"]; ok {
+			if plan := normalizeFunctionStylePlan(planRaw); len(plan) > 0 {
+				call.Arguments = map[string]any{"plan": plan}
+			}
+		}
 	}
 	prefix := strings.TrimSpace(trimmed[:callStart])
 	suffix := strings.TrimSpace(trimmed[closeParen+1:])
@@ -1054,51 +1068,6 @@ func extractFirstJSONObjectOrArray(raw string) string {
 	return ""
 }
 
-func parsePlainNumberedPlanCalls(text string) ([]ParsedToolCall, string) {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return nil, ""
-	}
-	lower := strings.ToLower(trimmed)
-	planHint := strings.Contains(lower, "plan:")
-	if !planHint {
-		return nil, trimmed
-	}
-	lines := strings.Split(trimmed, "\n")
-	steps := make([]map[string]any, 0, 4)
-	for _, line := range lines {
-		s := strings.TrimSpace(line)
-		if len(s) < 3 {
-			continue
-		}
-		// match "1. Step text"
-		if s[0] >= '1' && s[0] <= '9' && strings.HasPrefix(s[1:], ". ") {
-			stepText := strings.TrimSpace(s[3:])
-			if stepText == "" {
-				continue
-			}
-			status := "pending"
-			if len(steps) == 0 {
-				status = "in_progress"
-			}
-			steps = append(steps, map[string]any{
-				"step":   stepText,
-				"status": status,
-			})
-		}
-	}
-	if len(steps) == 0 {
-		return nil, trimmed
-	}
-	return []ParsedToolCall{{
-		CallID: fmt.Sprintf("call_%d", time.Now().UnixNano()),
-		Name:   "update_plan",
-		Arguments: map[string]any{
-			"plan": steps,
-		},
-	}}, ""
-}
-
 func parseDecoratedPlanCalls(text string) ([]ParsedToolCall, string) {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
@@ -1289,18 +1258,25 @@ func parseFunctionStyleValue(raw string) any {
 
 func parseSingleQwenXMLToolCall(block string) (ParsedToolCall, bool) {
 	lower := strings.ToLower(block)
-	funcOpen := "<function="
-	funcStart := strings.Index(lower, funcOpen)
-	if funcStart < 0 {
-		return ParsedToolCall{}, false
+	name := ""
+	nameEnd := -1
+	if match := qwenFunctionAttrNameRe.FindStringSubmatchIndex(block); len(match) >= 4 {
+		name = strings.TrimSpace(block[match[2]:match[3]])
+		nameEnd = match[1] - 1
+	} else {
+		funcOpen := "<function="
+		funcStart := strings.Index(lower, funcOpen)
+		if funcStart < 0 {
+			return ParsedToolCall{}, false
+		}
+		nameStart := funcStart + len(funcOpen)
+		nameEndRel := strings.Index(lower[nameStart:], ">")
+		if nameEndRel < 0 {
+			return ParsedToolCall{}, false
+		}
+		nameEnd = nameStart + nameEndRel
+		name = strings.TrimSpace(block[nameStart:nameEnd])
 	}
-	nameStart := funcStart + len(funcOpen)
-	nameEndRel := strings.Index(lower[nameStart:], ">")
-	if nameEndRel < 0 {
-		return ParsedToolCall{}, false
-	}
-	nameEnd := nameStart + nameEndRel
-	name := strings.TrimSpace(block[nameStart:nameEnd])
 	if name == "" {
 		return ParsedToolCall{}, false
 	}
@@ -1312,11 +1288,15 @@ func parseSingleQwenXMLToolCall(block string) (ParsedToolCall, bool) {
 	}
 
 	inner := block[nameEnd+1 : funcCloseIdx]
-	return ParsedToolCall{
+	call := ParsedToolCall{
 		CallID:    fmt.Sprintf("call_%d", time.Now().UnixNano()),
 		Name:      name,
 		Arguments: parseQwenXMLParameters(inner),
-	}, true
+	}
+	if strings.EqualFold(name, "shell") || strings.EqualFold(name, "shell_command") {
+		call.Arguments = normalizeShellArgsMapForOutput(call.Arguments)
+	}
+	return call, true
 }
 
 func parseQwenXMLParameters(inner string) map[string]any {
@@ -1327,38 +1307,73 @@ func parseQwenXMLParameters(inner string) map[string]any {
 
 	lower := strings.ToLower(inner)
 	paramOpen := "<parameter="
+	paramOpenAttr := "<parameter"
 	paramClose := "</parameter>"
 	funcClose := "</function>"
 	searchPos := 0
 
 	for {
-		openIdx := strings.Index(lower[searchPos:], paramOpen)
+		openIdxEq := strings.Index(lower[searchPos:], paramOpen)
+		openIdxAttr := strings.Index(lower[searchPos:], paramOpenAttr)
+		openIdx := -1
+		attrMode := false
+		switch {
+		case openIdxEq >= 0 && openIdxAttr >= 0:
+			if openIdxEq <= openIdxAttr {
+				openIdx = openIdxEq
+			} else {
+				openIdx = openIdxAttr
+				attrMode = true
+			}
+		case openIdxEq >= 0:
+			openIdx = openIdxEq
+		case openIdxAttr >= 0:
+			openIdx = openIdxAttr
+			attrMode = true
+		}
 		if openIdx < 0 {
 			break
 		}
 		openIdx += searchPos
-		keyStart := openIdx + len(paramOpen)
-		keyEndRel := strings.Index(lower[keyStart:], ">")
-		if keyEndRel < 0 {
+		tagEndRel := strings.Index(inner[openIdx:], ">")
+		if tagEndRel < 0 {
 			break
 		}
-		keyEnd := keyStart + keyEndRel
-		key := strings.TrimSpace(inner[keyStart:keyEnd])
+		tagEnd := openIdx + tagEndRel
+		key := ""
+		if attrMode {
+			tagText := inner[openIdx : tagEnd+1]
+			if match := qwenParameterAttrNameRe.FindStringSubmatch(tagText); len(match) == 2 {
+				key = strings.TrimSpace(match[1])
+			}
+		} else {
+			keyStart := openIdx + len(paramOpen)
+			key = strings.TrimSpace(inner[keyStart:tagEnd])
+		}
 		if key == "" {
-			searchPos = keyEnd + 1
+			searchPos = tagEnd + 1
 			continue
 		}
 
-		valueStart := keyEnd + 1
+		valueStart := tagEnd + 1
 		closeTagIdx := strings.Index(lower[valueStart:], paramClose)
 		nextParamIdx := strings.Index(lower[valueStart:], paramOpen)
+		nextParamAttrIdx := strings.Index(lower[valueStart:], paramOpenAttr)
 		nextFuncClose := strings.Index(lower[valueStart:], funcClose)
 
 		valueEnd := len(inner)
 		if closeTagIdx >= 0 {
 			valueEnd = valueStart + closeTagIdx
+		} else if nextParamIdx >= 0 && nextParamAttrIdx >= 0 {
+			if nextParamIdx <= nextParamAttrIdx {
+				valueEnd = valueStart + nextParamIdx
+			} else {
+				valueEnd = valueStart + nextParamAttrIdx
+			}
 		} else if nextParamIdx >= 0 {
 			valueEnd = valueStart + nextParamIdx
+		} else if nextParamAttrIdx >= 0 {
+			valueEnd = valueStart + nextParamAttrIdx
 		} else if nextFuncClose >= 0 {
 			valueEnd = valueStart + nextFuncClose
 		}
@@ -1377,8 +1392,16 @@ func parseQwenXMLParameters(inner string) map[string]any {
 
 		if closeTagIdx >= 0 {
 			searchPos = valueStart + closeTagIdx + len(paramClose)
+		} else if nextParamIdx >= 0 && nextParamAttrIdx >= 0 {
+			if nextParamIdx <= nextParamAttrIdx {
+				searchPos = valueStart + nextParamIdx
+			} else {
+				searchPos = valueStart + nextParamAttrIdx
+			}
 		} else if nextParamIdx >= 0 {
 			searchPos = valueStart + nextParamIdx
+		} else if nextParamAttrIdx >= 0 {
+			searchPos = valueStart + nextParamAttrIdx
 		} else {
 			break
 		}

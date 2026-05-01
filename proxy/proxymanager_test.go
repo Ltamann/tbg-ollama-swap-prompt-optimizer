@@ -150,6 +150,42 @@ func TestProxyManager_PersistentGroupsAreNotSwapped(t *testing.T) {
 	assert.Equal(t, proxy.findGroupByModelName("model1").processes["model1"].CurrentState(), StateReady)
 }
 
+func TestProxyManager_WebSearchSettingsAPI(t *testing.T) {
+	cfg := config.AddDefaultGroupToConfig(config.Config{
+		HealthCheckTimeout: 15,
+		Models: map[string]config.ModelConfig{
+			"model1": getTestSimpleResponderConfig("model1"),
+		},
+		LogLevel: "error",
+	})
+
+	proxy := New(cfg)
+	defer proxy.StopProcesses(StopImmediately)
+
+	req := httptest.NewRequest("POST", "/api/settings/web-search", bytes.NewBufferString(`{
+		"enabled": true,
+		"engine": "searxng",
+		"url": "http://127.0.0.1:18080/search",
+		"managedEnabled": false,
+		"managedCommand": "sh -lc \"sleep 5\"",
+		"managedStopCommand": ""
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "searxng", gjson.Get(w.Body.String(), "engine").String())
+	assert.Equal(t, "http://127.0.0.1:18080/search", gjson.Get(w.Body.String(), "url").String())
+	assert.Equal(t, false, gjson.Get(w.Body.String(), "managedEnabled").Bool())
+
+	getReq := httptest.NewRequest("GET", "/api/settings/web-search", nil)
+	getW := httptest.NewRecorder()
+	proxy.ServeHTTP(getW, getReq)
+	assert.Equal(t, http.StatusOK, getW.Code)
+	assert.Equal(t, "searxng", gjson.Get(getW.Body.String(), "engine").String())
+	assert.Equal(t, "http://127.0.0.1:18080/search", gjson.Get(getW.Body.String(), "url").String())
+}
+
 // When a request for a different model comes in ProxyManager should wait until
 // the first request is complete before swapping. Both requests should complete
 func TestProxyManager_SwapMultiProcessParallelRequests(t *testing.T) {
@@ -1519,6 +1555,50 @@ func TestResponsesRequestToChatMessages_ApplyPatchEmptyOperationSkipped(t *testi
 
 	messages := responsesRequestToChatMessages(req)
 	assert.Len(t, messages, 0)
+}
+
+func TestResponsesRequestToChatMessages_MergesReasoningIntoFollowingFunctionCall(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "reasoning",
+				"summary": []any{
+					map[string]any{
+						"type": "summary_text",
+						"text": "run the command first",
+					},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "exec_command",
+				"call_id":   "call_shell_1",
+				"arguments": `{"cmd":"pwd"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_shell_1",
+				"output":  "/tmp/workspace\n",
+			},
+		},
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	if !assert.Len(t, messages, 2) {
+		return
+	}
+	assert.Equal(t, "assistant", messages[0]["role"])
+	assert.Equal(t, "run the command first", messages[0]["reasoning_content"])
+	toolCalls, ok := messages[0]["tool_calls"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, toolCalls, 1) {
+		return
+	}
+	toolCall, _ := toolCalls[0].(map[string]any)
+	fn, _ := toolCall["function"].(map[string]any)
+	assert.Equal(t, "exec_command", fn["name"])
+	assert.Equal(t, "tool", messages[1]["role"])
+	assert.Equal(t, "call_shell_1", messages[1]["tool_call_id"])
+	assert.Equal(t, "/tmp/workspace", messages[1]["content"])
 }
 
 func TestResponsesRequestToChatMessages_PreservesRoleForUntypedRoleContentInput(t *testing.T) {

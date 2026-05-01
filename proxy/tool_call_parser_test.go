@@ -9,6 +9,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func firstCommand(t *testing.T, raw any) string {
+	t.Helper()
+	cmds := normalizeShellCommandsValue(raw)
+	require.NotEmpty(t, cmds)
+	return cmds[0]
+}
+
 func TestParseModelSpecificToolCalls_UsesQwenParser(t *testing.T) {
 	content := `<tool_call>
 <function=shell>
@@ -21,7 +28,26 @@ pwd
 	calls, remaining := parseModelSpecificToolCalls("Qwen3-Coder-30B", content)
 	require.Len(t, calls, 1)
 	assert.Equal(t, "shell", calls[0].Name)
-	assert.Equal(t, "pwd", calls[0].Arguments["command"])
+	assert.Equal(t, "pwd", firstCommand(t, calls[0].Arguments["commands"]))
+	assert.Equal(t, "", remaining)
+}
+
+func TestParseModelSpecificToolCalls_UsesQwenParserFunctionNameAttribute(t *testing.T) {
+	content := `<tool_call>
+<function name="shell">
+<parameter name="commands">
+["ls","-la"]
+</parameter>
+</function>
+</tool_call>`
+
+	calls, remaining := parseModelSpecificToolCalls("Qwen3-Coder-30B", content)
+	require.Len(t, calls, 1)
+	assert.Equal(t, "shell", calls[0].Name)
+	commands := normalizeShellCommandsValue(calls[0].Arguments["commands"])
+	require.Len(t, commands, 2)
+	assert.Equal(t, "ls", commands[0])
+	assert.Equal(t, "-la", commands[1])
 	assert.Equal(t, "", remaining)
 }
 
@@ -37,7 +63,7 @@ func TestParseModelSpecificToolCalls_CodexAliasUsesQwenParser(t *testing.T) {
 	calls, remaining := parseModelSpecificToolCalls("gpt-5.3-codex", content)
 	require.Len(t, calls, 1)
 	assert.Equal(t, "shell_command", calls[0].Name)
-	assert.Equal(t, "pwd", calls[0].Arguments["command"])
+	assert.Equal(t, "pwd", firstCommand(t, calls[0].Arguments["commands"]))
 	assert.Equal(t, "", remaining)
 }
 
@@ -80,7 +106,7 @@ func TestParseModelSpecificToolCalls_QwenEscapedToolsEnvelopeCommandArray(t *tes
 	calls, remaining := parseModelSpecificToolCalls("Qwen3.6-35B-A3B-UD-Q8_K_XL", content)
 	require.Len(t, calls, 1)
 	assert.Equal(t, "shell_command", calls[0].Name)
-	assert.Equal(t, `cat c:\Users\YLAB-Partner\.codex\config.toml`, calls[0].Arguments["command"])
+	assert.Equal(t, `cat c:\Users\YLAB-Partner\.codex\config.toml`, firstCommand(t, calls[0].Arguments["commands"]))
 	assert.Equal(t, "Planning first.", remaining)
 }
 
@@ -108,7 +134,7 @@ func TestParseModelSpecificToolCalls_QwenTaggedShellCommands(t *testing.T) {
 	calls, remaining := parseModelSpecificToolCalls("Qwen3.6-35B-A3B-UD-Q8_K_XL", content)
 	require.Len(t, calls, 1)
 	assert.Equal(t, "shell_command", calls[0].Name)
-	assert.Equal(t, `dir "c:\Users\YLAB-Partner\Downloads\qwentest"`, calls[0].Arguments["command"])
+	assert.Equal(t, `dir "c:\Users\YLAB-Partner\Downloads\qwentest"`, firstCommand(t, calls[0].Arguments["commands"]))
 	assert.Equal(t, "I will inspect first.", remaining)
 }
 
@@ -140,9 +166,7 @@ func TestParseModelSpecificToolCalls_QwenTaggedShellCommandsCatNoClose(t *testin
 <cat> C:/Users/YLAB-Partner/.codex/skills/llama-swap-auto-repair-loop/SKILL.md </cat>`
 
 	calls, remaining := parseModelSpecificToolCalls("Qwen3.6-35B-A3B-UD-Q8_K_XL", content)
-	require.Len(t, calls, 1)
-	assert.Equal(t, "shell_command", calls[0].Name)
-	assert.Equal(t, `cat C:/Users/YLAB-Partner/.codex/skills/llama-swap-auto-repair-loop/SKILL.md`, calls[0].Arguments["command"])
+	assert.Empty(t, calls)
 	assert.Equal(t, "Starting check.", remaining)
 }
 
@@ -153,9 +177,7 @@ cat C:/Users/YLAB-Partner/.codex/skills/llama-swap-auto-repair-loop/SKILL.md
 </shell_command>`
 
 	calls, remaining := parseModelSpecificToolCalls("Qwen3.6-35B-A3B-UD-Q8_K_XL", content)
-	require.Len(t, calls, 1)
-	assert.Equal(t, "shell_command", calls[0].Name)
-	assert.Equal(t, `cat C:/Users/YLAB-Partner/.codex/skills/llama-swap-auto-repair-loop/SKILL.md`, calls[0].Arguments["command"])
+	assert.Empty(t, calls)
 	assert.Equal(t, "Start.", remaining)
 }
 
@@ -164,7 +186,7 @@ func TestParseModelSpecificToolCalls_QwenTaggedShellWrapperWithCommands(t *testi
 	calls, remaining := parseModelSpecificToolCalls("Qwen3.6-35B-A3B-UD-Q8_K_XL", content)
 	require.Len(t, calls, 1)
 	assert.Equal(t, "shell_command", calls[0].Name)
-	assert.Equal(t, "pwd", calls[0].Arguments["command"])
+	assert.Equal(t, "pwd", firstCommand(t, calls[0].Arguments["commands"]))
 	assert.Equal(t, "", remaining)
 }
 
@@ -175,9 +197,7 @@ func TestParseModelSpecificToolCalls_QwenToolUseFileReadPath(t *testing.T) {
 </file_read>
 </tool_use>`
 	calls, remaining := parseModelSpecificToolCalls("gpt-5.2", content)
-	require.Len(t, calls, 1)
-	assert.Equal(t, "shell_command", calls[0].Name)
-	assert.Equal(t, `cat "C:/Users/YLAB-Partner/.codex/config.toml"`, calls[0].Arguments["command"])
+	assert.Empty(t, calls)
 	assert.Equal(t, "", remaining)
 }
 
@@ -186,7 +206,7 @@ func TestParseModelSpecificToolCalls_QwenBareToolCallOpener(t *testing.T) {
 <tool_call>`
 	calls, remaining := parseModelSpecificToolCalls("gpt-5.2", content)
 	assert.Empty(t, calls)
-	assert.Equal(t, "Calling update first.\n<tool_call>", remaining)
+	assert.Equal(t, "Calling update first.", remaining)
 }
 
 func TestParseModelSpecificToolCalls_QwenFunctionStyleUpdatePlanSteps(t *testing.T) {
@@ -245,10 +265,10 @@ func TestParseModelSpecificToolCalls_QwenToolCallWithUpdatePlanJSONAndDanglingLs
 </update_plan>
 <ls -la /home/admmin/llama-swap`
 	calls, _ := parseModelSpecificToolCalls("gpt-5.2", content)
-	require.Len(t, calls, 2)
+	// We preserve generic parsing without command-name special cases.
+	// Malformed dangling shell lines are not promoted unless emitted in tool shape.
+	require.Len(t, calls, 1)
 	assert.Equal(t, "update_plan", calls[0].Name)
-	assert.Equal(t, "shell_command", calls[1].Name)
-	assert.Equal(t, "ls -la /home/admmin/llama-swap", calls[1].Arguments["command"])
 }
 
 func TestParseModelSpecificToolCalls_RealWSLMalformedPlanBlob(t *testing.T) {
@@ -283,16 +303,8 @@ func TestParseModelSpecificToolCalls_PlainNumberedPlanFallback(t *testing.T) {
 2. Read and analyze config.toml
 3. Summarize key findings`
 	calls, remaining := parseModelSpecificToolCalls("gpt-5.2", content)
-	require.Len(t, calls, 1)
-	assert.Equal(t, "update_plan", calls[0].Name)
-	planJSON, err := json.Marshal(calls[0].Arguments["plan"])
-	require.NoError(t, err)
-	var plan []map[string]any
-	require.NoError(t, json.Unmarshal(planJSON, &plan))
-	require.Len(t, plan, 3)
-	assert.Equal(t, "Inspect workspace structure", plan[0]["step"])
-	assert.Equal(t, "in_progress", plan[0]["status"])
-	assert.Equal(t, "", remaining)
+	assert.Empty(t, calls)
+	assert.Contains(t, remaining, "### Plan:")
 }
 
 func TestParseModelSpecificToolCalls_DecoratedPlanFallback(t *testing.T) {
@@ -316,15 +328,7 @@ func TestParseModelSpecificToolCalls_ProposedPlanSummaryFallback(t *testing.T) {
 Summary: Create a single self-contained HTML game and verify it runs.
 </proposed_plan>`
 	calls, remaining := parseModelSpecificToolCalls("gpt-5.2", content)
-	require.Len(t, calls, 1)
-	assert.Equal(t, "update_plan", calls[0].Name)
-	planJSON, err := json.Marshal(calls[0].Arguments["plan"])
-	require.NoError(t, err)
-	var plan []map[string]any
-	require.NoError(t, json.Unmarshal(planJSON, &plan))
-	require.Len(t, plan, 1)
-	assert.Equal(t, "in_progress", plan[0]["status"])
-	assert.Contains(t, plan[0]["step"], "single self-contained HTML game")
+	assert.Empty(t, calls)
 	assert.NotContains(t, remaining, "<proposed_plan>")
 }
 
@@ -371,7 +375,7 @@ func TestParseModelSpecificToolCalls_GenericTerminalTagFallback(t *testing.T) {
 	calls, remaining := parseModelSpecificToolCalls("gpt-5.2", content)
 	require.Len(t, calls, 1)
 	assert.Equal(t, "shell_command", calls[0].Name)
-	assert.Equal(t, "pwd", calls[0].Arguments["command"])
+	assert.Equal(t, "pwd", firstCommand(t, calls[0].Arguments["commands"]))
 	assert.Empty(t, strings.TrimSpace(remaining))
 }
 

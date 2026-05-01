@@ -7,10 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -48,7 +50,21 @@ const (
 
 const applyPatchTraceLogPath = "/tmp/llama-swap-apply-patch-trace.log"
 
+const (
+	applyPatchPreferredToolDescription  = "Preferred method for file create, update, and delete. Use apply_patch instead of shell for writing file content or deleting files. For simple updates, prefer operation.content with the final file text. Use operation.diff only when you can provide exact patch context, not line-number-only hunks. For deletions, use operation.type=delete_file instead of shell rm/del."
+	applyPatchTailConstraintText        = "[apply_patch preferred] For file writes and deletions, use apply_patch rather than shell. Shell is for commands, builds, and inspection only."
+	applyPatchDeleteConstraintText      = "[native delete required] If the task deletes a file and apply_patch is available, use apply_patch with operation.type=delete_file. Do not use shell rm, del, unlink, or trash commands for that deletion."
+	applyPatchRetryPreferredFailureText = "[proxy] apply_patch is available and preferred for file writes. The previous turn used shell to write file content. Retry with apply_patch."
+	applyPatchValidationWarningPrefix   = "[proxy validation] apply_patch"
+	shellValidationWarningPrefix        = "[proxy validation] shell"
+	llamaSwapWebSearchURLVar            = "LLAMA_SWAP_WEB_SEARCH_URL"
+	llamaSwapSearxngCommandVar          = "LLAMA_SWAP_SEARXNG_CMD"
+	llamaSwapSearxngStopCommandVar      = "LLAMA_SWAP_SEARXNG_STOP_CMD"
+	llamaSwapSearxngEnabledVar          = "LLAMA_SWAP_SEARXNG_ENABLED"
+)
+
 var applyPatchTraceMu sync.Mutex
+var bridgeHTMLTagRegexp = regexp.MustCompile(`(?s)<[^>]+>`)
 
 // stripTopLevelParam removes a top-level parameter from JSON body without affecting nested fields.
 // This prevents accidentally removing nested fields like tools[].type when stripping "type".
@@ -348,6 +364,8 @@ func normalizeResponsesToolsMap(data map[string]any) ([]string, []string, bool) 
 		switch toolType {
 		case "function":
 			normalizedTools = append(normalizedTools, rawTool)
+		case "mcp":
+			normalizedTools = append(normalizedTools, cloneMap(tool))
 		case "shell":
 			normalizedTools = append(normalizedTools, buildResponsesShellFunctionTool())
 			adapted = appendIfMissing(adapted, "shell")
@@ -794,32 +812,41 @@ func buildResponsesApplyPatchFunctionTool() map[string]any {
 	return map[string]any{
 		"type":        "function",
 		"name":        llamaSwapApplyPatchFunctionName,
-		"description": "Compatibility wrapper for the Responses API apply_patch tool.",
+		"description": applyPatchPreferredToolDescription,
 		"parameters": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"operation": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"type": map[string]any{
-							"type": "string",
-							"enum": []string{"create_file", "update_file", "delete_file"},
-						},
-						"path": map[string]any{
-							"type": "string",
-						},
-						"diff": map[string]any{
-							"type": "string",
-						},
-						"content": map[string]any{
-							"type": "string",
-						},
-					},
-					"required": []string{"type", "path"},
-				},
+				"operation": buildApplyPatchOperationSchema(),
 			},
 			"required": []string{"operation"},
 		},
+	}
+}
+
+func buildApplyPatchOperationSchema() map[string]any {
+	return map[string]any{
+		"type":        "object",
+		"description": "Single file operation. Use type create_file, update_file, or delete_file. Alias spellings createfile/updatefile/deletefile are also accepted on input.",
+		"properties": map[string]any{
+			"type": map[string]any{
+				"type":        "string",
+				"enum":        []string{"create_file", "update_file", "delete_file"},
+				"description": "Operation type. Prefer create_file, update_file, or delete_file.",
+			},
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Absolute or workspace-relative file path.",
+			},
+			"diff": map[string]any{
+				"type":        "string",
+				"description": "Exact patch text with real file context. Do not send line-number-only hunks without matching context.",
+			},
+			"content": map[string]any{
+				"type":        "string",
+				"description": "Preferred for simple create/update operations: provide the full final file content.",
+			},
+		},
+		"required": []string{"type", "path"},
 	}
 }
 
@@ -855,6 +882,499 @@ func buildResponsesWebSearchFunctionTool() map[string]any {
 			"required": []string{"query"},
 		},
 	}
+}
+
+func requestIncludesWebSearchTool(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	tools, _ := req["tools"].([]any)
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		names := []string{
+			strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", tool["type"]))),
+			strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", tool["name"]))),
+		}
+		if fn, ok := tool["function"].(map[string]any); ok {
+			names = append(names, strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", fn["name"]))))
+		}
+		for _, name := range names {
+			switch name {
+			case "web_search", "web_search_preview", "websearch", "websearchpreview", llamaSwapWebSearchFunctionName:
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func cloneAnySlice(items []any) []any {
+	if len(items) == 0 {
+		return []any{}
+	}
+	cloned := make([]any, 0, len(items))
+	for _, raw := range items {
+		if m, ok := raw.(map[string]any); ok {
+			cloned = append(cloned, cloneMap(m))
+			continue
+		}
+		cloned = append(cloned, raw)
+	}
+	return cloned
+}
+
+func extractStringSlice(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		out := make([]string, 0, len(typed))
+		for _, entry := range typed {
+			if trimmed := strings.TrimSpace(entry); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, raw := range typed {
+			if trimmed := strings.TrimSpace(fmt.Sprintf("%v", raw)); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func normalizeMapValue(value any) map[string]any {
+	if value == nil {
+		return map[string]any{}
+	}
+	if typed, ok := value.(map[string]any); ok {
+		return typed
+	}
+	encoded := mustJSONBytes(value)
+	if len(encoded) == 0 {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(encoded, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func sanitizeBridgeWebSearchQuery(query string, domains []string) string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return ""
+	}
+	if len(domains) == 0 {
+		return query
+	}
+	extra := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		domain = strings.TrimSpace(domain)
+		if domain == "" {
+			continue
+		}
+		extra = append(extra, "site:"+domain)
+	}
+	if len(extra) == 0 {
+		return query
+	}
+	return strings.TrimSpace(query + " " + strings.Join(extra, " "))
+}
+
+func stripBridgeHTML(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	text = bridgeHTMLTagRegexp.ReplaceAllString(text, " ")
+	text = html.UnescapeString(text)
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func decodeDuckDuckGoResultURL(rawURL string) string {
+	rawURL = html.UnescapeString(strings.TrimSpace(rawURL))
+	if rawURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err == nil {
+		if uddg := strings.TrimSpace(parsed.Query().Get("uddg")); uddg != "" {
+			if decoded, decodeErr := url.QueryUnescape(uddg); decodeErr == nil && strings.TrimSpace(decoded) != "" {
+				return decoded
+			}
+			return uddg
+		}
+	}
+	return rawURL
+}
+
+func executeDuckDuckGoHTMLSearch(ctx context.Context, effectiveQuery string) (map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://html.duckduckgo.com/html/?q="+url.QueryEscape(effectiveQuery), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "llama-swap/bridge-web-search")
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("duckduckgo search returned status %d", resp.StatusCode)
+	}
+
+	titleRe := regexp.MustCompile(`(?is)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>`)
+	snippetRe := regexp.MustCompile(`(?is)<(?:a|div)[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>`)
+	titleMatches := titleRe.FindAllStringSubmatchIndex(string(body), 6)
+	results := make([]any, 0, len(titleMatches))
+	for idx, match := range titleMatches {
+		if len(match) < 6 {
+			continue
+		}
+		title := stripBridgeHTML(string(body[match[4]:match[5]]))
+		link := decodeDuckDuckGoResultURL(string(body[match[2]:match[3]]))
+		if title == "" || link == "" {
+			continue
+		}
+		snippet := ""
+		searchEnd := len(body)
+		if idx+1 < len(titleMatches) && len(titleMatches[idx+1]) >= 2 {
+			searchEnd = titleMatches[idx+1][0]
+		}
+		segment := string(body[match[1]:searchEnd])
+		if snippetMatch := snippetRe.FindStringSubmatch(segment); len(snippetMatch) >= 2 {
+			snippet = stripBridgeHTML(snippetMatch[1])
+		}
+		results = append(results, map[string]any{
+			"title":   title,
+			"url":     link,
+			"snippet": snippet,
+		})
+	}
+	return map[string]any{
+		"provider": "duckduckgo_html",
+		"results":  results,
+	}, nil
+}
+
+func executeConfiguredWebSearch(ctx context.Context, endpoint string, effectiveQuery string) (map[string]any, error) {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil {
+		return nil, err
+	}
+	queryValues := parsed.Query()
+	if strings.TrimSpace(queryValues.Get("q")) == "" {
+		queryValues.Set("q", effectiveQuery)
+	}
+	if strings.TrimSpace(queryValues.Get("format")) == "" {
+		queryValues.Set("format", "json")
+	}
+	parsed.RawQuery = queryValues.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "llama-swap/bridge-web-search")
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("configured web search returned status %d", resp.StatusCode)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return nil, err
+	}
+	rawResults, _ := decoded["results"].([]any)
+	if len(rawResults) == 0 {
+		if alt, ok := decoded["items"].([]any); ok {
+			rawResults = alt
+		}
+	}
+	results := make([]any, 0, len(rawResults))
+	for _, raw := range rawResults {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		title := strings.TrimSpace(fmt.Sprintf("%v", item["title"]))
+		if title == "" {
+			title = strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
+		}
+		link := strings.TrimSpace(fmt.Sprintf("%v", item["url"]))
+		if link == "" {
+			link = strings.TrimSpace(fmt.Sprintf("%v", item["link"]))
+		}
+		snippet := strings.TrimSpace(fmt.Sprintf("%v", item["content"]))
+		if snippet == "" {
+			snippet = strings.TrimSpace(fmt.Sprintf("%v", item["snippet"]))
+		}
+		if title == "" && link == "" && snippet == "" {
+			continue
+		}
+		results = append(results, map[string]any{
+			"title":   title,
+			"url":     link,
+			"snippet": snippet,
+		})
+		if len(results) >= 6 {
+			break
+		}
+	}
+	return map[string]any{
+		"provider": strings.TrimSpace(parsed.Host),
+		"results":  results,
+	}, nil
+}
+
+func executeBridgeWebSearch(ctx context.Context, action map[string]any) map[string]any {
+	return executeBridgeWebSearchWithSettings(ctx, action, "duckduckgo_html", strings.TrimSpace(os.Getenv(llamaSwapWebSearchURLVar)))
+}
+
+func executeBridgeWebSearchWithSettings(ctx context.Context, action map[string]any, engine string, endpoint string) map[string]any {
+	query := strings.TrimSpace(fmt.Sprintf("%v", action["query"]))
+	domains := extractStringSlice(action["domains"])
+	effectiveQuery := sanitizeBridgeWebSearchQuery(query, domains)
+	payload := map[string]any{
+		"ok":                  true,
+		"query":               query,
+		"effective_query":     effectiveQuery,
+		"domains":             domains,
+		"search_context_size": strings.TrimSpace(fmt.Sprintf("%v", action["search_context_size"])),
+		"fetched_at":          time.Now().UTC().Format(time.RFC3339),
+	}
+	if userLocation, ok := action["user_location"].(map[string]any); ok && len(userLocation) > 0 {
+		payload["user_location"] = userLocation
+	}
+	if effectiveQuery == "" {
+		payload["ok"] = false
+		payload["error"] = "missing web search query"
+		payload["results"] = []any{}
+		return payload
+	}
+
+	var (
+		result map[string]any
+		err    error
+	)
+	engine = strings.TrimSpace(strings.ToLower(engine))
+	switch {
+	case engine == "searxng" && strings.TrimSpace(endpoint) != "":
+		result, err = executeConfiguredWebSearch(ctx, endpoint, effectiveQuery)
+	case (engine == "" || engine == "duckduckgo_html") && strings.TrimSpace(endpoint) != "" && strings.TrimSpace(os.Getenv(llamaSwapWebSearchURLVar)) == strings.TrimSpace(endpoint):
+		result, err = executeConfiguredWebSearch(ctx, endpoint, effectiveQuery)
+	case engine == "" || engine == "duckduckgo_html":
+		result, err = executeDuckDuckGoHTMLSearch(ctx, effectiveQuery)
+	case engine == "searxng":
+		err = fmt.Errorf("searxng fallback selected but no endpoint configured")
+	default:
+		err = fmt.Errorf("unsupported web search engine %q", engine)
+	}
+	if err != nil {
+		payload["ok"] = false
+		payload["error"] = err.Error()
+		payload["results"] = []any{}
+		payload["provider"] = "bridge_error"
+		return payload
+	}
+	for key, value := range result {
+		payload[key] = value
+	}
+	if _, ok := payload["results"]; !ok {
+		payload["results"] = []any{}
+	}
+	return payload
+}
+
+func normalizeWebSearchFallbackEngine(engine string) string {
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case "searxng":
+		return "searxng"
+	default:
+		return "duckduckgo_html"
+	}
+}
+
+func envBoolTrue(name string) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func (pm *ProxyManager) getWebSearchFallbackSettings() (bool, string, string) {
+	if pm == nil {
+		return true, "duckduckgo_html", strings.TrimSpace(os.Getenv(llamaSwapWebSearchURLVar))
+	}
+	pm.Lock()
+	defer pm.Unlock()
+	engine := normalizeWebSearchFallbackEngine(pm.webSearchFallbackEngine)
+	endpoint := strings.TrimSpace(pm.webSearchFallbackURL)
+	if endpoint == "" {
+		endpoint = strings.TrimSpace(os.Getenv(llamaSwapWebSearchURLVar))
+	}
+	return pm.webSearchFallbackEnabled, engine, endpoint
+}
+
+func (pm *ProxyManager) getManagedWebSearchSettings() (bool, string, string) {
+	if pm == nil {
+		return false, strings.TrimSpace(os.Getenv(llamaSwapSearxngCommandVar)), strings.TrimSpace(os.Getenv(llamaSwapSearxngStopCommandVar))
+	}
+	pm.Lock()
+	defer pm.Unlock()
+	return pm.webSearchManagedEnabled, strings.TrimSpace(pm.webSearchManagedCommand), strings.TrimSpace(pm.webSearchManagedStopCmd)
+}
+
+func (pm *ProxyManager) setWebSearchFallbackSettings(enabled bool, engine string, endpoint string) {
+	if pm == nil {
+		return
+	}
+	pm.Lock()
+	defer pm.Unlock()
+	pm.webSearchFallbackEnabled = enabled
+	pm.webSearchFallbackEngine = normalizeWebSearchFallbackEngine(engine)
+	pm.webSearchFallbackURL = strings.TrimSpace(endpoint)
+}
+
+func (pm *ProxyManager) setManagedWebSearchSettings(enabled bool, command string, stopCommand string) {
+	if pm == nil {
+		return
+	}
+	pm.Lock()
+	pm.webSearchManagedEnabled = enabled
+	pm.webSearchManagedCommand = strings.TrimSpace(command)
+	pm.webSearchManagedStopCmd = strings.TrimSpace(stopCommand)
+	service := pm.webSearchManagedService
+	pm.Unlock()
+	if service != nil {
+		service.SetStopCommand(stopCommand)
+	}
+}
+
+func (pm *ProxyManager) syncManagedWebSearchProcess() error {
+	if pm == nil {
+		return nil
+	}
+	enabled, command, stopCommand := pm.getManagedWebSearchSettings()
+	service := pm.webSearchManagedService
+	if service == nil {
+		return nil
+	}
+	service.SetStopCommand(stopCommand)
+	if !enabled || strings.TrimSpace(command) == "" {
+		return service.Stop()
+	}
+	return service.Start(command)
+}
+
+func (pm *ProxyManager) managedWebSearchStatus() string {
+	if pm == nil || pm.webSearchManagedService == nil {
+		return "stopped"
+	}
+	return pm.webSearchManagedService.Status()
+}
+
+func (pm *ProxyManager) executeBridgeWebSearch(ctx context.Context, action map[string]any) map[string]any {
+	enabled, engine, endpoint := pm.getWebSearchFallbackSettings()
+	if !enabled {
+		return map[string]any{
+			"ok":       false,
+			"provider": "disabled",
+			"error":    "llama-swap local web-search fallback is disabled",
+			"results":  []any{},
+			"query":    strings.TrimSpace(fmt.Sprintf("%v", action["query"])),
+		}
+	}
+	return executeBridgeWebSearchWithSettings(ctx, action, engine, endpoint)
+}
+
+func extractPendingBridgeWebSearchCall(responseBody []byte) (map[string]any, bool) {
+	if !gjson.ValidBytes(responseBody) {
+		return nil, false
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(responseBody, &resp); err != nil {
+		return nil, false
+	}
+	output, _ := resp["output"].([]any)
+	completed := map[string]bool{}
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprintf("%v", item["type"])) == "web_search_call_output" {
+			completed[strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))] = true
+		}
+	}
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprintf("%v", item["type"])) != "web_search_call" {
+			continue
+		}
+		callID := strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))
+		if completed[callID] {
+			continue
+		}
+		return cloneMap(item), true
+	}
+	return nil, false
+}
+
+func appendResponsesInputItems(body []byte, items ...map[string]any) ([]byte, error) {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, err
+	}
+	input, _ := req["input"].([]any)
+	if input == nil {
+		input = []any{}
+	}
+	for _, item := range items {
+		if item == nil {
+			continue
+		}
+		input = append(input, cloneMap(item))
+	}
+	req["input"] = input
+	return json.Marshal(req)
+}
+
+func prependResponsesOutputItems(body []byte, items []any) ([]byte, error) {
+	if len(items) == 0 {
+		return body, nil
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	output, _ := resp["output"].([]any)
+	resp["output"] = append(cloneAnySlice(items), output...)
+	normalizeTranslatedResponsesOutput(resp)
+	return json.Marshal(resp)
 }
 
 func buildResponsesFileSearchFunctionTool() map[string]any {
@@ -1154,13 +1674,12 @@ func requestLooksLikePlanMode(req map[string]any) bool {
 		return mode == "plan"
 	}
 
-	combined := strings.ToLower(strings.TrimSpace(extractResponsesInputText(req["instructions"]) + "\n" + extractResponsesInputText(req["input"])))
-	if combined == "" {
+	safeCombined := strings.ToLower(strings.TrimSpace(extractTrustedResponsesInstructionText(req)))
+	if safeCombined == "" {
 		return false
 	}
 
 	// Fallback only for explicit, non-tagged collaboration headers in trusted roles.
-	safeCombined := strings.ToLower(strings.TrimSpace(extractTrustedResponsesInstructionText(req)))
 	defaultIdx := strings.LastIndex(safeCombined, "collaboration mode: default")
 	planIdx := strings.LastIndex(safeCombined, "collaboration mode: plan")
 	if defaultIdx > planIdx && defaultIdx >= 0 {
@@ -1170,13 +1689,153 @@ func requestLooksLikePlanMode(req map[string]any) bool {
 		return true
 	}
 
-	if strings.Contains(combined, "/mode plan") || strings.Contains(combined, "mode: plan") {
+	if strings.Contains(safeCombined, "/mode plan") || strings.Contains(safeCombined, "mode: plan") {
 		return true
 	}
-	if strings.Contains(combined, " --plan") || strings.HasPrefix(strings.TrimSpace(combined), "--plan") {
+	if strings.Contains(safeCombined, " --plan") || strings.HasPrefix(strings.TrimSpace(safeCombined), "--plan") {
+		return true
+	}
+	if strings.Contains(safeCombined, "plan mode only") {
+		return true
+	}
+	if strings.Contains(safeCombined, "return only the plan") {
+		return true
+	}
+	if strings.Contains(safeCombined, "do not execute tools") && strings.Contains(safeCombined, "plan") {
 		return true
 	}
 	return false
+}
+
+func rawResponsesBodyLooksLikePlanMode(body []byte) bool {
+	if gjson.ValidBytes(body) {
+		var req map[string]any
+		if err := json.Unmarshal(body, &req); err == nil {
+			return requestLooksLikePlanMode(req)
+		}
+	}
+	lower := strings.ToLower(strings.TrimSpace(string(body)))
+	if lower == "" {
+		return false
+	}
+	if strings.Contains(lower, "plan mode only") {
+		return true
+	}
+	if strings.Contains(lower, "return only the plan") {
+		return true
+	}
+	if strings.Contains(lower, "do not execute tools") && strings.Contains(lower, "plan") {
+		return true
+	}
+	if strings.Contains(lower, "/mode plan") || strings.Contains(lower, "mode: plan") {
+		return true
+	}
+	if strings.Contains(lower, " --plan") {
+		return true
+	}
+	return false
+}
+
+type ToolTier int
+
+const (
+	TierRead ToolTier = iota
+	TierWrite
+	TierDestructive
+)
+
+var toolTierRegistry = map[string]ToolTier{
+	"request_user_input": TierRead,
+	"update_plan":        TierRead,
+	"read_file":          TierRead,
+	"list_dir":           TierRead,
+	"stat":               TierRead,
+	"find_files":         TierRead,
+	"grep":               TierRead,
+	"apply_patch":        TierWrite,
+	"write_file":         TierWrite,
+	"create_file":        TierWrite,
+	"patch_file":         TierWrite,
+	"append_to_file":     TierWrite,
+	"move_file":          TierWrite,
+	"rename_file":        TierWrite,
+	"run_command":        TierWrite,
+	"shell_exec":         TierWrite,
+	"execute_command":    TierWrite,
+	"bash":               TierWrite,
+	"http_post":          TierWrite,
+	"http_put":           TierWrite,
+	"http_patch":         TierWrite,
+	"db_execute":         TierWrite,
+	"kubectl_apply":      TierWrite,
+	"terraform_apply":    TierWrite,
+	"docker_build":       TierWrite,
+	"delete_file":        TierDestructive,
+	"git_push":           TierDestructive,
+	"git_reset_hard":     TierDestructive,
+	"git_push_force":     TierDestructive,
+	"http_delete":        TierDestructive,
+	"kubectl_delete":     TierDestructive,
+	"terraform_destroy":  TierDestructive,
+	"db_drop":            TierDestructive,
+	"db_truncate":        TierDestructive,
+}
+
+func normalizeToolTierName(name string) string {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	if normalized == "" {
+		return ""
+	}
+	normalized = strings.TrimPrefix(normalized, "__llamaswap_")
+	switch normalized {
+	case "applypatch":
+		return "apply_patch"
+	case llamaSwapApplyPatchFunctionName:
+		return "apply_patch"
+	}
+	if idx := strings.LastIndex(normalized, "__"); idx >= 0 && idx+2 < len(normalized) {
+		normalized = normalized[idx+2:]
+	}
+	return normalized
+}
+
+func extractFunctionToolName(tool map[string]any) string {
+	if tool == nil {
+		return ""
+	}
+	if name, _ := tool["name"].(string); strings.TrimSpace(name) != "" {
+		return strings.TrimSpace(name)
+	}
+	if fn, ok := tool["function"].(map[string]any); ok {
+		if name, _ := fn["name"].(string); strings.TrimSpace(name) != "" {
+			return strings.TrimSpace(name)
+		}
+	}
+	return ""
+}
+
+func classifyTool(name string) ToolTier {
+	normalized := normalizeToolTierName(name)
+	if normalized == "" {
+		return TierWrite
+	}
+	if tier, ok := toolTierRegistry[normalized]; ok {
+		return tier
+	}
+	return TierWrite
+}
+
+func lookupToolTier(name string) (ToolTier, bool) {
+	normalized := normalizeToolTierName(name)
+	if normalized == "" {
+		return TierWrite, false
+	}
+	tier, ok := toolTierRegistry[normalized]
+	return tier, ok
+}
+
+func toolIsMutating(name string) bool {
+	return classifyTool(name) >= TierWrite
 }
 
 func isCodexManagedPlanMode(messages []map[string]any) bool {
@@ -1273,6 +1932,72 @@ func extractResponsesRequestReasoningEffort(req map[string]any) string {
 		effort = slashEffort
 	}
 	return normalizeResponsesReasoningEffort(effort)
+}
+
+func extractResponsesRequestReasoningSummary(req map[string]any) string {
+	if req == nil {
+		return ""
+	}
+	typed, ok := req["reasoning"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", typed["summary"])))
+}
+
+func normalizeResponsesReasoningSummary(summary string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(summary))
+	switch trimmed {
+	case "none", "concise", "detailed", "auto":
+		return trimmed
+	default:
+		return ""
+	}
+}
+
+func extractResponsesRequestReasoningSummaryFromBody(body []byte) string {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return ""
+	}
+	return normalizeResponsesReasoningSummary(extractResponsesRequestReasoningSummary(req))
+}
+
+func reasoningSummaryRequestsThinking(req map[string]any) bool {
+	switch extractResponsesRequestReasoningSummary(req) {
+	case "auto", "detailed":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripUnsupportedResponsesInclude(req map[string]any) {
+	if req == nil {
+		return
+	}
+	raw, ok := req["include"]
+	if !ok {
+		return
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		delete(req, "include")
+		return
+	}
+	filtered := make([]any, 0, len(items))
+	for _, rawItem := range items {
+		value := strings.TrimSpace(fmt.Sprintf("%v", rawItem))
+		if value == "" || strings.EqualFold(value, "reasoning.encrypted_content") {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	if len(filtered) == 0 {
+		delete(req, "include")
+		return
+	}
+	req["include"] = filtered
 }
 
 func extractLastTagBlockLooseWithStart(text, tag string) (content string, blockStart int, ok bool) {
@@ -1526,8 +2251,11 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	_ = normalizeResponsesInputMap(req)
 	mode := extractResponsesRequestMode(req)
 	codexManagedPlanMode := isCodexManagedPlanModeFromResponsesRequest(req)
+	planModeRequested := mode == "plan" || codexManagedPlanMode
 	proxyPlanEnforcement := mode == "plan" && !codexManagedPlanMode
 	reasoningEffort := extractResponsesRequestReasoningEffort(req)
+	reasoningSummaryEnabled := reasoningSummaryRequestsThinking(req)
+	stripUnsupportedResponsesInclude(req)
 	stripSlashDirectivesFromResponsesInput(req)
 	sanitizeResponsesInputToolArguments(req)
 
@@ -1535,19 +2263,60 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 		prependSystemInstructionOnce(req, "Planning mode is active. Do NOT execute tasks, claim execution, or start implementing changes.")
 		prependSystemInstructionOnce(req, "Return only a structured plan: numbered phases, assumptions, risks, and validation steps.")
 		prependSystemInstructionOnce(req, "Wrap the final answer in <proposed_plan>...</proposed_plan> tags exactly.")
-		prependSystemInstructionOnce(req, "Never include code blocks, shell commands, patches, tool calls, or file modifications in planning mode.")
+		prependSystemInstructionOnce(req, "Do not execute tools, mutate files, apply patches, or claim completed execution in planning mode. You may reference available tools only as part of the plan.")
+	}
+	if proxyPlanEnforcement {
+		prependSystemInstructionOnce(req, "In planning turns, do not call request_user_input or update_plan. If clarification is needed, ask the questions directly in normal assistant text.")
 	}
 	if profile, ok := reasoningEffortProfileForEffort(reasoningEffort); ok && strings.TrimSpace(profile.instruction) != "" {
 		prependSystemInstructionOnce(req, profile.instruction)
 	}
+	appendSerializedAgentOrchestrationInstruction(req)
 
 	out := map[string]any{}
-	hasToolRequests := false
-	if !proxyPlanEnforcement {
-		if toolsRaw, ok := req["tools"].([]any); ok {
-			hasToolRequests = len(normalizeBridgeChatTools(toolsRaw)) > 0
+	normalizedTools := []any(nil)
+	if toolsRaw, ok := req["tools"].([]any); ok {
+		prependNamespaceToolInstructions(req, toolsRaw)
+		prependPlaywrightMCPToolInstructions(req, toolsRaw)
+		normalizedTools = normalizeBridgeChatTools(toolsRaw)
+	}
+	if planModeRequested {
+		normalizedTools = removeMutatingPlanModeTools(normalizedTools, proxyPlanEnforcement)
+		if proxyPlanEnforcement {
+			normalizedTools = removePlanInteractionTools(normalizedTools)
 		}
 	}
+	if !planModeRequested && requestExplicitlyWantsReturnedPlan(req) {
+		prependSystemInstructionOnce(req,
+			"When the user asks for a plan in Default mode, return the plan directly as assistant text wrapped in <proposed_plan>...</proposed_plan>. "+
+				"Do not call update_plan to present the user-facing plan.")
+		normalizedTools = removeNamedToolFromList(normalizedTools, "update_plan")
+	}
+	if planModeRequested && !proxyPlanEnforcement && bridgeToolListHasFunction(normalizedTools, "request_user_input") {
+		prependSystemInstructionOnce(req,
+			"In native Codex plan turns, when clarification is needed and request_user_input is available, "+
+				"use the request_user_input tool instead of writing the questions as plain assistant text. "+
+				"Return a native function call named request_user_input. Do not describe the question in prose. "+
+				"Do not explain your reasoning. Arguments must contain a questions array with exactly one short question when the prompt asks for exactly one question.")
+	}
+	// Ensure apply_patch remains callable when request intent clearly asks for it,
+	// even if upstream client omitted that tool from the translated set.
+	// Exception: explicit shell-first mixed workflows intentionally narrow the
+	// first turn to shell-only; do not re-add apply_patch during translation.
+	reqBytesForIntent, _ := json.Marshal(req)
+	if !planModeRequested &&
+		shouldEnableStrictApplyPatchIntent(req, reqBytesForIntent) &&
+		!requestWantsShellInspectionBeforeApplyPatch(req) &&
+		!bridgeToolListHasFunction(normalizedTools, "apply_patch") {
+		normalizedTools = append(normalizedTools, bridgeToolToChatTool("apply_patch", applyPatchPreferredToolDescription, map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"operation": buildApplyPatchOperationSchema(),
+			},
+			"required": []string{"operation"},
+		}))
+	}
+	hasToolRequests := len(normalizedTools) > 0
 	copyField := func(key string) {
 		if v, ok := req[key]; ok {
 			out[key] = v
@@ -1571,14 +2340,14 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 		copyField(key)
 	}
 	if profile, ok := reasoningEffortProfileForEffort(reasoningEffort); ok {
-		if profile.hasEnableThinking {
+		if profile.hasEnableThinking || reasoningSummaryEnabled {
 			if existing, hasExisting := out["chat_template_kwargs"].(map[string]any); hasExisting {
 				updated := cloneMap(existing)
-				updated["enable_thinking"] = profile.enableThinking
+				updated["enable_thinking"] = profile.enableThinking || reasoningSummaryEnabled
 				out["chat_template_kwargs"] = updated
 			} else {
 				out["chat_template_kwargs"] = map[string]any{
-					"enable_thinking": profile.enableThinking,
+					"enable_thinking": profile.enableThinking || reasoningSummaryEnabled,
 				}
 			}
 		}
@@ -1601,21 +2370,55 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 			}
 		}
 	}
-	if !proxyPlanEnforcement {
-		if v, ok := req["parallel_tool_calls"]; ok {
-			out["parallel_tool_calls"] = v
-		}
-	}
-
-	if !proxyPlanEnforcement {
-		if toolsRaw, ok := req["tools"].([]any); ok {
-			if normalized := normalizeBridgeChatTools(toolsRaw); len(normalized) > 0 {
-				out["tools"] = normalized
+	if reasoningSummaryEnabled {
+		if _, ok := out["chat_template_kwargs"]; !ok {
+			out["chat_template_kwargs"] = map[string]any{
+				"enable_thinking": true,
 			}
 		}
+	}
+	if v, ok := req["parallel_tool_calls"]; ok {
+		out["parallel_tool_calls"] = v
+	}
+
+	hasPriorToolOutput := requestMapContainsAnyToolOutput(req)
+	forceFinalAfterSatisfiedApplyPatch := shouldForceFinalAnswerAfterSatisfiedApplyPatch(req)
+	if hasPriorToolOutput {
+		if exactReply := extractExactFinalReplyHintFromRequest(req); exactReply != "" {
+			prependSystemInstructionOnce(req,
+				"Continuation mode: if the task is already complete from prior tool results, do not call more tools. "+
+					"Provide the final answer immediately and reply with exactly: "+strconv.Quote(exactReply))
+		}
+	}
+	if forceFinalAfterSatisfiedApplyPatch {
+		prependSystemInstructionOnce(req,
+			"Continuation mode: the previous apply_patch already produced the requested file change. "+
+				"Do not call any more tools or modify files again. Provide the final answer immediately.")
+	}
+	if len(normalizedTools) > 0 {
+		if !forceFinalAfterSatisfiedApplyPatch {
+			out["tools"] = normalizedTools
+		}
+	}
+	if !proxyPlanEnforcement && !forceFinalAfterSatisfiedApplyPatch {
 		if toolChoice, ok := req["tool_choice"]; ok {
 			if normalized := normalizeBridgeToolChoice(toolChoice); normalized != nil {
-				out["tool_choice"] = normalized
+				if !(hasPriorToolOutput && toolChoiceTargetsSpecificTool(normalized)) {
+					out["tool_choice"] = normalized
+				}
+			}
+		}
+		if planModeRequested &&
+			!proxyPlanEnforcement &&
+			bridgeToolListHasFunction(normalizedTools, "request_user_input") &&
+			requestExplicitlyWantsNativeCodexQuestion(req) &&
+			!hasPriorToolOutput &&
+			!toolChoiceTargetsSpecificTool(out["tool_choice"]) {
+			out["tool_choice"] = map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name": "request_user_input",
+				},
 			}
 		}
 	} else {
@@ -1738,6 +2541,49 @@ func normalizeBridgeChatTools(toolsRaw []any) []any {
 		toolType = strings.TrimSpace(toolType)
 		toolName, _ := tool["name"].(string)
 		toolName = strings.TrimSpace(toolName)
+		if strings.EqualFold(toolType, "namespace") {
+			namespaceTools, _ := tool["tools"].([]any)
+			for _, childRaw := range namespaceTools {
+				child, ok := childRaw.(map[string]any)
+				if !ok {
+					continue
+				}
+				childType := strings.TrimSpace(fmt.Sprintf("%v", child["type"]))
+				if childType != "" && !strings.EqualFold(childType, "function") {
+					continue
+				}
+				childName := strings.TrimSpace(fmt.Sprintf("%v", child["name"]))
+				if childName == "" {
+					if fn, ok := child["function"].(map[string]any); ok {
+						childName = strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+					}
+				}
+				if childName == "" {
+					continue
+				}
+				fullName := joinToolNamespaceName(toolName, childName)
+				fn := map[string]any{"name": fullName}
+				if description, ok := child["description"].(string); ok && strings.TrimSpace(description) != "" {
+					fn["description"] = description
+				}
+				if parameters, ok := child["parameters"]; ok {
+					fn["parameters"] = parameters
+				} else if childFn, ok := child["function"].(map[string]any); ok {
+					if parameters, ok := childFn["parameters"]; ok {
+						fn["parameters"] = parameters
+					}
+				}
+				if strict, ok := child["strict"]; ok {
+					fn["strict"] = strict
+				} else if childFn, ok := child["function"].(map[string]any); ok {
+					if strict, ok := childFn["strict"]; ok {
+						fn["strict"] = strict
+					}
+				}
+				out = append(out, map[string]any{"type": "function", "function": fn})
+			}
+			continue
+		}
 		// Codex custom tools often arrive as type="custom" with only a name.
 		// Normalize known tool names into explicit schema branches.
 		if strings.EqualFold(toolType, "custom") {
@@ -1785,35 +2631,19 @@ func normalizeBridgeChatTools(toolsRaw []any) []any {
 				"properties": map[string]any{
 					"command": map[string]any{"type": "string"},
 					"commands": map[string]any{
-						"type":  "array",
-						"items": map[string]any{"type": "string"},
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "Commands to execute, one per array element.",
+						"minItems":    1,
 					},
 				},
 				"required": []string{"commands"},
 			}))
 		case "apply_patch":
-			out = append(out, bridgeToolToChatTool("apply_patch", "Apply a patch to files.", map[string]any{
+			out = append(out, bridgeToolToChatTool("apply_patch", applyPatchPreferredToolDescription, map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"operation": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"type": map[string]any{
-								"type": "string",
-								"enum": []string{"create_file", "update_file", "delete_file"},
-							},
-							"path": map[string]any{
-								"type": "string",
-							},
-							"diff": map[string]any{
-								"type": "string",
-							},
-							"content": map[string]any{
-								"type": "string",
-							},
-						},
-						"required": []string{"type", "path"},
-					},
+					"operation": buildApplyPatchOperationSchema(),
 				},
 				"required": []string{"operation"},
 			}))
@@ -1857,6 +2687,8 @@ func normalizeBridgeChatTools(toolsRaw []any) []any {
 				},
 				"required": []string{"action"},
 			}))
+		case "mcp":
+			out = append(out, cloneMap(tool))
 		default:
 			// Unknown tool types (e.g. Codex "custom") -> convert to function format
 			name, _ := tool["name"].(string)
@@ -1880,6 +2712,195 @@ func normalizeBridgeChatTools(toolsRaw []any) []any {
 	return out
 }
 
+func joinToolNamespaceName(namespace string, child string) string {
+	namespace = strings.TrimSpace(namespace)
+	child = strings.TrimSpace(child)
+	if namespace == "" {
+		return child
+	}
+	if child == "" {
+		return namespace
+	}
+	if strings.HasSuffix(namespace, "__") {
+		return namespace + child
+	}
+	return namespace + "__" + child
+}
+
+func buildMCPToolName(server string, tool string) string {
+	server = strings.TrimSpace(server)
+	tool = strings.TrimSpace(tool)
+	if server == "" {
+		return tool
+	}
+	return joinToolNamespaceName("mcp__"+server, tool)
+}
+
+func parseMCPToolName(name string) (server string, tool string, ok bool) {
+	name = strings.TrimSpace(name)
+	if !strings.HasPrefix(name, "mcp__") {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(name, "mcp__")
+	parts := strings.SplitN(rest, "__", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	server = strings.TrimSpace(parts[0])
+	tool = strings.TrimSpace(parts[1])
+	if server == "" || tool == "" {
+		return "", "", false
+	}
+	return server, tool, true
+}
+
+func collectNamespaceCallableNames(toolsRaw []any) map[string][]string {
+	out := map[string][]string{}
+	for _, rawTool := range toolsRaw {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		toolType := strings.TrimSpace(fmt.Sprintf("%v", tool["type"]))
+		if !strings.EqualFold(toolType, "namespace") {
+			continue
+		}
+		namespace := strings.TrimSpace(fmt.Sprintf("%v", tool["name"]))
+		if namespace == "" {
+			continue
+		}
+		children, _ := tool["tools"].([]any)
+		names := make([]string, 0, len(children))
+		for _, childRaw := range children {
+			child, ok := childRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			childName := strings.TrimSpace(fmt.Sprintf("%v", child["name"]))
+			if childName == "" {
+				if fn, ok := child["function"].(map[string]any); ok {
+					childName = strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+				}
+			}
+			if childName == "" {
+				continue
+			}
+			names = append(names, joinToolNamespaceName(namespace, childName))
+		}
+		if len(names) > 0 {
+			out[namespace] = names
+		}
+	}
+	return out
+}
+
+func prependNamespaceToolInstructions(req map[string]any, toolsRaw []any) {
+	if req == nil || len(toolsRaw) == 0 {
+		return
+	}
+	namespaces := collectNamespaceCallableNames(toolsRaw)
+	if len(namespaces) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(namespaces))
+	for namespace := range namespaces {
+		keys = append(keys, namespace)
+	}
+	sort.Strings(keys)
+	for _, namespace := range keys {
+		callable := namespaces[namespace]
+		if len(callable) == 0 {
+			continue
+		}
+		preview := callable
+		if len(preview) > 12 {
+			preview = preview[:12]
+		}
+		instruction := fmt.Sprintf(
+			"Namespace tools are not callable by their namespace root. Never call %q directly. Use one of these exact callable tool names instead: %s.",
+			namespace,
+			strings.Join(preview, ", "),
+		)
+		prependSystemInstructionOnce(req, instruction)
+	}
+}
+
+func requestMentionsPlaywrightBrowserTask(req map[string]any) bool {
+	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if text == "" {
+		reqBytes, _ := json.Marshal(req)
+		text = strings.ToLower(string(reqBytes))
+	}
+	return strings.Contains(text, "playwright") ||
+		strings.Contains(text, "browser tool") ||
+		strings.Contains(text, "browser_navigate") ||
+		strings.Contains(text, "browser_snapshot") ||
+		strings.Contains(text, "navigate to http") ||
+		strings.Contains(text, "navigate to https") ||
+		strings.Contains(text, "take a snapshot")
+}
+
+func prependPlaywrightMCPToolInstructions(req map[string]any, toolsRaw []any) {
+	if !requestMentionsPlaywrightBrowserTask(req) {
+		return
+	}
+	namespaces := collectNamespaceCallableNames(toolsRaw)
+	callable := namespaces["mcp__playwright__"]
+	if len(callable) == 0 {
+		return
+	}
+	preview := make([]string, 0, len(callable))
+	for _, name := range callable {
+		if strings.HasPrefix(name, "mcp__playwright__browser_") {
+			preview = append(preview, name)
+		}
+	}
+	if len(preview) == 0 {
+		preview = callable
+	}
+	if len(preview) > 8 {
+		preview = preview[:8]
+	}
+	prependSystemInstructionOnce(req, fmt.Sprintf(
+		"For Playwright or browser tasks, emit the exact MCP browser tool calls instead of stopping after reasoning. Use callable tool names like: %s.",
+		strings.Join(preview, ", "),
+	))
+	prependSystemInstructionOnce(req, "For browser tasks, do not finish the turn until the requested browser tool calls have been emitted and any requested final text reply has been produced.")
+}
+
+func bridgeToolListHasFunction(tools []any, name string) bool {
+	want := strings.ToLower(strings.TrimSpace(name))
+	if want == "" {
+		return false
+	}
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fn, ok := tool["function"].(map[string]any); ok {
+			got := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", fn["name"])))
+			if got == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func parsedCallListHasName(calls []ParsedToolCall, name string) bool {
+	want := strings.ToLower(strings.TrimSpace(name))
+	if want == "" {
+		return false
+	}
+	for _, c := range calls {
+		if strings.ToLower(strings.TrimSpace(c.Name)) == want {
+			return true
+		}
+	}
+	return false
+}
+
 func bridgeToolToChatTool(name string, description string, parameters map[string]any) map[string]any {
 	fn := map[string]any{"name": name}
 	if strings.TrimSpace(description) != "" {
@@ -1900,20 +2921,78 @@ func extractResponsesInputText(input any) string {
 	return strings.Join(parts, "\n")
 }
 
-var thinkTagPrefixRegex = regexp.MustCompile(`(?is)^\s*<think>\s*(.*?)\s*</think>\s*`)
+var thinkTagPrefixRegex = regexp.MustCompile(`(?is)^\s*(?:<think>\s*(.*?)\s*</think>|<thinking>\s*(.*?)\s*</thinking>)\s*`)
+var thinkTagAnywhereRegex = regexp.MustCompile(`(?is)(?:<think>\s*(.*?)\s*</think>|<thinking>\s*(.*?)\s*</thinking>)`)
+var leadingReasoningDirectiveRegex = regexp.MustCompile(`(?is)^\s*/(?:no_)?think\s*(?:\r?\n+|\z)`)
+var leadingOrphanThinkCloseRegex = regexp.MustCompile(`(?is)^\s*(?:(?:</think>|</thinking>)\s*)+`)
+var reasoningFunctionStyleRecoveryPrefixRegex = regexp.MustCompile(`(?is)^\s*(?:</think>\s*|</thinking>\s*)*(?:apply_patch|shell|shell_command|web_search|file_search|code_interpreter|image_generation|computer|update_plan|spawn_agent|send_input|resume_agent|wait_agent|close_agent)\s*\(`)
+
+func stripLeadingReasoningDirective(text string) string {
+	if text == "" {
+		return ""
+	}
+	stripped := leadingReasoningDirectiveRegex.ReplaceAllString(text, "")
+	if match := thinkTagPrefixRegex.FindStringSubmatchIndex(stripped); match != nil && len(match) >= 2 {
+		stripped = strings.TrimSpace(stripped[match[1]:])
+	}
+	stripped = leadingOrphanThinkCloseRegex.ReplaceAllString(stripped, "")
+	stripped = strings.TrimSpace(stripped)
+	if stripped == "" {
+		if leadingOrphanThinkCloseRegex.MatchString(strings.TrimSpace(text)) {
+			return ""
+		}
+		return strings.TrimSpace(text)
+	}
+	return stripped
+}
 
 func extractContentAndReasoning(raw string) (content string, reasoning string) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", ""
 	}
-	match := thinkTagPrefixRegex.FindStringSubmatchIndex(trimmed)
-	if match == nil || len(match) < 4 {
+	match := thinkTagAnywhereRegex.FindStringSubmatchIndex(trimmed)
+	if match == nil || len(match) < 2 {
 		return trimmed, ""
 	}
-	reasoning = strings.TrimSpace(trimmed[match[2]:match[3]])
+	reasoning = strings.TrimSpace(thinkTagAnywhereRegex.ReplaceAllString(trimmed[match[0]:match[1]], `$1$2`))
+	// Discard any pre-think prose. When models emit a brief sentence before the
+	// think block, only the post-think content should reach the final output lane.
 	content = strings.TrimSpace(trimmed[match[1]:])
 	return content, reasoning
+}
+
+func shouldAllowReasoningDerivedToolRecovery(raw string, parsedCalls []ParsedToolCall) bool {
+	if len(parsedCalls) == 0 {
+		return false
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	for _, marker := range []string{
+		"<tool_call>",
+		"</tool_call>",
+		"<function=",
+		"<tools>",
+		"</tools>",
+		"<apply_patch>",
+		"</apply_patch>",
+		"<shell_commands>",
+		"</shell_commands>",
+		"<shell_command>",
+		"</shell_command>",
+		"<shell>",
+		"</shell>",
+		"<tool_use>",
+		"</tool_use>",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return reasoningFunctionStyleRecoveryPrefixRegex.MatchString(trimmed)
 }
 
 func collectResponseText(v any, out *[]string) {
@@ -1944,6 +3023,7 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 			"content": strings.TrimSpace(instructions),
 		})
 	}
+	pendingReasoningText := ""
 
 	convertOne := func(role string, content any) {
 		if content == nil {
@@ -1964,6 +3044,10 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 		message := map[string]any{
 			"role":    normalizedRole,
 			"content": text,
+		}
+		if normalizedRole == "assistant" && reasoningText == "" && pendingReasoningText != "" {
+			reasoningText = pendingReasoningText
+			pendingReasoningText = ""
 		}
 		if normalizedRole == "assistant" && reasoningText != "" {
 			message["reasoning_content"] = reasoningText
@@ -1990,7 +3074,7 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 			callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(out))
 		}
 
-		out = append(out, map[string]any{
+		message := map[string]any{
 			"role":    "assistant",
 			"content": "",
 			"tool_calls": []any{
@@ -2003,7 +3087,12 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 					},
 				},
 			},
-		})
+		}
+		if pendingReasoningText != "" {
+			message["reasoning_content"] = pendingReasoningText
+			pendingReasoningText = ""
+		}
+		out = append(out, message)
 	}
 
 	appendToolResult := func(callID string, output any) {
@@ -2062,12 +3151,11 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 				if reasoningText == "" {
 					continue
 				}
-				// Keep reasoning on a dedicated field so it never pollutes assistant content text.
-				out = append(out, map[string]any{
-					"role":              "assistant",
-					"content":           "",
-					"reasoning_content": reasoningText,
-				})
+				if pendingReasoningText == "" {
+					pendingReasoningText = reasoningText
+				} else {
+					pendingReasoningText = strings.TrimSpace(pendingReasoningText + "\n" + reasoningText)
+				}
 			case "function_call":
 				appendAssistantToolCall(fmt.Sprintf("%v", item["name"]), item["arguments"], fmt.Sprintf("%v", item["call_id"]))
 			case "function_call_output":
@@ -2109,7 +3197,22 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 					continue
 				}
 				appendAssistantToolCall("apply_patch", payload, fmt.Sprintf("%v", item["call_id"]))
+			case "custom_tool_call":
+				callName := strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
+				if callName == "" {
+					continue
+				}
+				payload := map[string]any{}
+				if input := strings.TrimSpace(cleanFallbackInput(item["input"], "")); input != "" {
+					payload["input"] = input
+				}
+				if len(payload) == 0 {
+					continue
+				}
+				appendAssistantToolCall(callName, payload, fmt.Sprintf("%v", item["call_id"]))
 			case "apply_patch_call_output":
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+			case "custom_tool_call_output":
 				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
 			case "web_search_call":
 				appendAssistantToolCall("web_search", item["action"], fmt.Sprintf("%v", item["call_id"]))
@@ -2136,6 +3239,13 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 			}
 		}
 	}
+	if pendingReasoningText != "" {
+		out = append(out, map[string]any{
+			"role":              "assistant",
+			"content":           "",
+			"reasoning_content": pendingReasoningText,
+		})
+	}
 	return out
 }
 
@@ -2161,44 +3271,186 @@ func splitNonEmptyLines(s string) []string {
 	return out
 }
 
+func decodeShellCommandArrayString(raw string) ([]string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false
+	}
+	var stringValues []string
+	if err := json.Unmarshal([]byte(raw), &stringValues); err == nil {
+		out := make([]string, 0, len(stringValues))
+		for _, value := range stringValues {
+			trimmed := strings.TrimSpace(value)
+			if trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out, true
+	}
+	var anyValues []any
+	if err := json.Unmarshal([]byte(raw), &anyValues); err == nil {
+		out := make([]string, 0, len(anyValues))
+		for _, value := range anyValues {
+			trimmed := strings.TrimSpace(fmt.Sprintf("%v", value))
+			if trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+func normalizeSingleShellCommandString(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if len(trimmed) < 2 {
+		return trimmed
+	}
+	if (trimmed[0] == '\'' && trimmed[len(trimmed)-1] == '\'') || (trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"') {
+		inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+		if inner != "" && !strings.ContainsAny(inner, "\r\n") {
+			return inner
+		}
+	}
+	return trimmed
+}
+
+func tokenizeShellCommandString(raw string) []string {
+	command := normalizeSingleShellCommandString(raw)
+	if command == "" {
+		return nil
+	}
+	tokens := make([]string, 0, 4)
+	var current strings.Builder
+	inSingle := false
+	inDouble := false
+	escaped := false
+
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		tokens = append(tokens, current.String())
+		current.Reset()
+	}
+
+	for _, r := range command {
+		switch {
+		case escaped:
+			current.WriteRune(r)
+			escaped = false
+		case r == '\\' && !inSingle:
+			escaped = true
+		case r == '\'' && !inDouble:
+			inSingle = !inSingle
+		case r == '"' && !inSingle:
+			inDouble = !inDouble
+		case (r == ' ' || r == '\t') && !inSingle && !inDouble:
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if escaped {
+		current.WriteRune('\\')
+	}
+	flush()
+	if len(tokens) == 0 {
+		return []string{command}
+	}
+	return tokens
+}
+
+func buildRouterShellCommand(commands []string) []any {
+	if len(commands) == 0 {
+		return nil
+	}
+	var tokens []string
+	if len(commands) == 1 {
+		tokens = tokenizeShellCommandString(commands[0])
+	} else {
+		allSingleToken := true
+		for _, cmd := range commands {
+			if len(tokenizeShellCommandString(cmd)) != 1 {
+				allSingleToken = false
+				break
+			}
+		}
+		if allSingleToken {
+			tokens = make([]string, 0, len(commands))
+			for _, cmd := range commands {
+				tokens = append(tokens, normalizeSingleShellCommandString(cmd))
+			}
+		} else {
+			tokens = tokenizeShellCommandString(commands[0])
+		}
+	}
+	out := make([]any, 0, len(tokens))
+	for _, token := range tokens {
+		trimmed := strings.TrimSpace(token)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func normalizeShellCommandsValue(raw any) []string {
+	switch typed := raw.(type) {
+	case nil:
+		return nil
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, entry := range typed {
+			trimmed := normalizeSingleShellCommandString(fmt.Sprintf("%v", entry))
+			if trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	case []string:
+		out := make([]string, 0, len(typed))
+		for _, entry := range typed {
+			trimmed := normalizeSingleShellCommandString(entry)
+			if trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	case string:
+		trimmed := normalizeSingleShellCommandString(typed)
+		if trimmed == "" {
+			return nil
+		}
+		if decoded, ok := decodeShellCommandArrayString(trimmed); ok {
+			return decoded
+		}
+		return splitNonEmptyLines(trimmed)
+	default:
+		trimmed := normalizeSingleShellCommandString(fmt.Sprintf("%v", typed))
+		if trimmed == "" {
+			return nil
+		}
+		if decoded, ok := decodeShellCommandArrayString(trimmed); ok {
+			return decoded
+		}
+		return []string{trimmed}
+	}
+}
+
 func normalizeShellArgumentMap(raw map[string]any) map[string]any {
 	if raw == nil {
 		return map[string]any{}
 	}
 	out := cloneMap(raw)
-	command := strings.TrimSpace(fmt.Sprintf("%v", out["command"]))
-	commandsAny, hasCommands := out["commands"]
 	commands := make([]string, 0, 2)
-	if hasCommands {
-		switch typed := commandsAny.(type) {
-		case []any:
-			for _, entry := range typed {
-				v := strings.TrimSpace(fmt.Sprintf("%v", entry))
-				if v != "" {
-					commands = append(commands, v)
-				}
-			}
-		case []string:
-			for _, entry := range typed {
-				v := strings.TrimSpace(entry)
-				if v != "" {
-					commands = append(commands, v)
-				}
-			}
-		case string:
-			for _, line := range splitNonEmptyLines(typed) {
-				commands = append(commands, line)
-			}
+	if normalized := normalizeShellCommandsValue(out["commands"]); len(normalized) > 0 {
+		commands = append(commands, normalized...)
+	}
+	if len(commands) == 0 {
+		if normalized := normalizeShellCommandsValue(out["command"]); len(normalized) > 0 {
+			commands = append(commands, normalized...)
 		}
-	}
-	if command == "" && len(commands) > 0 {
-		command = commands[0]
-	}
-	if command != "" && len(commands) == 0 {
-		commands = []string{command}
-	}
-	if command != "" {
-		out["command"] = command
 	}
 	if len(commands) > 0 {
 		arr := make([]any, 0, len(commands))
@@ -2206,7 +3458,35 @@ func normalizeShellArgumentMap(raw map[string]any) map[string]any {
 			arr = append(arr, cmd)
 		}
 		out["commands"] = arr
+		// Router-facing canonical shape: `command` must be argv tokens, not a whole
+		// multiword command string packed into one array slot.
+		out["command"] = buildRouterShellCommand(commands)
+	} else {
+		delete(out, "commands")
+		delete(out, "command")
 	}
+	return out
+}
+
+func normalizeShellArgumentMapForResponse(raw map[string]any) map[string]any {
+	out := normalizeShellArgumentMap(raw)
+	if len(out) == 0 {
+		return out
+	}
+	commandOnly := normalizeShellCommandsValue(out["command"])
+	legacyCommands := normalizeShellCommandsValue(out["commands"])
+	if len(legacyCommands) > 1 && len(commandOnly) == 1 &&
+		strings.EqualFold(strings.TrimSpace(commandOnly[0]), strings.TrimSpace(legacyCommands[0])) {
+		arr := make([]any, 0, len(legacyCommands))
+		for _, cmd := range legacyCommands {
+			trimmed := strings.TrimSpace(cmd)
+			if trimmed != "" {
+				arr = append(arr, trimmed)
+			}
+		}
+		out["command"] = arr
+	}
+	delete(out, "commands")
 	return out
 }
 
@@ -2219,6 +3499,16 @@ func canonicalToolNameFromRecipient(recipient string) string {
 		return "apply_patch"
 	case "functions.update_plan":
 		return "update_plan"
+	case "functions.spawn_agent":
+		return "spawn_agent"
+	case "functions.send_input":
+		return "send_input"
+	case "functions.resume_agent":
+		return "resume_agent"
+	case "functions.wait_agent":
+		return "wait_agent"
+	case "functions.close_agent":
+		return "close_agent"
 	}
 	if recipient == "" {
 		return ""
@@ -2325,6 +3615,9 @@ func normalizePossiblyMixedToolArguments(raw string) string {
 	if repaired := extractJSONObject(raw); repaired != "" && json.Valid([]byte(repaired)) {
 		return repaired
 	}
+	if repaired := extractQwenXMLToolArguments(raw); repaired != "" && json.Valid([]byte(repaired)) {
+		return repaired
+	}
 	if repaired := extractXMLToolPayload(raw); repaired != "" && json.Valid([]byte(repaired)) {
 		return repaired
 	}
@@ -2338,6 +3631,31 @@ func extractJSONObject(s string) string {
 		return strings.TrimSpace(s[start : end+1])
 	}
 	return ""
+}
+
+func extractQwenXMLToolArguments(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	if !(strings.Contains(lower, "<tool_call") ||
+		strings.Contains(lower, "<function=") ||
+		strings.Contains(lower, "<parameter=") ||
+		strings.Contains(lower, "<tools>") ||
+		strings.Contains(lower, "<shell_commands") ||
+		strings.Contains(lower, "<shell_command") ||
+		strings.Contains(lower, "<tool_use") ||
+		strings.Contains(lower, "<update_plan") ||
+		strings.Contains(lower, "<apply_patch") ||
+		strings.Contains(lower, "<terminal>")) {
+		return ""
+	}
+	calls, _ := parseQwenXMLToolCalls(s)
+	if len(calls) != 1 {
+		return ""
+	}
+	return mustJSONString(calls[0].Arguments)
 }
 
 func extractXMLToolPayload(s string) string {
@@ -2366,9 +3684,19 @@ func extractXMLToolPayload(s string) string {
 		return ""
 	}
 	if commands, ok := fields["commands"]; ok {
+		if decoded, parsed := decodeShellCommandArrayString(commands); parsed {
+			return mustJSONString(map[string]any{"commands": decoded})
+		}
 		return mustJSONString(map[string]any{"commands": splitNonEmptyLines(commands)})
 	}
 	if command, ok := fields["command"]; ok {
+		if decoded, parsed := decodeShellCommandArrayString(command); parsed {
+			return mustJSONString(map[string]any{"commands": decoded})
+		}
+		command = strings.Trim(strings.TrimSpace(command), `[]"`)
+		if command == "" {
+			return mustJSONString(map[string]any{})
+		}
 		return mustJSONString(map[string]any{"commands": []string{command}})
 	}
 	converted := make(map[string]any, len(fields))
@@ -2397,6 +3725,62 @@ func parseJSONStringMap(s string) (map[string]any, bool) {
 		return nil, false
 	}
 	return out, true
+}
+
+var requestUserInputQuestionsArrayRegexp = regexp.MustCompile(`(?is)\bquestions\s*:\s*\[((?:[^\[\]"]+|"[^"\\]*(?:\\.[^"\\]*)*")*)\]`)
+var quotedJSONStringLiteralRegexp = regexp.MustCompile(`"((?:\\.|[^"\\])*)"`)
+var requestUserInputQuestionLineRegexp = regexp.MustCompile(`(?im)\bquestion\s*:\s*"((?:\\.|[^"\\])*)"`)
+
+func recoverRequestUserInputArgumentsFromTextSources(texts ...string) (string, bool) {
+	for _, raw := range texts {
+		text := strings.TrimSpace(raw)
+		if text == "" {
+			continue
+		}
+		lower := strings.ToLower(text)
+		if idx := strings.Index(lower, "\"questions\""); idx >= 0 {
+			if start := strings.LastIndex(text[:idx], "{"); start >= 0 {
+				if endRel := strings.Index(text[idx:], "}"); endRel > 0 {
+					candidate := strings.TrimSpace(text[start : idx+endRel+1])
+					if parsed, ok := parseJSONStringMap(candidate); ok {
+						if questions, ok := parsed["questions"].([]any); ok && len(questions) > 0 {
+							return mustJSONString(map[string]any{"questions": questions}), true
+						}
+					}
+				}
+			}
+		}
+		if match := requestUserInputQuestionsArrayRegexp.FindStringSubmatch(text); len(match) == 2 {
+			quoted := quotedJSONStringLiteralRegexp.FindAllString(match[1], -1)
+			questions := make([]string, 0, len(quoted))
+			for _, q := range quoted {
+				decoded, err := strconv.Unquote(q)
+				if err != nil {
+					continue
+				}
+				decoded = strings.TrimSpace(decoded)
+				if decoded != "" {
+					questions = append(questions, decoded)
+				}
+			}
+			if len(questions) > 0 {
+				return mustJSONString(map[string]any{"questions": questions}), true
+			}
+		}
+		if matches := requestUserInputQuestionLineRegexp.FindAllStringSubmatch(text, -1); len(matches) > 0 {
+			last := matches[len(matches)-1]
+			if len(last) == 2 {
+				decoded, err := strconv.Unquote(`"` + last[1] + `"`)
+				if err == nil {
+					decoded = strings.TrimSpace(decoded)
+					if decoded != "" {
+						return mustJSONString(map[string]any{"questions": []string{decoded}}), true
+					}
+				}
+			}
+		}
+	}
+	return "", false
 }
 
 func sanitizeBridgeToolArgumentsWithContext(args map[string]any, toolName string, systemInjector func(string)) map[string]any {
@@ -2542,9 +3926,11 @@ func hasNonEmptyApplyPatchMap(op map[string]any) bool {
 		if path == "" {
 			return false
 		}
-		return normalizeApplyPatchDiff(strings.TrimSpace(fmt.Sprintf("%v", op["diff"]))) != "" ||
-			strings.TrimSpace(fmt.Sprintf("%v", op["patch"])) != "" ||
-			strings.TrimSpace(fmt.Sprintf("%v", op["content"])) != ""
+		diff := normalizeApplyPatchDiff(strings.TrimSpace(cleanFallbackInput(op["diff"], "")))
+		patch := strings.TrimSpace(cleanFallbackInput(op["patch"], ""))
+		content := strings.TrimSpace(cleanFallbackInput(op["content"], ""))
+		input := strings.TrimSpace(cleanFallbackInput(op["input"], ""))
+		return diff != "" || patch != "" || content != "" || input != ""
 	case "delete_file":
 		return path != ""
 	}
@@ -2744,6 +4130,7 @@ func normalizeApplyPatchText(text string) string {
 	normalized := strings.ReplaceAll(text, "\r\n", "\n")
 	// Recover patch blocks emitted with JSON-like line continuations (`\\\n`).
 	normalized = strings.ReplaceAll(normalized, "\\\n", "\n")
+	normalized = stripApplyPatchNoNewlineMarker(normalized)
 	normalized = strings.TrimSpace(normalized)
 	if normalized == "" {
 		return ""
@@ -2824,6 +4211,7 @@ func isLikelyAbsoluteApplyPatchPath(path string) bool {
 
 func normalizeApplyPatchDiff(diff string) string {
 	diff = strings.ReplaceAll(diff, "\r\n", "\n")
+	diff = stripApplyPatchNoNewlineMarker(diff)
 	diff = strings.TrimSpace(diff)
 	if diff == "" {
 		return ""
@@ -2849,6 +4237,269 @@ func normalizeApplyPatchDiff(diff string) string {
 	return strings.TrimSpace(strings.Join(filtered, "\n"))
 }
 
+func stripApplyPatchNoNewlineMarker(text string) string {
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == `\ No newline at end of file` {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.Join(filtered, "\n")
+}
+
+func stripCodexCommandOutputEnvelope(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "Chunk ID:") {
+		if idx := strings.Index(trimmed, "\nOutput:\n"); idx >= 0 {
+			return strings.TrimSpace(trimmed[idx+len("\nOutput:\n"):])
+		}
+	}
+	return trimmed
+}
+
+func extractApplyPatchDiffBody(patch string) string {
+	normalized := normalizeApplyPatchText(patch)
+	if normalized == "" {
+		return ""
+	}
+	lines := strings.Split(normalized, "\n")
+	directiveIndex := -1
+	for idx, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "*** Update File:") || strings.HasPrefix(trimmed, "*** Add File:") {
+			directiveIndex = idx
+			break
+		}
+	}
+	if directiveIndex == -1 {
+		return normalizeApplyPatchDiff(normalized)
+	}
+	body := make([]string, 0, len(lines))
+	for _, line := range lines[directiveIndex+1:] {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "*** End Patch" {
+			break
+		}
+		body = append(body, line)
+	}
+	return strings.TrimSpace(strings.Join(body, "\n"))
+}
+
+func looksLikeLooseApplyPatchDiffBody(diff string) bool {
+	diff = strings.ReplaceAll(strings.TrimSpace(diff), "\r\n", "\n")
+	if diff == "" {
+		return false
+	}
+	if strings.Contains(diff, "@@") || strings.Contains(diff, "*** Begin Patch") {
+		return false
+	}
+	lines := strings.Split(diff, "\n")
+	if len(lines) < 2 {
+		return false
+	}
+	hasDelta := false
+	hasContext := false
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		switch line[0] {
+		case '+', '-':
+			hasDelta = true
+		case ' ':
+			hasContext = true
+		default:
+			hasContext = true
+		}
+	}
+	return hasDelta && hasContext
+}
+
+func rebuildContentFromLooseApplyPatchDiff(path string, diff string) (string, bool) {
+	path = strings.TrimSpace(normalizeApplyPatchPathForWorkspace(path))
+	diff = strings.ReplaceAll(strings.TrimSpace(diff), "\r\n", "\n")
+	if path == "" || diff == "" || !applyPatchPathExistsLocally(path) || !looksLikeLooseApplyPatchDiffBody(diff) {
+		return "", false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	existingLines := strings.Split(strings.TrimRight(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n"), "\n")
+	diffLines := strings.Split(diff, "\n")
+	out := make([]string, 0, len(existingLines)+len(diffLines))
+	existingIdx := 0
+	for idx, line := range diffLines {
+		if line == "" {
+			out = append(out, "")
+			if existingIdx < len(existingLines) && existingLines[existingIdx] == "" {
+				existingIdx++
+			}
+			continue
+		}
+		switch line[0] {
+		case '+':
+			out = append(out, line[1:])
+		case '-':
+			target := line[1:]
+			if existingIdx < len(existingLines) && existingLines[existingIdx] == target {
+				existingIdx++
+			}
+		case ' ':
+			target := line[1:]
+			out = append(out, target)
+			if existingIdx < len(existingLines) && existingLines[existingIdx] == target {
+				existingIdx++
+			}
+		default:
+			target := line
+			if existingIdx < len(existingLines) && existingLines[existingIdx] == target {
+				if idx+1 < len(diffLines) && strings.HasPrefix(diffLines[idx+1], "+") {
+					existingIdx++
+					continue
+				}
+				existingIdx++
+			}
+			out = append(out, target)
+		}
+	}
+	if existingIdx < len(existingLines) {
+		out = append(out, existingLines[existingIdx:]...)
+	}
+	rebuilt := strings.TrimSpace(strings.Join(out, "\n"))
+	if rebuilt == "" {
+		return "", false
+	}
+	return rebuilt, true
+}
+
+func buildApplyPatchDiffFromOperation(op map[string]any) string {
+	if op == nil {
+		return ""
+	}
+	opType := normalizeApplyPatchTypeHint(cleanFallbackInput(op["type"], ""))
+	path := strings.TrimSpace(cleanFallbackInput(op["path"], ""))
+	diff := normalizeApplyPatchDiff(strings.TrimSpace(cleanFallbackInput(op["diff"], "")))
+	content := strings.TrimSpace(cleanFallbackInput(op["content"], ""))
+	if content == "" {
+		content = strings.TrimSpace(cleanFallbackInput(op["input"], ""))
+	}
+	if diff != "" {
+		if strings.Contains(diff, "*** Begin Patch") {
+			if body := extractApplyPatchDiffBody(diff); body != "" {
+				return body
+			}
+		}
+		if looksLikePatchHunkOrDocument(diff) && !shouldRebuildWeakApplyPatchDiff(path, diff, content) {
+			return diff
+		}
+	}
+	switch opType {
+	case "create_file":
+		if content == "" {
+			return diff
+		}
+		lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+		prefixed := make([]string, 0, len(lines))
+		for _, line := range lines {
+			prefixed = append(prefixed, "+"+line)
+		}
+		return strings.Join(prefixed, "\n")
+	case "update_file":
+		if patch := buildHeuristicUpdatePatchFromExistingFile(path, content); patch != "" {
+			if body := extractApplyPatchDiffBody(patch); body != "" {
+				return body
+			}
+		}
+		if content != "" {
+			lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+			var b strings.Builder
+			b.WriteString("@@\n")
+			for _, line := range lines {
+				b.WriteString("+")
+				b.WriteString(line)
+				b.WriteString("\n")
+			}
+			return strings.TrimSpace(b.String())
+		}
+	}
+	return diff
+}
+
+func shouldRebuildWeakApplyPatchDiff(path string, diff string, content string) bool {
+	path = strings.TrimSpace(normalizeApplyPatchPathForWorkspace(path))
+	diff = normalizeApplyPatchDiff(diff)
+	content = strings.ReplaceAll(strings.TrimSpace(content), "\r\n", "\n")
+	if path == "" || diff == "" || content == "" || !applyPatchPathExistsLocally(path) {
+		return false
+	}
+	lines := strings.Split(diff, "\n")
+	hasDelete := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			hasDelete = true
+			break
+		}
+	}
+	if hasDelete {
+		appendApplyPatchTrace("weak_diff_rebuild_probe", map[string]any{
+			"path":         path,
+			"result":       false,
+			"reason":       "has_delete",
+			"content_len":  len(content),
+			"diff_excerpt": truncateBridgeDebugText(diff, 180),
+		})
+		return false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		appendApplyPatchTrace("weak_diff_rebuild_probe", map[string]any{
+			"path":         path,
+			"result":       false,
+			"reason":       "read_failed",
+			"content_len":  len(content),
+			"diff_excerpt": truncateBridgeDebugText(diff, 180),
+		})
+		return false
+	}
+	existingLines := strings.Split(strings.TrimRight(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n"), "\n")
+	contentLines := strings.Split(content, "\n")
+	if len(contentLines) < max(2, len(existingLines)/2) {
+		appendApplyPatchTrace("weak_diff_rebuild_probe", map[string]any{
+			"path":           path,
+			"result":         false,
+			"reason":         "content_too_short",
+			"content_len":    len(content),
+			"existing_lines": len(existingLines),
+			"content_lines":  len(contentLines),
+			"diff_excerpt":   truncateBridgeDebugText(diff, 180),
+		})
+		return false
+	}
+	shared := countSharedApplyPatchLines(existingLines, contentLines)
+	result := shared >= 2
+	appendApplyPatchTrace("weak_diff_rebuild_probe", map[string]any{
+		"path":           path,
+		"result":         result,
+		"reason":         "shared_line_eval",
+		"content_len":    len(content),
+		"existing_lines": len(existingLines),
+		"content_lines":  len(contentLines),
+		"shared_lines":   shared,
+		"diff_excerpt":   truncateBridgeDebugText(diff, 180),
+	})
+	return result
+}
+
 func normalizeApplyPatchOperation(operation any) any {
 	switch typed := operation.(type) {
 	case map[string]any:
@@ -2867,21 +4518,79 @@ func normalizeApplyPatchOperation(operation any) any {
 		if path, ok := out["path"].(string); ok && strings.TrimSpace(path) != "" {
 			out["path"] = normalizeApplyPatchPathForWorkspace(path)
 		}
+		if opType == "create_file" {
+			if path := strings.TrimSpace(cleanFallbackInput(out["path"], "")); path != "" && applyPatchPathExistsLocally(path) {
+				out["type"] = "update_file"
+				opType = "update_file"
+			}
+		}
 		if s, ok := out["diff"].(string); ok && strings.TrimSpace(s) != "" {
 			out["diff"] = normalizeApplyPatchDiff(s)
 		}
-		// Compatibility: some harnesses expect `input` while others use `content`.
-		// Mirror both fields for create/update operations when only one is present.
+		// Accept legacy `input` but emit canonical operation fields.
 		if opType == "create_file" || opType == "update_file" {
-			content := strings.TrimSpace(cleanFallbackInput(out["content"], ""))
-			input := strings.TrimSpace(cleanFallbackInput(out["input"], ""))
-			switch {
-			case content != "" && input == "":
-				out["input"] = content
-			case input != "" && content == "":
+			content := strings.TrimSpace(stripCodexCommandOutputEnvelope(stripApplyPatchNoNewlineMarker(cleanFallbackInput(out["content"], ""))))
+			input := strings.TrimSpace(stripCodexCommandOutputEnvelope(stripApplyPatchNoNewlineMarker(cleanFallbackInput(out["input"], ""))))
+			diff := strings.TrimSpace(cleanFallbackInput(out["diff"], ""))
+			patch := strings.TrimSpace(cleanFallbackInput(out["patch"], ""))
+			if content != "" {
+				out["content"] = content
+			}
+			if input != "" {
+				out["input"] = input
+			}
+			if opType == "update_file" && diff != "" && content == "" && input == "" && patch == "" {
+				path := strings.TrimSpace(cleanFallbackInput(out["path"], ""))
+				if rebuilt, ok := rebuildContentFromLooseApplyPatchDiff(path, diff); ok && strings.TrimSpace(rebuilt) != "" {
+					out["content"] = rebuilt
+					content = rebuilt
+					delete(out, "diff")
+					diff = ""
+				}
+			}
+			// Recover weaker update diffs (e.g. "\n+line") by deriving content.
+			if opType == "update_file" && diff != "" && content == "" && input == "" && patch == "" && !looksLikePatchHunkOrDocument(diff) {
+				if derived, ok := deriveContentFromApplyPatchDiff(diff); ok && strings.TrimSpace(derived) != "" {
+					content = strings.TrimSpace(derived)
+					out["content"] = content
+				}
+			}
+			if opType == "update_file" && diff != "" && content == "" && input == "" && patch == "" {
+				path := strings.TrimSpace(cleanFallbackInput(out["path"], ""))
+				if recovered, ok := recoverContentFromWeakApplyPatchUpdate(path, diff); ok && strings.TrimSpace(recovered) != "" {
+					out["content"] = recovered
+					content = recovered
+					delete(out, "diff")
+					diff = ""
+				}
+			}
+			if opType == "update_file" && content != "" {
+				path := strings.TrimSpace(cleanFallbackInput(out["path"], ""))
+				if repaired, ok := repairApplyPatchContentWithConcatenatedRewrite(path, content); ok && strings.TrimSpace(repaired) != "" {
+					out["content"] = repaired
+					content = repaired
+				}
+				if repaired, ok := repairApplyPatchContentWithPrefixedTail(path, content); ok && strings.TrimSpace(repaired) != "" {
+					out["content"] = repaired
+					content = repaired
+				}
+				if diff != "" && shouldRebuildWeakApplyPatchDiff(path, diff, content) {
+					delete(out, "diff")
+					diff = ""
+				}
+			}
+			if input != "" && content == "" {
 				out["content"] = input
 			}
 		}
+		if opType == "create_file" || opType == "update_file" {
+			if rebuiltDiff := strings.TrimSpace(buildApplyPatchDiffFromOperation(out)); rebuiltDiff != "" {
+				out["diff"] = rebuiltDiff
+			}
+		}
+		delete(out, "input")
+		delete(out, "patch")
+		delete(out, "raw")
 		return out
 	case string:
 		if operation, ok := convertApplyPatchTextToOperation(typed); ok {
@@ -2891,6 +4600,118 @@ func normalizeApplyPatchOperation(operation any) any {
 	default:
 		return operation
 	}
+}
+
+func repairApplyPatchContentWithPrefixedTail(path string, content string) (string, bool) {
+	path = strings.TrimSpace(normalizeApplyPatchPathForWorkspace(path))
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	if path == "" || content == "" || !applyPatchPathExistsLocally(path) {
+		return "", false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	existing := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	existingTrimmed := strings.TrimRight(existing, "\n")
+	contentTrimmed := strings.TrimRight(content, "\n")
+	if existingTrimmed == "" || !strings.HasPrefix(contentTrimmed, existingTrimmed+"\n+") {
+		return "", false
+	}
+	tail := strings.TrimPrefix(contentTrimmed, existingTrimmed+"\n")
+	if strings.TrimSpace(tail) == "" {
+		return "", false
+	}
+	tailLines := strings.Split(tail, "\n")
+	stripped := make([]string, 0, len(tailLines))
+	for _, line := range tailLines {
+		if !strings.HasPrefix(line, "+") {
+			return "", false
+		}
+		stripped = append(stripped, strings.TrimPrefix(line, "+"))
+	}
+	existingLines := strings.Split(existingTrimmed, "\n")
+	overlap := longestApplyPatchSuffixPrefixOverlap(existingLines, stripped)
+	newLines := stripped[overlap:]
+	if len(newLines) == 0 {
+		return "", false
+	}
+	desired := append(append([]string{}, existingLines...), newLines...)
+	return strings.Join(desired, "\n"), true
+}
+
+func repairApplyPatchContentWithConcatenatedRewrite(path string, content string) (string, bool) {
+	path = strings.TrimSpace(normalizeApplyPatchPathForWorkspace(path))
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	if path == "" || content == "" || !applyPatchPathExistsLocally(path) {
+		return "", false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	existing := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	existingTrimmed := strings.TrimRight(existing, "\n")
+	contentTrimmed := strings.TrimRight(content, "\n")
+	if existingTrimmed == "" || !strings.HasPrefix(contentTrimmed, existingTrimmed+"\n") {
+		return "", false
+	}
+	candidate := strings.TrimPrefix(contentTrimmed, existingTrimmed+"\n")
+	if strings.TrimSpace(candidate) == "" {
+		return "", false
+	}
+	if strings.Contains(candidate, "\n+") {
+		return "", false
+	}
+	candidateLines := strings.Split(candidate, "\n")
+	existingLines := strings.Split(existingTrimmed, "\n")
+	if len(candidateLines) < 2 || len(candidateLines) < max(2, len(existingLines)/2) {
+		return "", false
+	}
+	shared := countSharedApplyPatchLines(existingLines, candidateLines)
+	if shared < 2 {
+		return "", false
+	}
+	if candidate == existingTrimmed {
+		return "", false
+	}
+	return candidate, true
+}
+
+func longestApplyPatchSuffixPrefixOverlap(existingLines []string, candidateLines []string) int {
+	maxOverlap := len(candidateLines)
+	if len(existingLines) < maxOverlap {
+		maxOverlap = len(existingLines)
+	}
+	for overlap := maxOverlap; overlap > 0; overlap-- {
+		matched := true
+		start := len(existingLines) - overlap
+		for i := 0; i < overlap; i++ {
+			if existingLines[start+i] != candidateLines[i] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return overlap
+		}
+	}
+	return 0
+}
+
+func countSharedApplyPatchLines(existingLines []string, candidateLines []string) int {
+	counts := make(map[string]int, len(existingLines))
+	for _, line := range existingLines {
+		counts[line]++
+	}
+	shared := 0
+	for _, line := range candidateLines {
+		if counts[line] > 0 {
+			counts[line]--
+			shared++
+		}
+	}
+	return shared
 }
 
 func buildApplyPatchInputFromOperation(operation any) string {
@@ -2915,7 +4736,7 @@ func buildApplyPatchInputFromOperation(operation any) string {
 			content = strings.ReplaceAll(strings.TrimSpace(input), "\r\n", "\n")
 		}
 		if content == "" {
-			diff := normalizeApplyPatchDiff(strings.TrimSpace(fmt.Sprintf("%v", op["diff"])))
+			diff := normalizeApplyPatchDiff(strings.TrimSpace(cleanFallbackInput(op["diff"], "")))
 			if diff != "" {
 				if strings.Contains(diff, "*** Begin Patch") {
 					return diff
@@ -2962,10 +4783,22 @@ func buildApplyPatchInputFromOperation(operation any) string {
 		b.WriteString("*** End Patch\n")
 		return b.String()
 	case "update_file":
-		diff := normalizeApplyPatchDiff(strings.TrimSpace(fmt.Sprintf("%v", op["diff"])))
+		diff := normalizeApplyPatchDiff(strings.TrimSpace(cleanFallbackInput(op["diff"], "")))
+		content := strings.TrimSpace(cleanFallbackInput(op["content"], ""))
+		if content == "" {
+			content = strings.TrimSpace(cleanFallbackInput(op["input"], ""))
+		}
+		if diff != "" && shouldRebuildWeakApplyPatchDiff(path, diff, content) {
+			diff = ""
+		}
 		if diff != "" {
 			if strings.Contains(diff, "*** Begin Patch") {
 				return normalizeApplyPatchText(diff)
+			}
+			if !looksLikePatchHunkOrDocument(diff) {
+				if patch := buildHeuristicUpdatePatchFromExistingFile(path, diff); patch != "" {
+					return patch
+				}
 			}
 			var b strings.Builder
 			b.WriteString("*** Begin Patch\n")
@@ -2982,11 +4815,10 @@ func buildApplyPatchInputFromOperation(operation any) string {
 		// If only full replacement content is available, synthesize a minimal
 		// hunk so Codex apply_patch receives valid patch text instead of an
 		// empty/malformed payload that triggers retry loops.
-		content := strings.TrimSpace(cleanFallbackInput(op["content"], ""))
-		if content == "" {
-			content = strings.TrimSpace(cleanFallbackInput(op["input"], ""))
-		}
 		if content != "" {
+			if patch := buildHeuristicUpdatePatchFromExistingFile(path, content); patch != "" {
+				return patch
+			}
 			lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
 			var b strings.Builder
 			b.WriteString("*** Begin Patch\n")
@@ -3005,6 +4837,235 @@ func buildApplyPatchInputFromOperation(operation any) string {
 	default:
 		return ""
 	}
+}
+
+func buildHeuristicUpdatePatchFromExistingFile(path string, fragment string) string {
+	fragment = strings.ReplaceAll(strings.TrimSpace(fragment), "\r\n", "\n")
+	if fragment == "" || looksLikePatchHunkOrDocument(fragment) {
+		return ""
+	}
+	targetPath, err := canonicalizeLocalApplyPatchPath(path)
+	if err != nil {
+		return ""
+	}
+	raw, err := os.ReadFile(targetPath)
+	if err != nil {
+		return ""
+	}
+	existing := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	appendMode := shouldTreatUpdateFragmentAsAppend(existing, fragment)
+	var b strings.Builder
+	b.WriteString("*** Begin Patch\n")
+	b.WriteString("*** Update File: ")
+	b.WriteString(path)
+	b.WriteString("\n@@\n")
+	if strings.TrimRight(existing, "\n") != "" {
+		for _, line := range strings.Split(strings.TrimRight(existing, "\n"), "\n") {
+			prefix := "-"
+			if appendMode {
+				prefix = " "
+			}
+			b.WriteString(prefix)
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
+	for _, line := range strings.Split(fragment, "\n") {
+		b.WriteString("+")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("*** End Patch\n")
+	return b.String()
+}
+
+func extractStructuredLineKey(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return ""
+	}
+	for _, sep := range []string{"=", ":"} {
+		if idx := strings.Index(trimmed, sep); idx > 0 {
+			key := strings.TrimSpace(trimmed[:idx])
+			if key != "" {
+				return strings.ToLower(key)
+			}
+		}
+	}
+	return ""
+}
+
+func fragmentConflictsWithExistingStructuredLines(existing string, fragment string) bool {
+	existing = strings.ReplaceAll(existing, "\r\n", "\n")
+	fragment = strings.ReplaceAll(strings.TrimSpace(fragment), "\r\n", "\n")
+	if existing == "" || fragment == "" {
+		return false
+	}
+	existingKeys := map[string]string{}
+	for _, line := range strings.Split(strings.TrimRight(existing, "\n"), "\n") {
+		key := extractStructuredLineKey(line)
+		if key == "" {
+			continue
+		}
+		existingKeys[key] = strings.TrimSpace(line)
+	}
+	if len(existingKeys) == 0 {
+		return false
+	}
+	conflict := false
+	for _, line := range strings.Split(fragment, "\n") {
+		key := extractStructuredLineKey(line)
+		if key == "" {
+			continue
+		}
+		if existingLine, ok := existingKeys[key]; ok && existingLine != strings.TrimSpace(line) {
+			conflict = true
+			break
+		}
+	}
+	return conflict
+}
+
+func shouldTreatUpdateFragmentAsAppend(existing string, fragment string) bool {
+	fragment = strings.ReplaceAll(strings.TrimSpace(fragment), "\r\n", "\n")
+	existing = strings.ReplaceAll(existing, "\r\n", "\n")
+	if fragment == "" {
+		return false
+	}
+	if fragmentConflictsWithExistingStructuredLines(existing, fragment) {
+		return false
+	}
+	existingLines := strings.Split(strings.TrimRight(existing, "\n"), "\n")
+	fragmentLines := strings.Split(fragment, "\n")
+	// A one-line file updated to a different one-line value is much more
+	// likely to be a replacement than an append.
+	if len(existingLines) == 1 && len(fragmentLines) == 1 &&
+		strings.TrimSpace(existingLines[0]) != "" &&
+		strings.TrimSpace(existingLines[0]) != strings.TrimSpace(fragmentLines[0]) {
+		return false
+	}
+	if !strings.Contains(fragment, "\n") {
+		return true
+	}
+	if existing == "" {
+		return false
+	}
+	if strings.Contains(existing, fragment) {
+		return false
+	}
+	if len(fragmentLines) >= max(2, len(existingLines)/2) {
+		if countSharedApplyPatchLines(existingLines, fragmentLines) >= 2 {
+			return false
+		}
+	}
+	return len(fragment) < len(existing)
+}
+
+func applyPatchPathExistsLocally(path string) bool {
+	targetPath, err := canonicalizeLocalApplyPatchPath(path)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(targetPath)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func recoverContentFromWeakApplyPatchUpdate(path string, diff string) (string, bool) {
+	path = strings.TrimSpace(path)
+	diff = normalizeApplyPatchDiff(diff)
+	if path == "" || diff == "" || !looksLikePatchHunkOrDocument(diff) {
+		return "", false
+	}
+
+	targetPath, err := canonicalizeLocalApplyPatchPath(path)
+	if err != nil {
+		return "", false
+	}
+	raw, err := os.ReadFile(targetPath)
+	if err != nil {
+		return "", false
+	}
+	existing := strings.ReplaceAll(string(raw), "\r\n", "\n")
+
+	lines := strings.Split(diff, "\n")
+	inHunk := false
+	added := make([]string, 0, len(lines))
+	removed := make([]string, 0, len(lines))
+	context := make([]string, 0, len(lines))
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "@@"):
+			inHunk = true
+		case strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++"):
+			continue
+		case !inHunk:
+			continue
+		case strings.HasPrefix(line, "+"):
+			added = append(added, strings.TrimPrefix(line, "+"))
+		case strings.HasPrefix(line, "-"):
+			removed = append(removed, strings.TrimPrefix(line, "-"))
+		case strings.HasPrefix(line, " "):
+			context = append(context, strings.TrimPrefix(line, " "))
+		}
+	}
+
+	if len(added) == 0 {
+		return "", false
+	}
+
+	addedText := strings.Join(added, "\n")
+	removedText := strings.Join(removed, "\n")
+	contextText := strings.Join(context, "\n")
+	existingTrimmed := strings.TrimRight(existing, "\n")
+
+	if len(removed) == 0 && len(context) > 0 && existingTrimmed == contextText {
+		stripped := make([]string, 0, len(added))
+		allPrefixed := len(added) > 0
+		for _, line := range added {
+			if !strings.HasPrefix(line, "+") {
+				allPrefixed = false
+				break
+			}
+			stripped = append(stripped, strings.TrimPrefix(line, "+"))
+		}
+		if allPrefixed && len(stripped) > 0 {
+			out := existing
+			if out != "" && !strings.HasSuffix(out, "\n") {
+				out += "\n"
+			}
+			out += strings.Join(stripped, "\n")
+			if strings.HasSuffix(existing, "\n") && !strings.HasSuffix(out, "\n") {
+				out += "\n"
+			}
+			return out, true
+		}
+		return "", false
+	}
+
+	if len(removed) == 0 && shouldTreatUpdateFragmentAsAppend(existing, addedText) {
+		out := existing
+		if out != "" && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		out += addedText
+		if strings.HasSuffix(existing, "\n") && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		return out, true
+	}
+
+	if removedText != "" && existingTrimmed == removedText {
+		out := addedText
+		if strings.HasSuffix(existing, "\n") && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		return out, true
+	}
+
+	return "", false
 }
 
 func convertApplyPatchTextToOperation(text string) (map[string]any, bool) {
@@ -3190,34 +5251,72 @@ func validateBridgeToolCallItem(item map[string]any) (bool, string) {
 		if !(hasOperation || hasInput || hasPatch || hasDiff) {
 			diagnostic := strings.TrimSpace(fmt.Sprintf("%v", item["_bridge_diagnostic"]))
 			if diagnostic != "" {
-				return false, "apply_patch call was not executed because arguments were empty. Provide a non-empty patch operation with the target path and diff/content. Observed arguments: " + diagnostic
+				return false, applyPatchValidationWarningPrefix + " arguments were empty. Provide a non-empty operation with target path and diff/content. Observed arguments: " + diagnostic
 			}
-			return false, "apply_patch call was not executed because arguments were empty. Provide a non-empty patch operation with the target path and diff/content."
+			return false, applyPatchValidationWarningPrefix + " arguments were empty. Provide a non-empty operation with target path and diff/content."
 		}
 		if hasOperation && !applyPatchOperationPayloadValid(item["operation"]) {
-			return false, "apply_patch call was not executed because operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
+			return false, applyPatchValidationWarningPrefix + " operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
 		}
 		if hasInput && !applyPatchOperationPayloadValid(item["input"]) {
-			return false, "apply_patch call was not executed because input operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
+			return false, applyPatchValidationWarningPrefix + " input operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
 		}
 		if hasPatch && !applyPatchOperationPayloadValid(item["patch"]) {
-			return false, "apply_patch call was not executed because patch operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
+			return false, applyPatchValidationWarningPrefix + " patch operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
 		}
 		if hasDiff && !applyPatchOperationPayloadValid(item["diff"]) {
-			return false, "apply_patch call was not executed because diff operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
+			return false, applyPatchValidationWarningPrefix + " diff operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
+		}
+	case "custom_tool_call":
+		if strings.TrimSpace(fmt.Sprintf("%v", item["name"])) == "" {
+			return false, "custom tool call was not executed because tool name was empty."
+		}
+		if strings.TrimSpace(cleanFallbackInput(item["input"], "")) == "" {
+			return false, "custom tool call was not executed because input was empty."
+		}
+	case "mcp_tool_call":
+		if strings.TrimSpace(fmt.Sprintf("%v", item["server"])) == "" || strings.TrimSpace(fmt.Sprintf("%v", item["tool"])) == "" {
+			return false, "mcp tool call was not executed because server or tool name was empty."
 		}
 	case "shell_call", "web_search_call", "file_search_call", "code_interpreter_call", "image_generation_call", "computer_call":
 		action, _ := item["action"].(map[string]any)
+		if itemType == "shell_call" {
+			if !shellToolArgumentsValid(action) {
+				return false, shellValidationWarningPrefix + " arguments were empty. Provide a non-empty `command` string or `commands` array and retry."
+			}
+			break
+		}
 		if len(action) == 0 || !hasAnyNonEmptyValue(action) {
 			toolName := strings.TrimSuffix(itemType, "_call")
 			return false, fmt.Sprintf("%s call was not executed because arguments were empty. Provide concrete action arguments and retry.", toolName)
 		}
 	case "function_call":
-		if strings.TrimSpace(fmt.Sprintf("%v", item["name"])) == "" {
+		name := strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
+		if name == "" {
 			return false, "function call was not executed because function name was empty."
+		}
+		if strings.EqualFold(name, "shell") || strings.EqualFold(name, "shell_command") {
+			args := parseToolArgsMapString(fmt.Sprintf("%v", item["arguments"]))
+			if !shellToolArgumentsValid(args) {
+				return false, shellValidationWarningPrefix + " arguments were empty. Provide a non-empty `command` string or `commands` array and retry."
+			}
 		}
 	}
 	return true, ""
+}
+
+func shellToolArgumentsValid(raw map[string]any) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	normalized := normalizeShellArgumentMap(raw)
+	if len(normalizeShellCommandsValue(normalized["commands"])) > 0 {
+		return true
+	}
+	if len(normalizeShellCommandsValue(normalized["command"])) > 0 {
+		return true
+	}
+	return false
 }
 
 func truncateBridgeDebugText(s string, max int) string {
@@ -3326,7 +5425,7 @@ func summarizeApplyPatchResponsesOutput(body []byte) string {
 			content := item.Get("content").Array()
 			for _, part := range content {
 				text := strings.ToLower(strings.TrimSpace(part.Get("text").String()))
-				if strings.Contains(text, "apply_patch call was not executed because") {
+				if strings.Contains(text, strings.ToLower(applyPatchValidationWarningPrefix)) {
 					warnings++
 				}
 			}
@@ -3449,11 +5548,92 @@ func summarizeApplyPatchBridgeForensics(body []byte) string {
 
 func normalizeApplyPatchTypeHint(hint string) string {
 	switch strings.ToLower(strings.TrimSpace(hint)) {
-	case "create_file", "update_file", "delete_file":
-		return strings.ToLower(strings.TrimSpace(hint))
+	case "create_file", "createfile":
+		return "create_file"
+	case "update_file", "updatefile":
+		return "update_file"
+	case "delete_file", "deletefile":
+		return "delete_file"
 	default:
 		return ""
 	}
+}
+
+func extractLikelyFinalFileContentBlock(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	start := strings.LastIndex(text, "```")
+	if start == -1 {
+		return ""
+	}
+	prefix := text[:start]
+	open := strings.LastIndex(prefix, "```")
+	if open == -1 {
+		return ""
+	}
+	block := prefix[open+3:]
+	if nl := strings.Index(block, "\n"); nl != -1 {
+		lang := strings.TrimSpace(block[:nl])
+		if lang != "" && !strings.Contains(lang, "=") && !strings.Contains(lang, "/") && !strings.Contains(lang, "\\") {
+			block = block[nl+1:]
+		}
+	}
+	block = strings.TrimSpace(block)
+	if block == "" || !strings.Contains(block, "\n") || looksLikePatchText(block) {
+		return ""
+	}
+	return block
+}
+
+func repairApplyPatchOperationFromReasoningBlock(operation any, text string, reasoningText string) any {
+	op, ok := normalizeApplyPatchOperation(operation).(map[string]any)
+	if !ok {
+		return operation
+	}
+	opType := normalizeApplyPatchTypeHint(cleanFallbackInput(op["type"], ""))
+	path := strings.TrimSpace(cleanFallbackInput(op["path"], ""))
+	if path == "" || !applyPatchPathExistsLocally(path) || (opType != "create_file" && opType != "update_file") {
+		return op
+	}
+	content := strings.TrimSpace(cleanFallbackInput(op["content"], ""))
+	diff := strings.TrimSpace(cleanFallbackInput(op["diff"], ""))
+	block := extractLikelyFinalFileContentBlock(reasoningText)
+	if block == "" {
+		block = extractLikelyFinalFileContentBlock(text)
+	}
+	if block == "" {
+		return op
+	}
+	needsRepair := opType == "create_file" || content == "" || (!looksLikePatchHunkOrDocument(diff) && strings.Contains(diff, "+")) || strings.Contains(content, "+") || strings.Contains(content, "-")
+	if !needsRepair {
+		return op
+	}
+	op["type"] = "update_file"
+	op["path"] = normalizeApplyPatchPathForWorkspace(path)
+	op["content"] = block
+	delete(op, "diff")
+	return normalizeApplyPatchOperation(op)
+}
+
+func preferContentDrivenApplyPatchOperation(operation any) any {
+	op, ok := normalizeApplyPatchOperation(operation).(map[string]any)
+	if !ok {
+		return operation
+	}
+	opType := normalizeApplyPatchTypeHint(cleanFallbackInput(op["type"], ""))
+	path := strings.TrimSpace(cleanFallbackInput(op["path"], ""))
+	content := strings.TrimSpace(cleanFallbackInput(op["content"], ""))
+	if content == "" {
+		return op
+	}
+	if path == "" || !applyPatchPathExistsLocally(path) {
+		return op
+	}
+	if opType != "update_file" && opType != "create_file" {
+		return op
+	}
+	rewritten := cloneMap(op)
+	delete(rewritten, "diff")
+	return normalizeApplyPatchOperation(rewritten)
 }
 
 func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string) ([]byte, error) {
@@ -3470,6 +5650,7 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 	text := message.Get("content").String()
 	reasoningText := message.Get("reasoning_content").String()
 	text, extractedReasoning := extractContentAndReasoning(text)
+	text = stripLeadingReasoningDirective(text)
 	if strings.TrimSpace(reasoningText) == "" {
 		reasoningText = extractedReasoning
 	}
@@ -3491,7 +5672,7 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 		switchName := strings.TrimPrefix(strings.TrimSpace(name), "__llamaswap_")
 		switch switchName {
 		case "shell":
-			action := normalizeShellArgumentMap(parseToolArgsMapString(arguments))
+			action := normalizeShellArgumentMapForResponse(parseToolArgsMapString(arguments))
 			item["type"] = "function_call"
 			item["name"] = "shell"
 			item["arguments"] = mustJSONString(action)
@@ -3512,22 +5693,22 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 			item["type"] = "apply_patch_call"
 			item["status"] = "in_progress"
 			args := parseToolArgsMapString(arguments)
-			item["operation"] = selectApplyPatchOperation(args)
-			if opMap, ok := item["operation"].(map[string]any); ok && strings.TrimSpace(applyPatchPathHint) != "" {
+			operation := selectApplyPatchOperation(args)
+			if opMap, ok := operation.(map[string]any); ok && strings.TrimSpace(applyPatchPathHint) != "" {
 				opType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", opMap["type"])))
 				opPath := strings.TrimSpace(fmt.Sprintf("%v", opMap["path"]))
 				if (opType == "create_file" || opType == "update_file" || opType == "delete_file") &&
 					looksLikeAbsoluteWindowsOrUNCPath(opPath) {
 					opMap["path"] = normalizeApplyPatchPathForWorkspace(applyPatchPathHint)
-					item["operation"] = opMap
+					operation = opMap
 				}
 			}
-			if !applyPatchOperationPayloadValid(item["operation"]) {
+			if !applyPatchOperationPayloadValid(operation) {
 				if recovered, ok := recoverApplyPatchOperationFromArgs(args); ok && applyPatchOperationPayloadValid(recovered) {
-					item["operation"] = recovered
+					operation = recovered
 				}
 			}
-			if !applyPatchOperationPayloadValid(item["operation"]) && strings.TrimSpace(applyPatchPathHint) != "" {
+			if !applyPatchOperationPayloadValid(operation) && strings.TrimSpace(applyPatchPathHint) != "" {
 				fallbackType := normalizeApplyPatchTypeHint(applyPatchTypeHint)
 				if fallbackType == "" {
 					fallbackType = "create_file"
@@ -3544,21 +5725,23 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 					fallback["content"] = input
 				}
 				if applyPatchOperationPayloadValid(fallback) {
-					item["operation"] = fallback
+					operation = fallback
 				}
 			}
-			item["operation"] = normalizeApplyPatchOperation(item["operation"])
-			if !hasNonEmptyApplyPatchOperation(item["operation"]) {
+			operation = normalizeApplyPatchOperation(operation)
+			operation = repairApplyPatchOperationFromReasoningBlock(operation, text, reasoningText)
+			operation = preferContentDrivenApplyPatchOperation(operation)
+			if !hasNonEmptyApplyPatchOperation(operation) {
 				if extracted := extractApplyPatchFromFragmentedText(text); extracted != "" {
-					item["operation"] = map[string]any{"patch": extracted}
+					operation = map[string]any{"patch": extracted}
 				} else if extracted := extractApplyPatchFromFragmentedText(reasoningText); extracted != "" {
-					item["operation"] = map[string]any{"patch": extracted}
+					operation = map[string]any{"patch": extracted}
 				} else if extracted := extractApplyPatchFromFragmentedText(arguments); extracted != "" {
-					item["operation"] = map[string]any{"patch": extracted}
+					operation = map[string]any{"patch": extracted}
 				} else if looksLikePatchText(arguments) {
-					item["operation"] = map[string]any{"patch": strings.TrimSpace(arguments)}
+					operation = map[string]any{"patch": strings.TrimSpace(arguments)}
 				}
-				if !hasNonEmptyApplyPatchOperation(item["operation"]) {
+				if !hasNonEmptyApplyPatchOperation(operation) {
 					diagnosticParts := []string{
 						fmt.Sprintf("name=%q", strings.TrimSpace(name)),
 						fmt.Sprintf("normalized_args=%q", truncateBridgeDebugText(arguments, 180)),
@@ -3574,16 +5757,12 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 					})
 				}
 			}
-			// Prefer the structured `operation` payload over a synthetic patch text `input`.
-			// Some operation forms (e.g. `{type,path,content}`) cannot be losslessly converted
-			// into Codex's `apply_patch` patch format. Supplying a malformed `input` causes
-			// downstream validators to ignore the valid `operation` and fail with invalid diff.
-			payload := map[string]any{
-				"input":     "",
-				"operation": item["operation"],
+			item["operation"] = operation
+			if input := strings.TrimSpace(buildApplyPatchInputFromOperation(operation)); input != "" {
+				item["input"] = input
 			}
-			item["name"] = "apply_patch"
-			item["arguments"] = mustJSONString(payload)
+			delete(item, "name")
+			delete(item, "arguments")
 		case "web_search", "web_search_preview":
 			item["type"] = "web_search_call"
 			item["action"] = parseToolArgsMapString(arguments)
@@ -3600,21 +5779,29 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 			item["type"] = "computer_call"
 			item["action"] = parseToolArgsMapString(arguments)
 		default:
-			item["type"] = "function_call"
-			item["name"] = strings.TrimSpace(name)
-			cleanArgs := parseToolArgsMapString(arguments)
-			item["arguments"] = mustJSONString(cleanArgs)
+			if server, toolName, ok := parseMCPToolName(strings.TrimSpace(name)); ok {
+				// Keep MCP leaf tools as function_call with the fully qualified
+				// namespace name. WSL codex exec 0.123.0 persists and continues
+				// reliably with this shape, while raw mcp_tool_call items can be
+				// dropped before they reach the local rollout/event surfaces.
+				item["type"] = "function_call"
+				item["name"] = buildMCPToolName(server, toolName)
+				item["arguments"] = mustJSONString(parseToolArgsMapString(arguments))
+			} else {
+				item["type"] = "function_call"
+				item["name"] = strings.TrimSpace(name)
+				cleanArgs := parseToolArgsMapString(arguments)
+				item["arguments"] = mustJSONString(cleanArgs)
+			}
 		}
 		if ok, warning := validateBridgeToolCallItem(item); !ok {
 			sanitized := false
 			switch strings.TrimSpace(fmt.Sprintf("%v", item["type"])) {
 			case "apply_patch_call":
-				item["type"] = "function_call"
-				item["name"] = "apply_patch"
-				item["arguments"] = mustJSONString(map[string]any{
-					"input":     "",
-					"operation": normalizeApplyPatchOperation(item["operation"]),
-				})
+				item["type"] = "apply_patch_call"
+				item["operation"] = normalizeApplyPatchOperation(item["operation"])
+				delete(item, "name")
+				delete(item, "arguments")
 				sanitized = true
 			case "shell_call":
 				item["type"] = "function_call"
@@ -3623,6 +5810,7 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 				sanitized = true
 			}
 			if sanitized {
+				item["bridgevalidationwarning"] = warning
 				item["_bridge_validation_warning"] = warning
 				output = append(output, item)
 				return
@@ -3649,8 +5837,19 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 	hasFunctionCall := functionCall.Exists() && strings.TrimSpace(functionCall.Get("name").String()) != ""
 	parsedToolCalls, cleanedText := parseModelSpecificToolCalls(model, text)
 	parsedReasoningToolCalls := []ParsedToolCall{}
+	cleanedReasoningText := ""
 	if len(parsedToolCalls) == 0 && strings.TrimSpace(reasoningText) != "" {
-		parsedReasoningToolCalls, _ = parseModelSpecificToolCalls(model, reasoningText)
+		parsedReasoningToolCalls, cleanedReasoningText = parseModelSpecificToolCalls(model, reasoningText)
+		if len(parsedReasoningToolCalls) > 0 && !shouldAllowReasoningDerivedToolRecovery(reasoningText, parsedReasoningToolCalls) {
+			appendApplyPatchTrace("translate.reasoning_recovery_rejected", map[string]any{
+				"model":          model,
+				"reasoning_len":  len(strings.TrimSpace(reasoningText)),
+				"parsed_calls":   len(parsedReasoningToolCalls),
+				"reasoning_head": truncateBridgeDebugText(strings.TrimSpace(reasoningText), 220),
+			})
+			parsedReasoningToolCalls = nil
+			cleanedReasoningText = ""
+		}
 	}
 	appendApplyPatchTrace("translate.tool_parse_summary", map[string]any{
 		"model":                  model,
@@ -3661,11 +5860,14 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 		"text_len":               len(strings.TrimSpace(text)),
 		"reasoning_len":          len(strings.TrimSpace(reasoningText)),
 	})
-	if len(parsedToolCalls) > 0 || len(parsedReasoningToolCalls) > 0 {
+	if len(parsedToolCalls) > 0 {
 		text = cleanedText
 	}
-	text = strings.TrimSpace(text)
-	reasoningText = strings.TrimSpace(reasoningText)
+	if len(parsedReasoningToolCalls) > 0 {
+		reasoningText = cleanedReasoningText
+	}
+	text = strings.TrimSpace(stripLeadingReasoningDirective(text))
+	reasoningText = strings.TrimSpace(stripLeadingReasoningDirective(reasoningText))
 	// Completion-style outputs may include a valid patch block in plain text
 	// without emitting a native tool call. Synthesize an apply_patch tool call
 	// so the Responses API client can execute it.
@@ -3684,7 +5886,60 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 					Arguments: map[string]any{"input": extracted},
 				},
 			}
+		} else if strings.TrimSpace(applyPatchPathHint) != "" &&
+			strings.TrimSpace(applyPatchContentHint) != "" &&
+			(strings.Contains(strings.ToLower(text), "apply_patch") || strings.Contains(strings.ToLower(reasoningText), "apply_patch")) {
+			opType := normalizeApplyPatchTypeHint(applyPatchTypeHint)
+			if opType == "" {
+				opType = "update_file"
+			}
+			parsedReasoningToolCalls = []ParsedToolCall{
+				{
+					Name: "apply_patch",
+					Arguments: map[string]any{
+						"operation": map[string]any{
+							"type":    opType,
+							"path":    normalizeApplyPatchPathForWorkspace(applyPatchPathHint),
+							"content": strings.TrimSpace(applyPatchContentHint),
+						},
+					},
+				},
+			}
 		}
+	}
+	// If apply_patch intent is explicit and we still have no executable apply_patch
+	// call candidate, synthesize one from request hints as a deterministic fallback.
+	if !hasToolCalls && !hasFunctionCall &&
+		!parsedCallListHasName(parsedToolCalls, "apply_patch") &&
+		!parsedCallListHasName(parsedReasoningToolCalls, "apply_patch") &&
+		strings.TrimSpace(applyPatchPathHint) != "" &&
+		strings.TrimSpace(applyPatchContentHint) != "" {
+		opType := normalizeApplyPatchTypeHint(applyPatchTypeHint)
+		if opType == "" {
+			opType = "update_file"
+		}
+		parsedToolCalls = append(parsedToolCalls, ParsedToolCall{
+			Name: "apply_patch",
+			Arguments: map[string]any{
+				"operation": map[string]any{
+					"type":    opType,
+					"path":    normalizeApplyPatchPathForWorkspace(applyPatchPathHint),
+					"content": strings.TrimSpace(applyPatchContentHint),
+				},
+			},
+		})
+	}
+
+	// Some upstreams emit reasoning-only outputs (empty `content`, populated `reasoning_content`).
+	// Codex/VScode clients currently prioritize `output_text`, so produce a non-empty assistant
+	// message when no tool call exists and only reasoning was provided.
+	if strings.TrimSpace(text) == "" && strings.TrimSpace(reasoningText) != "" &&
+		!hasToolCalls && !hasFunctionCall && len(parsedToolCalls) == 0 && len(parsedReasoningToolCalls) == 0 {
+		appendApplyPatchTrace("translate.promote_reasoning_to_text", map[string]any{
+			"model": model,
+		})
+		text = reasoningText
+		reasoningText = ""
 	}
 
 	parsedByName := map[string][]ParsedToolCall{}
@@ -3755,6 +6010,11 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 		toolCalls.ForEach(func(_, tc gjson.Result) bool {
 			name := tc.Get("function.name").String()
 			args := tc.Get("function.arguments").String()
+			if strings.EqualFold(strings.TrimSpace(name), "request_user_input") && isLikelyEmptyToolArgs(args) {
+				if recovered, ok := recoverRequestUserInputArgumentsFromTextSources(reasoningText, text); ok {
+					args = recovered
+				}
+			}
 			if isLikelyEmptyToolArgs(args) {
 				if recovered, ok := popParsedArgs(name); ok && !isLikelyEmptyToolArgs(recovered) {
 					args = recovered
@@ -3767,6 +6027,11 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 	} else if hasFunctionCall {
 		name := functionCall.Get("name").String()
 		args := functionCall.Get("arguments").String()
+		if strings.EqualFold(strings.TrimSpace(name), "request_user_input") && isLikelyEmptyToolArgs(args) {
+			if recovered, ok := recoverRequestUserInputArgumentsFromTextSources(reasoningText, text); ok {
+				args = recovered
+			}
+		}
 		if isLikelyEmptyToolArgs(args) {
 			if recovered, ok := popParsedArgs(name); ok && !isLikelyEmptyToolArgs(recovered) {
 				args = recovered
@@ -3790,7 +6055,7 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 		"status":      "completed",
 		"model":       model,
 		"output":      output,
-		"output_text": text,
+		"output_text": stripLeadingReasoningDirective(text),
 	}
 	if created := gjson.GetBytes(body, "created").Int(); created > 0 {
 		resp["created_at"] = created
@@ -3909,7 +6174,7 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 				if partType == "" {
 					partType = "output_text"
 				}
-				partText := strings.TrimSpace(fmt.Sprintf("%v", part["text"]))
+				partText := strings.TrimSpace(stripLeadingReasoningDirective(fmt.Sprintf("%v", part["text"])))
 				if partText != "" {
 					hasMessageText = true
 				}
@@ -3920,7 +6185,7 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 			}
 			item["content"] = normalizedContent
 		case "function_call":
-			if strings.TrimSpace(fmt.Sprintf("%v", item["call_id"])) == "" {
+			if cleanFallbackInput(item["call_id"], "") == "" {
 				item["call_id"] = fmt.Sprintf("call_%s_%d", respID, idx)
 			}
 			name := strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
@@ -3932,38 +6197,55 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 			if strings.TrimSpace(args) == "" {
 				args = "{}"
 			}
-			if strings.EqualFold(name, "shell") {
+			switch {
+			case strings.EqualFold(name, "shell"):
 				parsed := parseToolArgsMapString(args)
-				args = mustJSONString(normalizeShellArgumentMap(parsed))
-			}
-			item["arguments"] = args
-			if strings.EqualFold(name, "apply_patch") || strings.EqualFold(name, llamaSwapApplyPatchFunctionName) {
+				args = mustJSONString(normalizeShellArgumentMapForResponse(parsed))
+				item["arguments"] = args
+				hasToolCall = true
+			case func() bool {
+				_, _, ok := parseMCPToolName(name)
+				return ok
+			}():
+				server, toolName, _ := parseMCPToolName(name)
+				item["type"] = "function_call"
+				item["name"] = buildMCPToolName(server, toolName)
+				item["arguments"] = mustJSONString(parseToolArgsMapString(args))
+				if cleanFallbackInput(item["status"], "") == "" {
+					item["status"] = "in_progress"
+				}
+				hasToolCall = true
+			case strings.EqualFold(name, "apply_patch"), strings.EqualFold(name, llamaSwapApplyPatchFunctionName):
 				parsed := parseToolArgsMapString(args)
 				op := selectApplyPatchOperation(parsed)
+				op = normalizeApplyPatchOperation(op)
+				item["type"] = "apply_patch_call"
 				if !hasNonEmptyApplyPatchOperation(op) || !applyPatchOperationPayloadValid(op) {
-					item["name"] = "apply_patch"
-					item["arguments"] = mustJSONString(map[string]any{"input": "", "operation": normalizeApplyPatchOperation(op)})
-					item["_bridge_validation_warning"] = "apply_patch call operation was invalid; emitting sanitized function_call payload."
+					item["operation"] = op
+					delete(item, "name")
+					delete(item, "arguments")
+					item["bridgevalidationwarning"] = applyPatchValidationWarningPrefix + " operation was invalid; emitting sanitized apply_patch_call payload."
+					item["_bridge_validation_warning"] = item["bridgevalidationwarning"]
 					hasToolCall = true
 					break
 				}
-				op = normalizeApplyPatchOperation(op)
-
-				// Preserve the item as a `function_call` for Codex tool dispatch, but ensure
-				// arguments contain a clean `operation` payload.
-				item["name"] = "apply_patch"
-				item["arguments"] = mustJSONString(map[string]any{"input": "", "operation": op})
 				item["operation"] = op
+				delete(item, "name")
+				delete(item, "arguments")
+				hasToolCall = true
+			default:
+				item["arguments"] = args
 				hasToolCall = true
 			}
-			hasToolCall = true
 		case "apply_patch_call":
 			op := normalizeApplyPatchOperation(item["operation"])
 			if !hasNonEmptyApplyPatchOperation(op) || !applyPatchOperationPayloadValid(op) {
-				item["type"] = "function_call"
-				item["name"] = "apply_patch"
-				item["arguments"] = mustJSONString(map[string]any{"input": "", "operation": op})
-				item["_bridge_validation_warning"] = "apply_patch_call operation was invalid; emitting sanitized function_call payload."
+				item["type"] = "apply_patch_call"
+				item["operation"] = op
+				delete(item, "name")
+				delete(item, "arguments")
+				item["bridgevalidationwarning"] = applyPatchValidationWarningPrefix + " operation was invalid; emitting sanitized apply_patch_call payload."
+				item["_bridge_validation_warning"] = item["bridgevalidationwarning"]
 				hasToolCall = true
 				break
 			}
@@ -3972,7 +6254,31 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 				item["call_id"] = fmt.Sprintf("call_%s_%d", respID, idx)
 			}
 			item["operation"] = op
+			if input := strings.TrimSpace(buildApplyPatchInputFromOperation(op)); input != "" {
+				item["input"] = input
+			}
 			if strings.TrimSpace(fmt.Sprintf("%v", item["status"])) == "" {
+				item["status"] = "in_progress"
+			}
+		case "mcp_tool_call":
+			hasToolCall = true
+			if cleanFallbackInput(item["call_id"], "") == "" {
+				item["call_id"] = fmt.Sprintf("call_%s_%d", respID, idx)
+			}
+			server := cleanFallbackInput(item["server"], "")
+			toolName := cleanFallbackInput(item["tool"], "")
+			if server == "" || toolName == "" {
+				if parsedServer, parsedTool, ok := parseMCPToolName(cleanFallbackInput(item["name"], "")); ok {
+					server = parsedServer
+					toolName = parsedTool
+				}
+			}
+			item["type"] = "function_call"
+			item["name"] = buildMCPToolName(server, toolName)
+			item["arguments"] = mustJSONString(parseToolArgsMapString(mustJSONString(normalizeMapValue(item["arguments"]))))
+			delete(item, "server")
+			delete(item, "tool")
+			if cleanFallbackInput(item["status"], "") == "" {
 				item["status"] = "in_progress"
 			}
 		case "shell_call", "web_search_call", "file_search_call", "code_interpreter_call", "image_generation_call", "computer_call":
@@ -4004,10 +6310,74 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 	}
 	if !hasMessageText {
 		resp["output_text"] = ""
+		return
 	}
+	resp["output_text"] = strings.TrimSpace(stripLeadingReasoningDirective(fmt.Sprintf("%v", resp["output_text"])))
 }
 
-func writeResponsesStream(w http.ResponseWriter, responseJSON []byte) {
+func enforceExactFinalReplyHint(responseBody []byte, hint string) []byte {
+	hint = strings.TrimSpace(hint)
+	if hint == "" || !gjson.ValidBytes(responseBody) || responseContainsToolCall(responseBody) {
+		return responseBody
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(responseBody, &resp); err != nil {
+		return responseBody
+	}
+	output, _ := resp["output"].([]any)
+	found := false
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok || strings.TrimSpace(fmt.Sprintf("%v", item["type"])) != "message" {
+			continue
+		}
+		content, _ := item["content"].([]any)
+		for _, partRaw := range content {
+			part, ok := partRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			text := strings.TrimSpace(fmt.Sprintf("%v", part["text"]))
+			if strings.Contains(text, hint) {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		return responseBody
+	}
+	respID := strings.TrimSpace(fmt.Sprintf("%v", resp["id"]))
+	if respID == "" {
+		respID = fmt.Sprintf("resp_%d", time.Now().UnixNano())
+		resp["id"] = respID
+	}
+	resp["output"] = []any{
+		map[string]any{
+			"id":   fmt.Sprintf("msg_%s_exact_reply", respID),
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{
+					"type": "output_text",
+					"text": hint,
+				},
+			},
+		},
+	}
+	resp["output_text"] = hint
+	resp["status"] = "completed"
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return responseBody
+	}
+	return out
+}
+
+func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedReasoningSummary string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -4040,10 +6410,33 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte) {
 		_, _ = w.Write([]byte("data: " + string(data) + "\n\n"))
 		flusher.Flush()
 	}
-
 	respID := strings.TrimSpace(gjson.GetBytes(responseJSON, "id").String())
 	if respID == "" {
 		respID = fmt.Sprintf("resp_%d", time.Now().UnixNano())
+	}
+	writeReasoningSummaryPartAdded := func(itemID string, outputIndex int) {
+		writeEvent("response.reasoning_summary_part.added", map[string]any{
+			"response_id":   respID,
+			"item_id":       itemID,
+			"output_index":  outputIndex,
+			"summary_index": 0,
+			"part": map[string]any{
+				"type": "summary_text",
+				"text": "",
+			},
+		})
+	}
+	writeReasoningSummaryPartDone := func(itemID string, outputIndex int, text string) {
+		writeEvent("response.reasoning_summary_part.done", map[string]any{
+			"response_id":   respID,
+			"item_id":       itemID,
+			"output_index":  outputIndex,
+			"summary_index": 0,
+			"part": map[string]any{
+				"type": "summary_text",
+				"text": text,
+			},
+		})
 	}
 	createdAt := gjson.GetBytes(responseJSON, "created_at").Int()
 	if createdAt == 0 {
@@ -4058,42 +6451,107 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte) {
 		"status":     "in_progress",
 		"output":     []any{},
 	}
+	if summary := normalizeResponsesReasoningSummary(requestedReasoningSummary); summary != "" {
+		responseSkeleton["reasoning"] = map[string]any{"summary": summary}
+	}
 
 	writeEvent("response.created", map[string]any{"response": responseSkeleton})
 	writeEvent("response.in_progress", map[string]any{"response": responseSkeleton})
 
 	var full map[string]any
 	_ = json.Unmarshal(responseJSON, &full)
+	if summary := normalizeResponsesReasoningSummary(requestedReasoningSummary); summary != "" {
+		reasoning, _ := full["reasoning"].(map[string]any)
+		if reasoning == nil {
+			reasoning = map[string]any{}
+		} else {
+			reasoning = cloneMap(reasoning)
+		}
+		reasoning["summary"] = summary
+		full["reasoning"] = reasoning
+	}
 	if needsContinuation {
 		full["status"] = "requires_action"
 	}
 	output := gjson.GetBytes(responseJSON, "output").Array()
-	for idx, itemResult := range output {
+	normalizedOutput := make([]any, 0, len(output))
+	for _, itemResult := range output {
 		item := map[string]any{}
 		if err := json.Unmarshal([]byte(itemResult.Raw), &item); err != nil {
 			continue
+		}
+		outputIndex := len(normalizedOutput)
+		// Final guardrail: never emit generic function_call for apply_patch in SSE output.
+		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["type"])), "function_call") &&
+			strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["name"])), "apply_patch") {
+			args := parseToolArgsMapString(fmt.Sprintf("%v", item["arguments"]))
+			op := normalizeApplyPatchOperation(selectApplyPatchOperation(args))
+			item["type"] = "apply_patch_call"
+			item["operation"] = op
+			if input := strings.TrimSpace(buildApplyPatchInputFromOperation(op)); input != "" {
+				item["input"] = input
+			}
+			delete(item, "name")
+			delete(item, "arguments")
+		}
+		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["type"])), "apply_patch_call") {
+			op := preferContentDrivenApplyPatchOperation(item["operation"])
+			input := strings.TrimSpace(buildApplyPatchInputFromOperation(op))
+			if input == "" {
+				input = strings.TrimSpace(cleanFallbackInput(item["input"], ""))
+			}
+			if input == "" {
+				input = strings.TrimSpace(buildApplyPatchInputFromOperation(op))
+			}
+			item["type"] = "custom_tool_call"
+			item["name"] = "apply_patch"
+			item["input"] = input
+			item["operation"] = op
+		}
+		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["type"])), "custom_tool_call") &&
+			strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["name"])), "apply_patch") {
+			op := preferContentDrivenApplyPatchOperation(item["operation"])
+			input := strings.TrimSpace(buildApplyPatchInputFromOperation(op))
+			if input == "" {
+				input = strings.TrimSpace(cleanFallbackInput(item["input"], ""))
+			}
+			item["operation"] = op
+			if input != "" {
+				item["input"] = input
+			}
 		}
 		addedItem := item
 		itemType := strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
 		if itemType == "function_call" ||
 			itemType == "shell_call" ||
 			itemType == "apply_patch_call" ||
+			itemType == "mcp_tool_call" ||
+			itemType == "custom_tool_call" ||
 			itemType == "web_search_call" ||
 			itemType == "file_search_call" ||
 			itemType == "code_interpreter_call" ||
 			itemType == "image_generation_call" ||
 			itemType == "computer_call" {
-			addedItem = cloneMap(item)
+			if _, ok := addedItem["id"]; !ok {
+				addedItem = cloneMap(item)
+			}
+			addedItem["status"] = "in_progress"
+		} else if itemType == "reasoning" {
+			if _, ok := addedItem["id"]; !ok {
+				addedItem = cloneMap(item)
+			}
 			addedItem["status"] = "in_progress"
 		}
 		writeEvent("response.output_item.added", map[string]any{
 			"response_id":  respID,
-			"output_index": idx,
+			"output_index": outputIndex,
 			"item":         addedItem,
 		})
 		if itemType == "function_call" ||
 			itemType == "shell_call" ||
 			itemType == "apply_patch_call" ||
+			itemType == "mcp_tool_call" ||
+			itemType == "custom_tool_call" ||
 			itemType == "web_search_call" ||
 			itemType == "file_search_call" ||
 			itemType == "code_interpreter_call" ||
@@ -4106,30 +6564,36 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte) {
 			if itemType != "function_call" {
 				name = strings.TrimSuffix(itemType, "_call")
 				switch itemType {
-				case "apply_patch_call":
-					payload := map[string]any{"operation": item["operation"]}
-					if input := strings.TrimSpace(fmt.Sprintf("%v", item["input"])); input != "" {
-						payload["input"] = input
+				case "mcp_tool_call":
+					name = strings.TrimSpace(fmt.Sprintf("%v", item["tool"]))
+					arguments = mustJSONString(normalizeMapValue(item["arguments"]))
+				case "custom_tool_call":
+					name = strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
+					arguments = strings.TrimSpace(cleanFallbackInput(item["input"], ""))
+					if arguments == "" {
+						op := normalizeApplyPatchOperation(item["operation"])
+						arguments = strings.TrimSpace(buildApplyPatchInputFromOperation(op))
 					}
-					arguments = mustJSONString(payload)
 				default:
 					arguments = mustJSONString(item["action"])
 				}
 			}
-			writeEvent("response.function_call_arguments.delta", map[string]any{
-				"response_id":  respID,
-				"item_id":      itemID,
-				"output_index": idx,
-				"delta":        arguments,
-			})
-			writeEvent("response.function_call_arguments.done", map[string]any{
-				"response_id":  respID,
-				"item_id":      itemID,
-				"output_index": idx,
-				"name":         name,
-				"call_id":      callID,
-				"arguments":    arguments,
-			})
+			if itemType != "custom_tool_call" && itemType != "mcp_tool_call" {
+				writeEvent("response.function_call_arguments.delta", map[string]any{
+					"response_id":  respID,
+					"item_id":      itemID,
+					"output_index": outputIndex,
+					"delta":        arguments,
+				})
+				writeEvent("response.function_call_arguments.done", map[string]any{
+					"response_id":  respID,
+					"item_id":      itemID,
+					"output_index": outputIndex,
+					"name":         name,
+					"call_id":      callID,
+					"arguments":    arguments,
+				})
+			}
 		}
 		if itemType == "message" {
 			if content, ok := item["content"].([]any); ok {
@@ -4141,28 +6605,28 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte) {
 					writeEvent("response.content_part.added", map[string]any{
 						"response_id":   respID,
 						"item_id":       item["id"],
-						"output_index":  idx,
+						"output_index":  outputIndex,
 						"content_index": contentIndex,
 						"part":          map[string]any{"type": part["type"], "text": ""},
 					})
 					writeEvent("response.output_text.delta", map[string]any{
 						"response_id":   respID,
 						"item_id":       item["id"],
-						"output_index":  idx,
+						"output_index":  outputIndex,
 						"content_index": contentIndex,
 						"delta":         fmt.Sprintf("%v", part["text"]),
 					})
 					writeEvent("response.output_text.done", map[string]any{
 						"response_id":   respID,
 						"item_id":       item["id"],
-						"output_index":  idx,
+						"output_index":  outputIndex,
 						"content_index": contentIndex,
 						"text":          fmt.Sprintf("%v", part["text"]),
 					})
 					writeEvent("response.content_part.done", map[string]any{
 						"response_id":   respID,
 						"item_id":       item["id"],
-						"output_index":  idx,
+						"output_index":  outputIndex,
 						"content_index": contentIndex,
 						"part":          part,
 					})
@@ -4172,41 +6636,124 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte) {
 		if itemType == "reasoning" {
 			reasoningText := strings.TrimSpace(extractResponsesInputText(item["summary"]))
 			if reasoningText != "" {
+				writeReasoningSummaryPartAdded(fmt.Sprintf("%v", item["id"]), outputIndex)
 				writeEvent("response.reasoning_summary_text.delta", map[string]any{
-					"response_id":  respID,
-					"item_id":      item["id"],
-					"output_index": idx,
-					"delta":        reasoningText,
+					"response_id":   respID,
+					"item_id":       item["id"],
+					"output_index":  outputIndex,
+					"summary_index": 0,
+					"delta":         reasoningText,
 				})
 				writeEvent("response.reasoning_summary_text.done", map[string]any{
-					"response_id":  respID,
-					"item_id":      item["id"],
-					"output_index": idx,
-					"text":         reasoningText,
+					"response_id":   respID,
+					"item_id":       item["id"],
+					"output_index":  outputIndex,
+					"summary_index": 0,
+					"text":          reasoningText,
 				})
+				writeReasoningSummaryPartDone(fmt.Sprintf("%v", item["id"]), outputIndex, reasoningText)
 			}
 		}
 		doneItem := item
 		if itemType == "function_call" ||
 			itemType == "shell_call" ||
 			itemType == "apply_patch_call" ||
+			itemType == "mcp_tool_call" ||
+			itemType == "custom_tool_call" ||
 			itemType == "web_search_call" ||
 			itemType == "file_search_call" ||
 			itemType == "code_interpreter_call" ||
 			itemType == "image_generation_call" ||
 			itemType == "computer_call" {
-			doneItem = cloneMap(item)
+			if _, ok := doneItem["id"]; !ok {
+				doneItem = cloneMap(item)
+			}
 			if !needsContinuation {
 				doneItem["status"] = "completed"
 			} else {
 				doneItem["status"] = "in_progress"
 			}
+		} else if itemType == "reasoning" {
+			if _, ok := doneItem["id"]; !ok {
+				doneItem = cloneMap(item)
+			}
+			doneItem["status"] = "completed"
+			if summary := normalizeResponsesReasoningSummary(requestedReasoningSummary); summary != "" {
+				doneItem["summary_mode"] = summary
+			}
 		}
 		writeEvent("response.output_item.done", map[string]any{
 			"response_id":  respID,
-			"output_index": idx,
+			"output_index": outputIndex,
 			"item":         doneItem,
 		})
+		normalizedOutput = append(normalizedOutput, doneItem)
+		if itemType == "reasoning" {
+			reasoningText := strings.TrimSpace(extractResponsesInputText(item["summary"]))
+			if reasoningText != "" {
+				commentaryOutputIndex := len(normalizedOutput)
+				commentaryItemID := fmt.Sprintf("msg_%s_%d", respID, commentaryOutputIndex)
+				commentaryItem := map[string]any{
+					"id":      commentaryItemID,
+					"type":    "message",
+					"role":    "assistant",
+					"channel": "commentary",
+					"content": []any{
+						map[string]any{"type": "output_text", "text": reasoningText},
+					},
+				}
+				writeEvent("response.output_item.added", map[string]any{
+					"response_id":  respID,
+					"output_index": commentaryOutputIndex,
+					"item": map[string]any{
+						"id":      commentaryItemID,
+						"type":    "message",
+						"role":    "assistant",
+						"channel": "commentary",
+						"content": []any{
+							map[string]any{"type": "output_text", "text": ""},
+						},
+					},
+				})
+				writeEvent("response.content_part.added", map[string]any{
+					"response_id":   respID,
+					"item_id":       commentaryItemID,
+					"output_index":  commentaryOutputIndex,
+					"content_index": 0,
+					"part":          map[string]any{"type": "output_text", "text": ""},
+				})
+				writeEvent("response.output_text.delta", map[string]any{
+					"response_id":   respID,
+					"item_id":       commentaryItemID,
+					"output_index":  commentaryOutputIndex,
+					"content_index": 0,
+					"delta":         reasoningText,
+				})
+				writeEvent("response.output_text.done", map[string]any{
+					"response_id":   respID,
+					"item_id":       commentaryItemID,
+					"output_index":  commentaryOutputIndex,
+					"content_index": 0,
+					"text":          reasoningText,
+				})
+				writeEvent("response.content_part.done", map[string]any{
+					"response_id":   respID,
+					"item_id":       commentaryItemID,
+					"output_index":  commentaryOutputIndex,
+					"content_index": 0,
+					"part":          map[string]any{"type": "output_text", "text": reasoningText},
+				})
+				writeEvent("response.output_item.done", map[string]any{
+					"response_id":  respID,
+					"output_index": commentaryOutputIndex,
+					"item":         commentaryItem,
+				})
+				normalizedOutput = append(normalizedOutput, commentaryItem)
+			}
+		}
+	}
+	if len(normalizedOutput) > 0 {
+		full["output"] = normalizedOutput
 	}
 
 	// Always finish the SSE stream with a `response.completed` event. If a tool
@@ -4219,13 +6766,19 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte) {
 func extractInvalidToolArgFeedback(responseBody []byte) (string, bool) {
 	output := gjson.GetBytes(responseBody, "output").Array()
 	for _, item := range output {
+		warning := strings.TrimSpace(item.Get("bridgevalidationwarning").String())
+		if strings.Contains(strings.ToLower(warning), strings.ToLower(applyPatchValidationWarningPrefix)) {
+			return warning, true
+		}
 		if strings.TrimSpace(item.Get("type").String()) != "message" {
 			continue
 		}
 		content := item.Get("content").Array()
 		for _, part := range content {
 			text := strings.TrimSpace(part.Get("text").String())
-			if strings.Contains(text, "apply_patch call was not executed because") {
+			lower := strings.ToLower(text)
+			if strings.Contains(lower, strings.ToLower(applyPatchValidationWarningPrefix)) ||
+				strings.Contains(lower, "apply_patch call was not executed because") {
 				return text, true
 			}
 		}
@@ -4260,12 +6813,200 @@ func requestIncludesApplyPatchTool(req map[string]any) bool {
 	return false
 }
 
+func requestHasOnlyApplyPatchTools(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	tools, _ := req["tools"].([]any)
+	if len(tools) == 0 {
+		return false
+	}
+	sawApplyPatch := false
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			return false
+		}
+		toolType := strings.TrimSpace(fmt.Sprintf("%v", tool["type"]))
+		name := strings.TrimSpace(fmt.Sprintf("%v", tool["name"]))
+		if name == "" {
+			if fn, ok := tool["function"].(map[string]any); ok {
+				name = strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+			}
+		}
+		isApplyPatch := strings.EqualFold(toolType, "apply_patch") ||
+			strings.EqualFold(name, "apply_patch") ||
+			strings.EqualFold(name, llamaSwapApplyPatchFunctionName)
+		if !isApplyPatch {
+			return false
+		}
+		sawApplyPatch = true
+	}
+	return sawApplyPatch
+}
+
+func requestHasExplicitApplyPatchToolChoice(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	raw, ok := req["tool_choice"]
+	if !ok || raw == nil {
+		return false
+	}
+	normalized := normalizeBridgeToolChoice(raw)
+	switch typed := normalized.(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "apply_patch")
+	case map[string]any:
+		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", typed["type"])), "apply_patch") {
+			return true
+		}
+		if fn, ok := typed["function"].(map[string]any); ok {
+			name := strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+			if strings.EqualFold(name, "apply_patch") || strings.EqualFold(name, llamaSwapApplyPatchFunctionName) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func shouldEnableStrictApplyPatchIntent(req map[string]any, requestBody []byte) bool {
+	if req == nil {
+		return false
+	}
+	if requestLooksLikePlanMode(req) {
+		return false
+	}
+	// Post-tool continuation turns should not be forced back into initial
+	// apply_patch recovery mode. At that point the model must be free to either
+	// finish or choose another tool without inherited patch-only steering.
+	if requestMapContainsAnyToolOutput(req) || requestContainsAnyToolOutput(requestBody) {
+		return false
+	}
+	if requestHasExplicitApplyPatchToolChoice(req) {
+		return true
+	}
+	if requestHasOnlyApplyPatchTools(req) {
+		return true
+	}
+	if requestInputMentionsApplyPatch(req) {
+		return true
+	}
+	// Last resort: if request body contains an explicit apply_patch request phrase
+	// from user-authored input text, enable strict mode. Do not scan the full
+	// request body or top-level instructions here; those contain tool metadata
+	// and model instructions that mention apply_patch on every turn.
+	lowerInput := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if requestInputExplicitlyForbidsApplyPatch(lowerInput) {
+		return false
+	}
+	if strings.Contains(lowerInput, "use apply_patch") || strings.Contains(lowerInput, "retry with apply_patch") {
+		return true
+	}
+	_ = requestBody
+	return false
+}
+
+func requestExplicitlyWantsNativeCodexQuestion(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	lowerText := strings.ToLower(strings.TrimSpace(
+		extractTrustedResponsesInstructionText(req) + "\n" + extractResponsesUserInputText(req),
+	))
+	if lowerText == "" {
+		return false
+	}
+	if strings.Contains(lowerText, "do not ask") || strings.Contains(lowerText, "no questions") {
+		return false
+	}
+	wantsQuestion := strings.Contains(lowerText, "ask exactly one short clarifying question") ||
+		strings.Contains(lowerText, "ask one short clarifying question") ||
+		strings.Contains(lowerText, "ask a short clarifying question") ||
+		strings.Contains(lowerText, "ask exactly one short question")
+	wantsNativeFormat := strings.Contains(lowerText, "native codex question format") ||
+		strings.Contains(lowerText, "request_user_input") ||
+		strings.Contains(lowerText, "codex question dialog")
+	return wantsQuestion && wantsNativeFormat
+}
+
+func requestExplicitlyWantsReturnedPlan(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	lowerText := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if lowerText == "" {
+		return false
+	}
+	hasPlanIntent := strings.HasPrefix(lowerText, "plan ") ||
+		strings.Contains(lowerText, "write a plan") ||
+		strings.Contains(lowerText, "return a plan") ||
+		strings.Contains(lowerText, "finalize the plan") ||
+		strings.Contains(lowerText, "finalizing the plan") ||
+		strings.Contains(lowerText, "<proposed_plan>")
+	if !hasPlanIntent {
+		return false
+	}
+	hasImplementIntent := strings.Contains(lowerText, "please implement this plan") ||
+		strings.Contains(lowerText, "implement this plan") ||
+		strings.Contains(lowerText, "start implementing") ||
+		strings.Contains(lowerText, "using apply_patch") ||
+		strings.Contains(lowerText, "do not use shell for writing")
+	return !hasImplementIntent
+}
+
+func toolChoiceTargetsSpecificTool(raw any) bool {
+	normalized := normalizeBridgeToolChoice(raw)
+	switch typed := normalized.(type) {
+	case nil:
+		return false
+	case string:
+		trimmed := strings.TrimSpace(strings.ToLower(typed))
+		return trimmed != "" && trimmed != "auto" && trimmed != "none" && trimmed != "required"
+	case map[string]any:
+		choiceType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", typed["type"])))
+		return choiceType == "function"
+	default:
+		return false
+	}
+}
+
+func shouldForceLocalApplyPatchFallback(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	parseFlag := func(v any) bool {
+		switch typed := v.(type) {
+		case bool:
+			return typed
+		case string:
+			lower := strings.TrimSpace(strings.ToLower(typed))
+			return lower == "1" || lower == "true" || lower == "yes" || lower == "on"
+		default:
+			return false
+		}
+	}
+	if parseFlag(req["llamaswap_force_local_apply_patch"]) {
+		return true
+	}
+	if meta, ok := req["metadata"].(map[string]any); ok {
+		if parseFlag(meta["llamaswap_force_local_apply_patch"]) {
+			return true
+		}
+	}
+	return false
+}
+
 func extractResponsesUserInputText(req map[string]any) string {
 	if req == nil {
 		return ""
 	}
 	if raw, ok := req["input"].(string); ok {
-		return strings.TrimSpace(raw)
+		text := strings.TrimSpace(raw)
+		if text != "" {
+			return text
+		}
 	}
 
 	items, ok := req["input"].([]any)
@@ -4312,7 +7053,10 @@ func extractResponsesUserInputText(req map[string]any) string {
 			lastUserText = strings.TrimSpace(extractResponsesInputText(content))
 		}
 	}
-	return lastUserText
+	if strings.TrimSpace(lastUserText) != "" {
+		return lastUserText
+	}
+	return strings.TrimSpace(cleanFallbackInput(req["instructions"], ""))
 }
 
 var applyPatchPathHintRegexps = []*regexp.Regexp{
@@ -4320,11 +7064,14 @@ var applyPatchPathHintRegexps = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bupdate\s+(?:file\s+)?([^\s"'` + "`" + `]+)`),
 	regexp.MustCompile(`(?i)\bmodify\s+(?:file\s+)?([^\s"'` + "`" + `]+)`),
 	regexp.MustCompile(`(?i)\bedit\s+(?:file\s+)?([^\s"'` + "`" + `]+)`),
+	regexp.MustCompile(`(?i)\bto\s+file\s+([^\s"'` + "`" + `]+)`),
 }
 
 var applyPatchContentHintRegexps = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bone\s+line:\s*([^\r\n]+)`),
 	regexp.MustCompile(`(?i)\bcontaining\s+exactly\s+one\s+line:\s*([^\r\n]+)`),
+	regexp.MustCompile(`(?i)\bappend(?:ing)?\s+exactly\s+one\s+line\s+['"]([^'"]+)['"]`),
+	regexp.MustCompile(`(?i)\bappend(?:ing)?\s+one\s+line\s+['"]([^'"]+)['"]`),
 }
 
 var genericPathCandidateRegexps = []*regexp.Regexp{
@@ -4459,6 +7206,9 @@ func extractApplyPatchTypeHintFromResponsesRequestBody(body []byte) string {
 	if strings.Contains(text, "update file") || strings.Contains(text, "modify file") || strings.Contains(text, "edit file") {
 		return "update_file"
 	}
+	if strings.Contains(text, "append") {
+		return "update_file"
+	}
 	if strings.Contains(text, "create file") || strings.Contains(text, "add file") || strings.Contains(text, "new file") {
 		return "create_file"
 	}
@@ -4470,6 +7220,9 @@ func requestInputMentionsApplyPatch(req map[string]any) bool {
 	if input == "" {
 		return false
 	}
+	if requestInputExplicitlyForbidsApplyPatch(input) && !strings.Contains(input, "*** begin patch") {
+		return false
+	}
 	if strings.Contains(input, "apply_patch") || strings.Contains(input, "*** begin patch") {
 		return true
 	}
@@ -4477,6 +7230,45 @@ func requestInputMentionsApplyPatch(req map[string]any) bool {
 		return true
 	}
 	return false
+}
+
+func requestInputExplicitlyForbidsApplyPatch(input string) bool {
+	input = strings.ToLower(strings.TrimSpace(input))
+	if input == "" {
+		return false
+	}
+	phrases := []string{
+		"do not use apply_patch",
+		"don't use apply_patch",
+		"dont use apply_patch",
+		"do not call apply_patch",
+		"don't call apply_patch",
+		"dont call apply_patch",
+		"without apply_patch",
+		"instead of apply_patch",
+		"rather than apply_patch",
+	}
+	for _, phrase := range phrases {
+		if strings.Contains(input, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func requestInputMentionsApplyPatchDelete(req map[string]any) bool {
+	input := strings.ToLower(extractResponsesUserInputText(req))
+	if input == "" {
+		return false
+	}
+	if !(strings.Contains(input, "apply_patch") || strings.Contains(input, "native apply_patch")) {
+		return false
+	}
+	return strings.Contains(input, "delete file") ||
+		strings.Contains(input, "delete ") ||
+		strings.Contains(input, "remove file") ||
+		strings.Contains(input, "delete /") ||
+		strings.Contains(input, "delete \\")
 }
 
 func appendAssistantMessageToResponsesOutput(responseBody []byte, text string) []byte {
@@ -4507,8 +7299,40 @@ func appendAssistantMessageToResponsesOutput(responseBody []byte, text string) [
 	return responseBody
 }
 
+func forceShellInspectionResponse(responseBody []byte, targetPath string) []byte {
+	targetPath = strings.TrimSpace(normalizeApplyPatchPathForWorkspace(targetPath))
+	if targetPath == "" || !gjson.ValidBytes(responseBody) {
+		return responseBody
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(responseBody, &resp); err != nil {
+		return responseBody
+	}
+	respID := strings.TrimSpace(fmt.Sprintf("%v", resp["id"]))
+	if respID == "" {
+		respID = fmt.Sprintf("resp_%d", time.Now().UnixNano())
+		resp["id"] = respID
+	}
+	callID := fmt.Sprintf("call_shell_inspect_%d", time.Now().UnixNano())
+	item := map[string]any{
+		"id":        "fc_" + callID,
+		"type":      "function_call",
+		"call_id":   callID,
+		"name":      "exec_command",
+		"status":    "in_progress",
+		"arguments": mustJSONString(map[string]any{"cmd": "cat " + targetPath}),
+	}
+	resp["output"] = []any{item}
+	resp["status"] = "requires_action"
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return responseBody
+	}
+	return out
+}
+
 func synthesizeApplyPatchNoActionFeedback(responseBody []byte) []byte {
-	feedback := "apply_patch call was not executed because no executable tool call was returned. The previous response only contained planning text or no actionable tool arguments. Retry immediately with a non-empty `operation` object, or provide the final answer if no patch is needed."
+	feedback := applyPatchValidationWarningPrefix + " no executable tool call was returned. The previous response only contained planning text or no actionable tool arguments. Retry immediately with a non-empty `operation` object, or provide the final answer if no patch is needed."
 	return appendAssistantMessageToResponsesOutput(responseBody, feedback)
 }
 
@@ -4551,11 +7375,53 @@ func responseContainsApplyPatchCall(responseBody []byte) bool {
 		if itemType == "function_call" && name == "apply_patch" {
 			return true
 		}
+		if itemType == "custom_tool_call" && name == "apply_patch" {
+			return true
+		}
 		if strings.Contains(args, "apply_patch") {
 			return true
 		}
 	}
 	return false
+}
+
+func responseContainsMutatingToolCall(responseBody []byte) bool {
+	output := gjson.GetBytes(responseBody, "output").Array()
+	for _, item := range output {
+		itemType := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+		name := strings.TrimSpace(item.Get("name").String())
+		switch itemType {
+		case "apply_patch_call":
+			return true
+		case "function_call", "custom_tool_call":
+			if toolIsMutating(name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func extractApplyPatchPathFromResponse(responseBody []byte) string {
+	output := gjson.GetBytes(responseBody, "output").Array()
+	for _, item := range output {
+		itemType := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+		name := strings.ToLower(strings.TrimSpace(item.Get("name").String()))
+		if itemType != "apply_patch_call" && !(itemType == "function_call" && name == "apply_patch") && !(itemType == "custom_tool_call" && name == "apply_patch") {
+			continue
+		}
+		path := strings.TrimSpace(item.Get("operation.path").String())
+		if path != "" {
+			return normalizeApplyPatchPathForWorkspace(path)
+		}
+		args := parseToolArgsMapString(item.Get("arguments").String())
+		if op, ok := normalizeApplyPatchOperation(selectApplyPatchOperation(args)).(map[string]any); ok {
+			if candidate := strings.TrimSpace(cleanFallbackInput(op["path"], "")); candidate != "" {
+				return normalizeApplyPatchPathForWorkspace(candidate)
+			}
+		}
+	}
+	return ""
 }
 
 func responseContainsToolOutput(responseBody []byte) bool {
@@ -4632,6 +7498,32 @@ func requestMapContainsAnyToolOutput(req map[string]any) bool {
 		}
 	}
 	return false
+}
+
+func shouldForceFinalAnswerAfterSatisfiedApplyPatch(req map[string]any) bool {
+	if req == nil || !requestMapContainsAnyToolOutput(req) {
+		return false
+	}
+	text := strings.TrimSpace(extractResponsesUserInputText(req))
+	if text == "" || !strings.Contains(strings.ToLower(text), "append") || extractExactFinalReplyHintFromRequest(req) == "" {
+		return false
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return false
+	}
+	pathHint := strings.TrimSpace(extractApplyPatchPathHintFromResponsesRequestBody(body))
+	contentHint := strings.TrimSpace(extractApplyPatchContentHintFromResponsesRequestBody(body))
+	typeHint := normalizeApplyPatchTypeHint(extractApplyPatchTypeHintFromResponsesRequestBody(body))
+	if pathHint == "" || contentHint == "" || typeHint != "update_file" || !applyPatchPathExistsLocally(pathHint) {
+		return false
+	}
+	raw, err := os.ReadFile(pathHint)
+	if err != nil {
+		return false
+	}
+	current := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	return strings.Contains(current, contentHint)
 }
 
 func buildPostApplyPatchTransientFallbackResponse() []byte {
@@ -4782,13 +7674,23 @@ func responseLooksLikePlanningOnly(responseBody []byte) bool {
 
 func extractResponsesRequestModeFromBody(body []byte) string {
 	if !gjson.ValidBytes(body) {
+		if rawResponsesBodyLooksLikePlanMode(body) {
+			return "plan"
+		}
 		return ""
 	}
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
+		if rawResponsesBodyLooksLikePlanMode(body) {
+			return "plan"
+		}
 		return ""
 	}
-	return extractResponsesRequestMode(req)
+	mode := extractResponsesRequestMode(req)
+	if mode == "" && rawResponsesBodyLooksLikePlanMode(body) {
+		return "plan"
+	}
+	return mode
 }
 
 func shouldRewritePlanModeResponseText(text string) bool {
@@ -4874,6 +7776,162 @@ func ensureProposedPlanWrapper(text string) string {
 	return "<proposed_plan>\n" + trimmed + "\n</proposed_plan>"
 }
 
+func removeMutatingPlanModeTools(tools []any, failClosed bool) []any {
+	if len(tools) == 0 {
+		return tools
+	}
+	filtered := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		trimmedName := extractFunctionToolName(tool)
+		// Plan turns must never expose mutating tools. Generic `shell` remains
+		// available for read/inspection flows and is guarded separately at
+		// command-level; named write/destructive tools are stripped here.
+		if strings.EqualFold(trimmedName, "shell") {
+			filtered = append(filtered, raw)
+			continue
+		}
+		tier, known := lookupToolTier(trimmedName)
+		// Codex-managed Plan Mode should preserve unknown native tools so the
+		// non-mutating question/exploration surface does not collapse to zero.
+		// Proxy-enforced raw plan mode remains fail-closed for unknown tools.
+		if !known && !failClosed {
+			filtered = append(filtered, raw)
+			continue
+		}
+		if tier >= TierWrite {
+			continue
+		}
+		filtered = append(filtered, raw)
+	}
+	return filtered
+}
+
+func removePlanInteractionTools(tools []any) []any {
+	if len(tools) == 0 {
+		return tools
+	}
+	filtered := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		serialized := strings.ToLower(mustJSONString(tool))
+		if strings.Contains(serialized, `"name":"request_user_input"`) ||
+			strings.Contains(serialized, `"name":"update_plan"`) {
+			continue
+		}
+		name := extractFunctionToolName(tool)
+		if strings.EqualFold(name, "request_user_input") || strings.EqualFold(name, "update_plan") {
+			continue
+		}
+		filtered = append(filtered, raw)
+	}
+	return filtered
+}
+
+func removeNamedToolFromList(tools []any, target string) []any {
+	if len(tools) == 0 {
+		return tools
+	}
+	filtered := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		if strings.EqualFold(extractFunctionToolName(tool), target) {
+			continue
+		}
+		filtered = append(filtered, raw)
+	}
+	return filtered
+}
+
+func extractApplyPatchPlanText(operation map[string]any) string {
+	if len(operation) == 0 {
+		return ""
+	}
+	candidates := make([]string, 0, 4)
+	if raw, ok := operation["content"]; ok && raw != nil {
+		candidates = append(candidates, fmt.Sprintf("%v", raw))
+	}
+	if raw, ok := operation["input"]; ok && raw != nil {
+		candidates = append(candidates, fmt.Sprintf("%v", raw))
+	}
+	if raw, ok := operation["patch"]; ok && raw != nil {
+		candidates = append(candidates, fmt.Sprintf("%v", raw))
+	}
+	if raw, ok := operation["diff"]; ok && raw != nil {
+		if derived, ok := deriveContentFromApplyPatchDiff(fmt.Sprintf("%v", raw)); ok {
+			candidates = append(candidates, derived)
+		}
+	}
+	for _, candidate := range candidates {
+		if cleaned := sanitizePlanModeCandidateText(candidate); strings.TrimSpace(cleaned) != "" {
+			return cleaned
+		}
+	}
+	return ""
+}
+
+func sanitizePlanModeCandidateText(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = stripLeadingReasoningDirective(strings.TrimSpace(text))
+	if content, _ := extractContentAndReasoning(text); strings.TrimSpace(content) != "" {
+		text = strings.TrimSpace(content)
+	}
+	cutMarkers := []string{
+		"</parameter>",
+		"<parameter=",
+		"</function>",
+		"<function=",
+		"</tool_call>",
+		"<tool_call>",
+		"<update_plan>",
+		"</update_plan>",
+		"<explanation>",
+		"</explanation>",
+		"<status>",
+		"</status>",
+		"<step>",
+		"</step>",
+		"*** End Patch",
+	}
+	lower := strings.ToLower(text)
+	cutIdx := -1
+	for _, marker := range cutMarkers {
+		if idx := strings.Index(lower, strings.ToLower(marker)); idx >= 0 && (cutIdx == -1 || idx < cutIdx) {
+			cutIdx = idx
+		}
+	}
+	if cutIdx >= 0 {
+		text = text[:cutIdx]
+	}
+	text = strings.TrimSpace(text)
+	for strings.HasSuffix(text, "```") {
+		text = strings.TrimSpace(strings.TrimSuffix(text, "```"))
+	}
+	return strings.TrimSpace(text)
+}
+
+func extractPlanTextFromBlockedApplyPatch(responseBody []byte) string {
+	if !gjson.ValidBytes(responseBody) {
+		return ""
+	}
+	if _, operation, ok := extractFirstApplyPatchInvocationFromResponse(responseBody); ok {
+		return extractApplyPatchPlanText(operation)
+	}
+	return ""
+}
+
 func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool) []byte {
 	if !gjson.ValidBytes(responseBody) {
 		return responseBody
@@ -4907,6 +7965,9 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 	}
 
 	planText := strings.TrimSpace(strings.Join(textParts, "\n\n"))
+	if strings.TrimSpace(planText) == "" {
+		planText = extractPlanTextFromBlockedApplyPatch(responseBody)
+	}
 	finishReason := strings.TrimSpace(strings.ToLower(gjson.GetBytes(responseBody, "choices.0.finish_reason").String()))
 	if shouldRewritePlanModeResponseText(planText) {
 		if planText == "" && !upstreamFinishedNormally {
@@ -4927,6 +7988,10 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 	}
 	if strings.TrimSpace(planText) == "" {
 		planText = enforcedPlanModeText()
+	}
+	planText = stripLeadingReasoningDirective(planText)
+	if content, _ := extractContentAndReasoning(planText); strings.TrimSpace(content) != "" {
+		planText = content
 	}
 	planText = ensureProposedPlanWrapper(planText)
 
@@ -4950,6 +8015,25 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 		return responseBody
 	}
 	return out
+}
+
+func shouldEnforcePlanModeSyntheticRewrite(isPlanModeRequested, enforceProxyPlanMode bool, responseBody []byte) bool {
+	if enforceProxyPlanMode {
+		return true
+	}
+	if !isPlanModeRequested {
+		return false
+	}
+	// Preserve native Codex-managed plan item streams. Request-time plan filtering
+	// already strips mutating tools for managed plan turns, and rewriting here
+	// destroys upstream reasoning/message items by replacing them with a synthetic
+	// msg_plan_mode_* assistant message.
+	_ = responseBody
+	return false
+}
+
+func planModeBlocksMutatingToolCall(responseBody []byte) bool {
+	return responseContainsMutatingToolCall(responseBody)
 }
 
 func requestHasTools(req map[string]any) bool {
@@ -4991,6 +8075,12 @@ func maybeForceRetryToolChoice(req map[string]any, feedback string) {
 	if req == nil {
 		return
 	}
+	if requestLooksLikePlanMode(req) {
+		return
+	}
+	if body, err := json.Marshal(req); err == nil && rawResponsesBodyLooksLikePlanMode(body) {
+		return
+	}
 	lowerFeedback := strings.ToLower(feedback)
 	if !(strings.Contains(lowerFeedback, "name=\"apply_patch\"") || strings.Contains(lowerFeedback, "name='apply_patch'") || strings.Contains(lowerFeedback, "apply_patch")) {
 		return
@@ -5013,7 +8103,7 @@ func maybeForceRetryToolChoice(req map[string]any, feedback string) {
 					name = strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
 				}
 			}
-			if strings.EqualFold(name, "apply_patch") {
+			if strings.EqualFold(name, "apply_patch") || strings.EqualFold(name, llamaSwapApplyPatchFunctionName) {
 				filtered = append(filtered, tool)
 			}
 		}
@@ -5030,6 +8120,120 @@ func maybeForceRetryToolChoice(req map[string]any, feedback string) {
 	}
 }
 
+func appendApplyPatchTailConstraintToUserTurn(req map[string]any, constraint string) bool {
+	if req == nil {
+		return false
+	}
+	constraint = strings.TrimSpace(constraint)
+	if constraint == "" {
+		return false
+	}
+	input, ok := req["input"].([]any)
+	if !ok || len(input) == 0 {
+		return false
+	}
+	for idx := len(input) - 1; idx >= 0; idx-- {
+		item, ok := input[idx].(map[string]any)
+		if !ok {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["type"])), "message") {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["role"])), "user") {
+			continue
+		}
+		item["content"] = appendPolicyToMessageContent(item["content"], constraint)
+		input[idx] = item
+		req["input"] = input
+		return true
+	}
+	return false
+}
+
+func appendApplyPatchFirstAttemptConstraint(req map[string]any) {
+	if req == nil {
+		return
+	}
+	if requestLooksLikePlanMode(req) {
+		return
+	}
+	if body, err := json.Marshal(req); err == nil && rawResponsesBodyLooksLikePlanMode(body) {
+		return
+	}
+	// Shell-first steering is only for explicit mixed-workflow prompts like
+	// "first use shell ... then use apply_patch". Native apply_patch remains the
+	// default for ordinary file-mutation requests.
+	if requestWantsShellInspectionBeforeApplyPatch(req) {
+		appendShellInspectionBeforeApplyPatchInstruction(req)
+		keepOnlyShellTools(req)
+		return
+	}
+	maybeForceRetryToolChoice(req, `name="apply_patch"`)
+	appendApplyPatchTailConstraintToUserTurn(req, applyPatchTailConstraintText)
+	if requestInputMentionsApplyPatchDelete(req) {
+		prependSystemInstructionOnce(req, "When deleting files in this task, prefer the native apply_patch delete_file operation. Do not choose shell rm/del for requested file deletion steps.")
+		appendApplyPatchTailConstraintToUserTurn(req, applyPatchDeleteConstraintText)
+	}
+}
+
+func requestMentionsAgentOrchestration(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if text == "" {
+		return false
+	}
+	hasAgentVerb := strings.Contains(text, "spawn_agent") ||
+		strings.Contains(text, "wait_agent") ||
+		strings.Contains(text, "resume_agent") ||
+		strings.Contains(text, "close_agent") ||
+		strings.Contains(text, "send_input") ||
+		strings.Contains(text, "child agent") ||
+		strings.Contains(text, "subagent")
+	if !hasAgentVerb {
+		return false
+	}
+	return strings.Contains(text, "spawn") ||
+		strings.Contains(text, "wait") ||
+		strings.Contains(text, "resume") ||
+		strings.Contains(text, "close") ||
+		strings.Contains(text, "follow-up")
+}
+
+func requestMentionsMultipleAgentSteps(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "spawn_agent twice") ||
+		strings.Contains(text, "two child agents") ||
+		strings.Contains(text, "two subagents") ||
+		strings.Contains(text, "second child") ||
+		strings.Contains(text, "second agent") ||
+		strings.Contains(text, "both waits") ||
+		strings.Contains(text, "close both")
+}
+
+func appendSerializedAgentOrchestrationInstruction(req map[string]any) {
+	if req == nil || !requestMentionsAgentOrchestration(req) {
+		return
+	}
+	instruction := "Agent orchestration mode: execute collaboration steps explicitly and serially." +
+		" After each spawn_agent, you must issue wait_agent or another explicitly requested collaboration tool before claiming progress." +
+		" Do not say you are waiting unless you actually emit wait_agent." +
+		" Do not finish the task until every requested wait_agent, resume_agent, send_input, and close_agent step has been emitted as a real tool call."
+	if requestMentionsMultipleAgentSteps(req) {
+		instruction += " For multi-agent tasks on this system, keep the sequence strictly serialized: finish the first child's wait/required follow-up before progressing to the second child, then close children explicitly before the final reply."
+	}
+	prependSystemInstructionOnce(req, instruction)
+	req["parallel_tool_calls"] = false
+}
+
 func appendEmptyPostToolRecoveryInstruction(req map[string]any) {
 	if req == nil {
 		return
@@ -5037,6 +8241,78 @@ func appendEmptyPostToolRecoveryInstruction(req map[string]any) {
 	instruction := "Tool executed. Analyze the result and continue with the next step or final answer. " +
 		"Return a non-empty assistant message or exactly one next tool call. Do not stop after the tool phase."
 	prependSystemInstructionOnce(req, instruction)
+}
+
+var exactFinalReplyRegexps = []*regexp.Regexp{
+	regexp.MustCompile(`(?is)\bthen\s+reply\s+exactly\s*:\s*["']?([^\r\n"']+)["']?`),
+	regexp.MustCompile(`(?is)\breply\s+exactly\s*:\s*["']?([^\r\n"']+)["']?`),
+	regexp.MustCompile(`(?is)\bthen\s+reply\s+["']?([A-Za-z0-9_.:-]+(?:\s+[A-Za-z0-9_.:-]+)*)["']?`),
+	regexp.MustCompile(`(?is)\bthen\s+respond\s+["']?([A-Za-z0-9_.:-]+(?:\s+[A-Za-z0-9_.:-]+)*)["']?`),
+}
+
+func extractExactFinalReplyHint(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	for _, re := range exactFinalReplyRegexps {
+		match := re.FindStringSubmatch(text)
+		if len(match) < 2 {
+			continue
+		}
+		candidate := strings.TrimSpace(match[1])
+		candidate = strings.Trim(candidate, " \t\r\n`\"'.!,;:)")
+		if candidate == "" {
+			continue
+		}
+		return candidate
+	}
+	return ""
+}
+
+func extractExactFinalReplyHintFromRequest(req map[string]any) string {
+	if req == nil {
+		return ""
+	}
+	return extractExactFinalReplyHint(extractResponsesUserInputText(req))
+}
+
+func extractExactFinalReplyHintFromRequestBody(body []byte) string {
+	if !gjson.ValidBytes(body) {
+		return ""
+	}
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return ""
+	}
+	return extractExactFinalReplyHintFromRequest(req)
+}
+
+func requestWantsShellInspectionBeforeApplyPatch(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if text == "" {
+		return false
+	}
+	wantsPatch := strings.Contains(text, "apply_patch") ||
+		strings.Contains(text, "append") ||
+		strings.Contains(text, "update file") ||
+		strings.Contains(text, "modify file") ||
+		strings.Contains(text, "edit file")
+	if !wantsPatch {
+		return false
+	}
+	wantsShell := strings.Contains(text, "shell")
+	// Require an explicit "inspect/read first" style instruction so mixed
+	// shell+patch ordering is preserved only when the user actually asked for it.
+	wantsInspectFirst := strings.Contains(text, "inspect first") ||
+		strings.Contains(text, "first use shell") ||
+		strings.Contains(text, "read the file first") ||
+		strings.Contains(text, "inspect the current file") ||
+		strings.Contains(text, "verify with shell first")
+	return wantsShell && wantsInspectFirst
 }
 
 func summarizeApplyPatchRetryContext(req map[string]any) string {
@@ -5059,7 +8335,8 @@ func summarizeApplyPatchRetryContext(req map[string]any) string {
 			if name == "" {
 				if fn, ok := tool["function"].(map[string]any); ok {
 					name = strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
-					if params, ok := fn["parameters"].(map[string]any); ok && strings.EqualFold(name, "apply_patch") {
+					if params, ok := fn["parameters"].(map[string]any); ok &&
+						(strings.EqualFold(name, "apply_patch") || strings.EqualFold(name, llamaSwapApplyPatchFunctionName)) {
 						if required, ok := params["required"]; ok {
 							applyPatchRequired = strings.TrimSpace(mustJSONString(required))
 						}
@@ -5070,7 +8347,7 @@ func summarizeApplyPatchRetryContext(req map[string]any) string {
 				name = cleaned
 				toolNames = append(toolNames, name)
 			}
-			if strings.EqualFold(name, "apply_patch") {
+			if strings.EqualFold(name, "apply_patch") || strings.EqualFold(name, llamaSwapApplyPatchFunctionName) {
 				applyPatchTools++
 			}
 		}
@@ -5082,6 +8359,50 @@ func summarizeApplyPatchRetryContext(req map[string]any) string {
 		truncateBridgeDebugText(applyPatchRequired, 120),
 		truncateBridgeDebugText(strings.Join(toolNames, ","), 200),
 	)
+}
+
+func appendShellInspectionBeforeApplyPatchInstruction(req map[string]any) {
+	if req == nil {
+		return
+	}
+	instruction := "Honor the requested tool order. If the user asks to inspect or read a file with shell before mutating it, your first tool call must be a shell read/inspection of that target file. Only after that shell result may you call apply_patch. Do not patch first on this turn."
+	if requestInputMentionsApplyPatchDelete(req) {
+		instruction += " When the task includes deleting a file and apply_patch is available, perform that deletion with apply_patch using operation.type=delete_file, not shell rm/del."
+	}
+	prependSystemInstructionOnce(req, instruction)
+}
+
+func keepOnlyShellTools(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	tools, ok := req["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return false
+	}
+	filtered := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		toolType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", tool["type"])))
+		name := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", tool["name"])))
+		if name == "" {
+			if fn, ok := tool["function"].(map[string]any); ok {
+				name = strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", fn["name"])))
+			}
+		}
+		if toolType == "shell" || name == "shell" || name == "exec_command" || name == "shellcommand" {
+			filtered = append(filtered, tool)
+		}
+	}
+	if len(filtered) == 0 {
+		return false
+	}
+	req["tools"] = filtered
+	delete(req, "tool_choice")
+	return true
 }
 
 func responseMentionsApplyPatch(responseBody []byte) bool {
@@ -5183,7 +8504,7 @@ func evaluateApplyPatchOutput(responseBody []byte) (bool, string, string) {
 			if firstToolSample == "" {
 				if itemType == "function_call" {
 					name := strings.TrimSpace(item.Get("name").String())
-					args := truncateBridgeDebugText(strings.TrimSpace(item.Get("arguments").String()), 180)
+					args := strings.TrimSpace(item.Get("arguments").String())
 					firstToolSample = "function_call:" + name + " args=" + args
 				} else {
 					firstToolSample = itemType
@@ -5229,12 +8550,56 @@ func evaluateApplyPatchOutput(responseBody []byte) (bool, string, string) {
 	return false, "wrong_tool_call", firstToolSample
 }
 
+func responseHasAssistantText(responseBody []byte) bool {
+	if strings.TrimSpace(gjson.GetBytes(responseBody, "output_text").String()) != "" {
+		return true
+	}
+	output := gjson.GetBytes(responseBody, "output").Array()
+	for _, item := range output {
+		if strings.TrimSpace(item.Get("type").String()) != "message" {
+			continue
+		}
+		content := item.Get("content").Array()
+		for _, part := range content {
+			if strings.TrimSpace(part.Get("type").String()) != "output_text" {
+				continue
+			}
+			if strings.TrimSpace(part.Get("text").String()) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isOversizedShellFileWrite(args string) bool {
+	args = strings.TrimSpace(args)
+	if len(args) < 8192 {
+		return false
+	}
+	lower := strings.ToLower(args)
+	patterns := []string{
+		"set-content",
+		"out-file",
+		"writealltext",
+		"tee -a",
+		"@'",
+		"@\"",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 func shouldForceStrictApplyPatchRetry(reasonCode string) bool {
 	switch strings.ToLower(strings.TrimSpace(reasonCode)) {
-	case "", "wrong_tool_call":
-		return false
-	default:
+	case "no_tool_call", "wrong_tool_call", "wrong_tool_call_oversized_shell_write", "empty_operation", "invalid_diff":
 		return true
+	default:
+		return false
 	}
 }
 
@@ -5248,11 +8613,13 @@ func buildApplyPatchRetryFailedResponse(baseResp []byte, reasonCode string, samp
 	if reasonCode == "" {
 		reasonCode = "no_tool_call"
 	}
-	text := "apply_patch retry failed (`" + reasonCode + "`). " +
-		"The model did not return an executable apply_patch tool phase. " +
-		"Retry with a strict tool-only apply_patch call."
+	text := "[proxy] apply_patch retry could not be completed. Retry with apply_patch if the task still requires a file write."
+	if strings.HasPrefix(strings.ToLower(reasonCode), "wrong_tool_call") {
+		text = applyPatchRetryPreferredFailureText
+	}
+	text += " (`" + reasonCode + "`)."
 	if strings.TrimSpace(sampledArgs) != "" {
-		text += " Sampled arguments: " + sampledArgs
+		text += " Sampled arguments: " + truncateBridgeDebugText(sampledArgs, 220)
 	}
 	resp := map[string]any{
 		"id":         id,
@@ -5767,10 +9134,10 @@ func (w *bridgeChatStreamWriter) StatusCode() int {
 	return w.statusCode
 }
 
-func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, isPlanMode bool) error {
+func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, isPlanMode bool, requestedReasoningSummary string) error {
 	// Forward upstream chat.completions SSE as true incremental Responses SSE.
-	// This is only used for the "native stream forward" path, which disables tools
-	// (`tool_choice: none`), so the stream is always message-only.
+	// In plan mode, mutating tool calls must be suppressed even if the upstream
+	// model emits them natively, so the final stream remains plan-only.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -5793,24 +9160,135 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 	model := ""
 	createdAt := int64(0)
 	msgID := ""
+	commentaryMsgID := ""
 	fullText := strings.Builder{}
 	reasoningText := strings.Builder{}
 	reasoningSeen := false
 	finishReasonStop := false
 	finishReasonLength := false
+	blockedPlanMutationText := ""
 	type toolState struct {
-		index      int
-		itemID     string
-		callID     string
-		name       string
-		argsBuffer strings.Builder
+		index       int
+		outputIndex int
+		itemID      string
+		callID      string
+		name        string
+		exposed     bool
+		argsBuffer  strings.Builder
 	}
 	toolStates := map[int]*toolState{}
 	toolOrder := make([]int, 0, 4)
-	nextOutputIndex := 1 // output[0] is the primary assistant message
+	nextOutputIndex := 0
+	canonicalToolName := func(name string) string {
+		name = strings.TrimSpace(name)
+		if strings.EqualFold(name, llamaSwapApplyPatchFunctionName) {
+			return "apply_patch"
+		}
+		name = strings.TrimPrefix(name, "__llamaswap_")
+		if strings.EqualFold(name, "applypatch") {
+			return "apply_patch"
+		}
+		return name
+	}
+	buildToolOutputItem := func(state *toolState, arguments string) map[string]any {
+		toolName := canonicalToolName(state.name)
+		if strings.EqualFold(toolName, "apply_patch") {
+			args := parseToolArgsMapString(arguments)
+			op := preferContentDrivenApplyPatchOperation(selectApplyPatchOperation(args))
+			input := strings.TrimSpace(buildApplyPatchInputFromOperation(op))
+			appendApplyPatchTrace("chat_sse.build_tool_output_item", map[string]any{
+				"tool_name":        toolName,
+				"raw_arguments":    truncateBridgeDebugText(arguments, 400),
+				"parsed_args":      truncateBridgeDebugText(mustJSONString(args), 400),
+				"normalized_op":    truncateBridgeDebugText(mustJSONString(op), 400),
+				"normalized_input": truncateBridgeDebugText(input, 400),
+			})
+			item := map[string]any{
+				"id":      state.itemID,
+				"type":    "custom_tool_call",
+				"call_id": state.callID,
+				"name":    "apply_patch",
+				"status":  "in_progress",
+			}
+			if op != nil {
+				item["operation"] = op
+			}
+			if input != "" {
+				item["input"] = input
+			}
+			return item
+		}
+		if server, subtool, ok := parseMCPToolName(toolName); ok {
+			return map[string]any{
+				"id":        state.itemID,
+				"type":      "function_call",
+				"call_id":   state.callID,
+				"name":      buildMCPToolName(server, subtool),
+				"status":    "in_progress",
+				"arguments": mustJSONString(parseToolArgsMapString(arguments)),
+			}
+		}
+		return map[string]any{
+			"id":        state.itemID,
+			"type":      "function_call",
+			"call_id":   state.callID,
+			"name":      toolName,
+			"status":    "in_progress",
+			"arguments": arguments,
+		}
+	}
+	shouldExposeToolState := func(state *toolState) bool {
+		if state == nil {
+			return false
+		}
+		toolName := canonicalToolName(state.name)
+		if toolName == "" {
+			return false
+		}
+		if strings.EqualFold(toolName, "shell") {
+			args := parseToolArgsMapString(normalizePossiblyMixedToolArguments(state.argsBuffer.String()))
+			return shellToolArgumentsValid(args)
+		}
+		return true
+	}
+	canonicalToolArguments := func(state *toolState, arguments string) string {
+		toolName := canonicalToolName(state.name)
+		normalized := normalizePossiblyMixedToolArguments(arguments)
+		if strings.EqualFold(toolName, "apply_patch") {
+			args := parseToolArgsMapString(normalized)
+			op := preferContentDrivenApplyPatchOperation(selectApplyPatchOperation(args))
+			if input := strings.TrimSpace(buildApplyPatchInputFromOperation(op)); input != "" {
+				appendApplyPatchTrace("chat_sse.canonical_tool_arguments", map[string]any{
+					"tool_name":        toolName,
+					"raw_arguments":    truncateBridgeDebugText(arguments, 400),
+					"normalized_args":  truncateBridgeDebugText(normalized, 400),
+					"parsed_args":      truncateBridgeDebugText(mustJSONString(args), 400),
+					"normalized_op":    truncateBridgeDebugText(mustJSONString(op), 400),
+					"normalized_input": truncateBridgeDebugText(input, 400),
+				})
+				return input
+			}
+			if looksLikePatchText(normalized) {
+				return normalizeApplyPatchText(normalized)
+			}
+			return mustJSONString(map[string]any{"operation": op})
+		}
+		if strings.EqualFold(toolName, "shell") {
+			return mustJSONString(normalizeShellArgumentMapForResponse(parseToolArgsMapString(normalized)))
+		}
+		return normalized
+	}
 	var latestUsage map[string]any
-	started := false
+	lifecycleStarted := false
+	messageStarted := false
+	messageOutputIndex := -1
+	commentaryStarted := false
+	commentaryOutputIndex := -1
+	reasoningStarted := false
+	reasoningOutputIndex := -1
+	reasoningItemID := ""
 	sequence := 0
+	var startToolStateIfReady func(state *toolState)
 
 	writeEvent := func(eventType string, payload map[string]any) {
 		if _, ok := payload["type"]; !ok {
@@ -5823,9 +9301,71 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		_, _ = w.Write([]byte("data: " + string(data) + "\n\n"))
 		flusher.Flush()
 	}
+	startToolStateIfReady = func(state *toolState) {
+		if state == nil || state.exposed || !shouldExposeToolState(state) {
+			return
+		}
+		state.outputIndex = nextOutputIndex
+		state.exposed = true
+		arguments := "{}"
+		toolName := canonicalToolName(state.name)
+		if strings.EqualFold(toolName, "shell") {
+			arguments = mustJSONString(normalizeShellArgumentMapForResponse(parseToolArgsMapString(normalizePossiblyMixedToolArguments(state.argsBuffer.String()))))
+		}
+		item := map[string]any{
+			"id":        state.itemID,
+			"type":      "function_call",
+			"call_id":   state.callID,
+			"name":      toolName,
+			"status":    "in_progress",
+			"arguments": arguments,
+		}
+		if server, subtool, ok := parseMCPToolName(toolName); ok {
+			item["name"] = buildMCPToolName(server, subtool)
+		}
+		if strings.EqualFold(toolName, "apply_patch") {
+			item = map[string]any{
+				"id":      state.itemID,
+				"type":    "custom_tool_call",
+				"call_id": state.callID,
+				"name":    "apply_patch",
+				"status":  "in_progress",
+			}
+		}
+		writeEvent("response.output_item.added", map[string]any{
+			"response_id":  respID,
+			"output_index": state.outputIndex,
+			"item":         item,
+		})
+		nextOutputIndex++
+	}
+	writeReasoningSummaryPartAdded := func() {
+		writeEvent("response.reasoning_summary_part.added", map[string]any{
+			"response_id":   respID,
+			"item_id":       reasoningItemID,
+			"output_index":  reasoningOutputIndex,
+			"summary_index": 0,
+			"part": map[string]any{
+				"type": "summary_text",
+				"text": "",
+			},
+		})
+	}
+	writeReasoningSummaryPartDone := func(text string) {
+		writeEvent("response.reasoning_summary_part.done", map[string]any{
+			"response_id":   respID,
+			"item_id":       reasoningItemID,
+			"output_index":  reasoningOutputIndex,
+			"summary_index": 0,
+			"part": map[string]any{
+				"type": "summary_text",
+				"text": text,
+			},
+		})
+	}
 
-	startStreamIfNeeded := func() {
-		if started {
+	startLifecycleIfNeeded := func() {
+		if lifecycleStarted {
 			return
 		}
 		if strings.TrimSpace(respID) == "" {
@@ -5834,7 +9374,6 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		if createdAt == 0 {
 			createdAt = time.Now().Unix()
 		}
-		msgID = fmt.Sprintf("msg_%s_0", respID)
 
 		responseSkeleton := map[string]any{
 			"id":         respID,
@@ -5844,9 +9383,24 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			"status":     "in_progress",
 			"output":     []any{},
 		}
+		if summary := normalizeResponsesReasoningSummary(requestedReasoningSummary); summary != "" {
+			responseSkeleton["reasoning"] = map[string]any{"summary": summary}
+		}
 		writeEvent("response.created", map[string]any{"response": responseSkeleton})
 		writeEvent("response.in_progress", map[string]any{"response": responseSkeleton})
+		lifecycleStarted = true
+	}
 
+	startMessageIfNeeded := func() {
+		startLifecycleIfNeeded()
+		if messageStarted {
+			return
+		}
+		if messageOutputIndex < 0 {
+			messageOutputIndex = nextOutputIndex
+			nextOutputIndex++
+		}
+		msgID = fmt.Sprintf("msg_%s_%d", respID, messageOutputIndex)
 		item := map[string]any{
 			"id":      msgID,
 			"type":    "message",
@@ -5858,18 +9412,76 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		}
 		writeEvent("response.output_item.added", map[string]any{
 			"response_id":  respID,
-			"output_index": 0,
+			"output_index": messageOutputIndex,
 			"item":         item,
 		})
 		writeEvent("response.content_part.added", map[string]any{
 			"response_id":   respID,
 			"item_id":       msgID,
-			"output_index":  0,
+			"output_index":  messageOutputIndex,
 			"content_index": 0,
 			"part":          map[string]any{"type": "output_text", "text": ""},
 		})
+		messageStarted = true
+	}
 
-		started = true
+	startCommentaryIfNeeded := func() {
+		startLifecycleIfNeeded()
+		if commentaryStarted {
+			return
+		}
+		if commentaryOutputIndex < 0 {
+			commentaryOutputIndex = nextOutputIndex
+			nextOutputIndex++
+		}
+		commentaryMsgID = fmt.Sprintf("msg_%s_%d", respID, commentaryOutputIndex)
+		item := map[string]any{
+			"id":      commentaryMsgID,
+			"type":    "message",
+			"role":    "assistant",
+			"channel": "commentary",
+			"content": []any{
+				map[string]any{"type": "output_text", "text": ""},
+			},
+		}
+		writeEvent("response.output_item.added", map[string]any{
+			"response_id":  respID,
+			"output_index": commentaryOutputIndex,
+			"item":         item,
+		})
+		writeEvent("response.content_part.added", map[string]any{
+			"response_id":   respID,
+			"item_id":       commentaryMsgID,
+			"output_index":  commentaryOutputIndex,
+			"content_index": 0,
+			"part":          map[string]any{"type": "output_text", "text": ""},
+		})
+		commentaryStarted = true
+	}
+
+	startReasoningIfNeeded := func() {
+		startLifecycleIfNeeded()
+		if reasoningStarted {
+			return
+		}
+		if reasoningOutputIndex < 0 {
+			reasoningOutputIndex = nextOutputIndex
+			nextOutputIndex++
+		}
+		reasoningItemID = fmt.Sprintf("rs_%s_%d", respID, reasoningOutputIndex)
+		item := map[string]any{
+			"id":      reasoningItemID,
+			"type":    "reasoning",
+			"status":  "in_progress",
+			"summary": []any{},
+		}
+		writeEvent("response.output_item.added", map[string]any{
+			"response_id":  respID,
+			"output_index": reasoningOutputIndex,
+			"item":         item,
+		})
+		writeReasoningSummaryPartAdded()
+		reasoningStarted = true
 	}
 
 	scanner := bufio.NewScanner(upstream)
@@ -5931,7 +9543,7 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			latestUsage = usageMap
 		}
 
-		startStreamIfNeeded()
+		startLifecycleIfNeeded()
 
 		toolCalls := gjson.Get(payload, "choices.0.delta.tool_calls")
 		if toolCalls.IsArray() {
@@ -5944,39 +9556,39 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 						callID = fmt.Sprintf("call_%s_%d", respID, idx)
 					}
 					state = &toolState{
-						index:  idx,
-						itemID: fmt.Sprintf("fc_%s_%d", respID, idx),
-						callID: callID,
+						index:       idx,
+						outputIndex: -1,
+						itemID:      fmt.Sprintf("fc_%s_%d", respID, idx),
+						callID:      callID,
 					}
 					toolStates[idx] = state
 					toolOrder = append(toolOrder, idx)
-					writeEvent("response.output_item.added", map[string]any{
-						"response_id":  respID,
-						"output_index": nextOutputIndex,
-						"item": map[string]any{
-							"id":        state.itemID,
-							"type":      "function_call",
-							"call_id":   state.callID,
-							"name":      "",
-							"status":    "in_progress",
-							"arguments": "{}",
-						},
-					})
-					nextOutputIndex++
 				}
 				if id := strings.TrimSpace(tc.Get("id").String()); id != "" {
 					state.callID = id
 				}
 				if name := strings.TrimSpace(tc.Get("function.name").String()); name != "" {
 					state.name = name
+					if isPlanMode && strings.EqualFold(canonicalToolName(state.name), "apply_patch") {
+						if existing := toolStates[idx]; existing != nil {
+							existing.name = name
+						}
+					}
 				}
+				startToolStateIfReady(state)
 				if argDelta := tc.Get("function.arguments").String(); argDelta != "" {
 					state.argsBuffer.WriteString(argDelta)
-					writeEvent("response.function_call_arguments.delta", map[string]any{
-						"response_id": respID,
-						"item_id":     state.itemID,
-						"delta":       argDelta,
-					})
+					startToolStateIfReady(state)
+					if isPlanMode && strings.EqualFold(canonicalToolName(state.name), "apply_patch") {
+						continue
+					}
+					if state.exposed && !strings.EqualFold(canonicalToolName(state.name), "apply_patch") && !strings.HasPrefix(canonicalToolName(state.name), "mcp__") {
+						writeEvent("response.function_call_arguments.delta", map[string]any{
+							"response_id": respID,
+							"item_id":     state.itemID,
+							"delta":       canonicalToolArguments(state, state.argsBuffer.String()),
+						})
+					}
 				}
 			}
 		}
@@ -5992,30 +9604,41 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		if delta == "" && reasoningDelta == "" {
 			// finalize tool-call phase if upstream says so
 			if strings.EqualFold(strings.TrimSpace(gjson.Get(payload, "choices.0.finish_reason").String()), "tool_calls") {
-				for orderIdx, toolIdx := range toolOrder {
+				for _, toolIdx := range toolOrder {
 					state := toolStates[toolIdx]
 					if state == nil {
 						continue
 					}
-					arguments := normalizePossiblyMixedToolArguments(state.argsBuffer.String())
-					writeEvent("response.function_call_arguments.done", map[string]any{
-						"response_id": respID,
-						"item_id":     state.itemID,
-						"name":        state.name,
-						"call_id":     state.callID,
-						"arguments":   arguments,
-					})
+					arguments := canonicalToolArguments(state, state.argsBuffer.String())
+					if strings.EqualFold(canonicalToolName(state.name), "shell") && !shellToolArgumentsValid(parseToolArgsMapString(arguments)) {
+						if strings.TrimSpace(fullText.String()) == "" {
+							fullText.WriteString(shellValidationWarningPrefix + " arguments were empty. Provide a non-empty `command` string or `commands` array and retry.")
+						}
+						continue
+					}
+					if isPlanMode && strings.EqualFold(canonicalToolName(state.name), "apply_patch") {
+						args := parseToolArgsMapString(normalizePossiblyMixedToolArguments(state.argsBuffer.String()))
+						if op, ok := normalizeApplyPatchOperation(selectApplyPatchOperation(args)).(map[string]any); ok {
+							if candidate := extractApplyPatchPlanText(op); strings.TrimSpace(candidate) != "" {
+								blockedPlanMutationText = candidate
+							}
+						}
+						continue
+					}
+					startToolStateIfReady(state)
+					if !strings.EqualFold(canonicalToolName(state.name), "apply_patch") && !strings.HasPrefix(canonicalToolName(state.name), "mcp__") {
+						writeEvent("response.function_call_arguments.done", map[string]any{
+							"response_id": respID,
+							"item_id":     state.itemID,
+							"name":        state.name,
+							"call_id":     state.callID,
+							"arguments":   arguments,
+						})
+					}
 					writeEvent("response.output_item.done", map[string]any{
 						"response_id":  respID,
-						"output_index": 1 + orderIdx,
-						"item": map[string]any{
-							"id":        state.itemID,
-							"type":      "function_call",
-							"call_id":   state.callID,
-							"name":      state.name,
-							"status":    "in_progress",
-							"arguments": arguments,
-						},
+						"output_index": state.outputIndex,
+						"item":         buildToolOutputItem(state, arguments),
 					})
 				}
 			}
@@ -6024,19 +9647,32 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 
 		if reasoningDelta != "" {
 			reasoningSeen = true
+			startReasoningIfNeeded()
+			startCommentaryIfNeeded()
 			reasoningText.WriteString(reasoningDelta)
 			writeEvent("response.reasoning_summary_text.delta", map[string]any{
-				"response_id": respID,
-				"delta":       reasoningDelta,
+				"response_id":   respID,
+				"item_id":       reasoningItemID,
+				"output_index":  reasoningOutputIndex,
+				"summary_index": 0,
+				"delta":         reasoningDelta,
+			})
+			writeEvent("response.output_text.delta", map[string]any{
+				"response_id":   respID,
+				"item_id":       commentaryMsgID,
+				"output_index":  commentaryOutputIndex,
+				"content_index": 0,
+				"delta":         reasoningDelta,
 			})
 			continue
 		}
 		fullText.WriteString(delta)
 		if !isPlanMode {
+			startMessageIfNeeded()
 			writeEvent("response.output_text.delta", map[string]any{
 				"response_id":   respID,
 				"item_id":       msgID,
-				"output_index":  0,
+				"output_index":  messageOutputIndex,
 				"content_index": 0,
 				"delta":         delta,
 			})
@@ -6046,10 +9682,30 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		return err
 	}
 
-	startStreamIfNeeded()
+	startLifecycleIfNeeded()
 
 	finalText := strings.TrimSpace(fullText.String())
+	reasoningDoneText := strings.TrimSpace(reasoningText.String())
+	promotedReasoning := false
+	if !isPlanMode && strings.TrimSpace(finalText) == "" && reasoningDoneText != "" && len(toolOrder) == 0 {
+		// Codex clients may hide reasoning lanes. If upstream produced reasoning-only output,
+		// surface it on the normal output_text lane to avoid empty assistant messages.
+		promotedReasoning = true
+		finalText = reasoningDoneText
+		reasoningDoneText = ""
+		startMessageIfNeeded()
+		writeEvent("response.output_text.delta", map[string]any{
+			"response_id":   respID,
+			"item_id":       msgID,
+			"output_index":  messageOutputIndex,
+			"content_index": 0,
+			"delta":         finalText,
+		})
+	}
 	if isPlanMode {
+		if strings.TrimSpace(finalText) == "" && strings.TrimSpace(blockedPlanMutationText) != "" {
+			finalText = blockedPlanMutationText
+		}
 		if shouldRewritePlanModeResponseText(finalText) {
 			if strings.TrimSpace(finalText) == "" && !finishReasonStop {
 				// Upstream did not finish normally; preserve empty/error-shaped output
@@ -6072,47 +9728,131 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			})
 		}
 	}
-	reasoningDoneText := strings.TrimSpace(reasoningText.String())
-	if reasoningSeen {
+	visibleToolCount := 0
+	for _, toolIdx := range toolOrder {
+		state := toolStates[toolIdx]
+		if state == nil {
+			continue
+		}
+		if !state.exposed {
+			continue
+		}
+		if isPlanMode && strings.EqualFold(canonicalToolName(state.name), "apply_patch") {
+			continue
+		}
+		visibleToolCount++
+	}
+	shouldEmitMessage := visibleToolCount == 0 || strings.TrimSpace(finalText) != "" || isPlanMode
+	if shouldEmitMessage {
+		startMessageIfNeeded()
+	}
+	if reasoningSeen && !promotedReasoning {
+		startReasoningIfNeeded()
 		writeEvent("response.reasoning_summary_text.done", map[string]any{
-			"response_id": respID,
-			"text":        reasoningDoneText,
+			"response_id":   respID,
+			"item_id":       reasoningItemID,
+			"output_index":  reasoningOutputIndex,
+			"summary_index": 0,
+			"text":          reasoningDoneText,
+		})
+		writeReasoningSummaryPartDone(reasoningDoneText)
+		reasoningDoneItem := map[string]any{
+			"id":     reasoningItemID,
+			"type":   "reasoning",
+			"status": "completed",
+			"summary": []any{
+				map[string]any{
+					"type": "summary_text",
+					"text": reasoningDoneText,
+				},
+			},
+		}
+		if summary := normalizeResponsesReasoningSummary(requestedReasoningSummary); summary != "" {
+			reasoningDoneItem["summary_mode"] = summary
+		}
+		writeEvent("response.output_item.done", map[string]any{
+			"response_id":  respID,
+			"output_index": reasoningOutputIndex,
+			"item":         reasoningDoneItem,
 		})
 	}
-	writeEvent("response.output_text.done", map[string]any{
-		"response_id":   respID,
-		"item_id":       msgID,
-		"output_index":  0,
-		"content_index": 0,
-		"text":          finalText,
-	})
-	writeEvent("response.content_part.done", map[string]any{
-		"response_id":   respID,
-		"item_id":       msgID,
-		"output_index":  0,
-		"content_index": 0,
-		"part":          map[string]any{"type": "output_text", "text": finalText},
-	})
-
-	finalItem := map[string]any{
-		"id":   msgID,
-		"type": "message",
-		"role": "assistant",
-		"channel": func() string {
-			if len(toolOrder) > 0 {
-				return "commentary"
-			}
-			return "final"
-		}(),
-		"content": []any{
-			map[string]any{"type": "output_text", "text": finalText},
-		},
+	var commentaryItem map[string]any
+	if reasoningSeen && commentaryStarted && !promotedReasoning {
+		writeEvent("response.output_text.done", map[string]any{
+			"response_id":   respID,
+			"item_id":       commentaryMsgID,
+			"output_index":  commentaryOutputIndex,
+			"content_index": 0,
+			"text":          reasoningDoneText,
+		})
+		writeEvent("response.content_part.done", map[string]any{
+			"response_id":   respID,
+			"item_id":       commentaryMsgID,
+			"output_index":  commentaryOutputIndex,
+			"content_index": 0,
+			"part":          map[string]any{"type": "output_text", "text": reasoningDoneText},
+		})
+		commentaryItem = map[string]any{
+			"id":      commentaryMsgID,
+			"type":    "message",
+			"role":    "assistant",
+			"channel": "commentary",
+			"content": []any{
+				map[string]any{"type": "output_text", "text": reasoningDoneText},
+			},
+		}
+		writeEvent("response.output_item.done", map[string]any{
+			"response_id":  respID,
+			"output_index": commentaryOutputIndex,
+			"item":         commentaryItem,
+		})
 	}
-	writeEvent("response.output_item.done", map[string]any{
-		"response_id":  respID,
-		"output_index": 0,
-		"item":         finalItem,
-	})
+	var finalItem map[string]any
+	if shouldEmitMessage {
+		if isPlanMode && strings.TrimSpace(finalText) != "" {
+			writeEvent("response.output_text.delta", map[string]any{
+				"response_id":   respID,
+				"item_id":       msgID,
+				"output_index":  messageOutputIndex,
+				"content_index": 0,
+				"delta":         finalText,
+			})
+		}
+		writeEvent("response.output_text.done", map[string]any{
+			"response_id":   respID,
+			"item_id":       msgID,
+			"output_index":  messageOutputIndex,
+			"content_index": 0,
+			"text":          finalText,
+		})
+		writeEvent("response.content_part.done", map[string]any{
+			"response_id":   respID,
+			"item_id":       msgID,
+			"output_index":  messageOutputIndex,
+			"content_index": 0,
+			"part":          map[string]any{"type": "output_text", "text": finalText},
+		})
+
+		finalItem = map[string]any{
+			"id":   msgID,
+			"type": "message",
+			"role": "assistant",
+			"channel": func() string {
+				if visibleToolCount > 0 {
+					return "commentary"
+				}
+				return "final"
+			}(),
+			"content": []any{
+				map[string]any{"type": "output_text", "text": finalText},
+			},
+		}
+		writeEvent("response.output_item.done", map[string]any{
+			"response_id":  respID,
+			"output_index": messageOutputIndex,
+			"item":         finalItem,
+		})
+	}
 
 	fullResponse := map[string]any{
 		"id":         respID,
@@ -6120,17 +9860,32 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		"created_at": createdAt,
 		"model":      model,
 		"status": func() string {
-			if len(toolOrder) > 0 {
+			if visibleToolCount > 0 {
 				return "requires_action"
 			}
 			return "completed"
 		}(),
-		"output":      []any{finalItem},
+		"output":      []any{},
 		"output_text": finalText,
 	}
-	if reasoningDoneText != "" {
-		fullResponse["output"] = append(fullResponse["output"].([]any), map[string]any{
-			"id":   fmt.Sprintf("rs_%s_0", respID),
+	if summary := normalizeResponsesReasoningSummary(requestedReasoningSummary); summary != "" {
+		fullResponse["reasoning"] = map[string]any{"summary": summary}
+	}
+	outputByIndex := map[int]any{}
+	maxOutputIndex := -1
+	if finalItem != nil {
+		outputByIndex[messageOutputIndex] = finalItem
+		maxOutputIndex = messageOutputIndex
+	}
+	if commentaryItem != nil {
+		outputByIndex[commentaryOutputIndex] = commentaryItem
+		if commentaryOutputIndex > maxOutputIndex {
+			maxOutputIndex = commentaryOutputIndex
+		}
+	}
+	if reasoningSeen && !promotedReasoning && reasoningOutputIndex >= 0 && reasoningDoneText != "" {
+		reasoningItem := map[string]any{
+			"id":   reasoningItemID,
 			"type": "reasoning",
 			"summary": []any{
 				map[string]any{
@@ -6138,39 +9893,38 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 					"text": reasoningDoneText,
 				},
 			},
-		})
-	}
-	if len(toolOrder) > 0 {
-		mergedOutput := make([]any, 0, 2+len(toolOrder))
-		if reasoningDoneText != "" {
-			mergedOutput = append(mergedOutput, map[string]any{
-				"id":   fmt.Sprintf("rs_%s_0", respID),
-				"type": "reasoning",
-				"summary": []any{
-					map[string]any{
-						"type": "summary_text",
-						"text": reasoningDoneText,
-					},
-				},
-			})
 		}
-		mergedOutput = append(mergedOutput, finalItem)
-		for _, toolIdx := range toolOrder {
-			state := toolStates[toolIdx]
-			if state == nil {
-				continue
-			}
-			mergedOutput = append(mergedOutput, map[string]any{
-				"id":        state.itemID,
-				"type":      "function_call",
-				"call_id":   state.callID,
-				"name":      state.name,
-				"status":    "in_progress",
-				"arguments": normalizePossiblyMixedToolArguments(state.argsBuffer.String()),
-			})
+		if summary := normalizeResponsesReasoningSummary(requestedReasoningSummary); summary != "" {
+			reasoningItem["summary_mode"] = summary
 		}
-		fullResponse["output"] = mergedOutput
+		outputByIndex[reasoningOutputIndex] = reasoningItem
+		if reasoningOutputIndex > maxOutputIndex {
+			maxOutputIndex = reasoningOutputIndex
+		}
 	}
+	for _, toolIdx := range toolOrder {
+		state := toolStates[toolIdx]
+		if state == nil {
+			continue
+		}
+		if !state.exposed {
+			continue
+		}
+		if isPlanMode && strings.EqualFold(canonicalToolName(state.name), "apply_patch") {
+			continue
+		}
+		outputByIndex[state.outputIndex] = buildToolOutputItem(state, normalizePossiblyMixedToolArguments(state.argsBuffer.String()))
+		if state.outputIndex > maxOutputIndex {
+			maxOutputIndex = state.outputIndex
+		}
+	}
+	orderedOutput := make([]any, 0, maxOutputIndex+1)
+	for outputIndex := 0; outputIndex <= maxOutputIndex; outputIndex++ {
+		if item, ok := outputByIndex[outputIndex]; ok {
+			orderedOutput = append(orderedOutput, item)
+		}
+	}
+	fullResponse["output"] = orderedOutput
 	if latestUsage != nil {
 		fullResponse["usage"] = latestUsage
 	}
@@ -6240,6 +9994,15 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 		responsesRequestedStream := gjson.GetBytes(bodyBytes, "stream").Bool() || strings.Contains(strings.ToLower(strings.TrimSpace(r.Header.Get("Accept"))), "text/event-stream")
 		var initialReq map[string]any
 		_ = json.Unmarshal(bodyBytes, &initialReq)
+		initialMode := extractResponsesRequestMode(initialReq)
+		if initialMode == "" && rawResponsesBodyLooksLikePlanMode(bodyBytes) {
+			initialMode = "plan"
+		}
+		shellFirstBeforePatch := requestWantsShellInspectionBeforeApplyPatch(initialReq)
+		isApplyPatchIntent := initialMode != "plan" && shouldEnableStrictApplyPatchIntent(initialReq, bodyBytes)
+		forceLocalApplyPatchFallback := shouldForceLocalApplyPatchFallback(initialReq)
+		localWebSearchFallbackEnabled, _, _ := pm.getWebSearchFallbackSettings()
+		shouldResolveWebSearchLocally := localWebSearchFallbackEnabled && requestIncludesWebSearchTool(initialReq)
 		useNativeStreamForward := responsesRequestedStream && shouldUseNativeResponsesBridgeStream(initialReq)
 		addCaptureStage(r.Context(), "bridge.responses_request", bodyBytes)
 		emitMonitor(r.Context(), modelID, "bridge", "in", r.URL.Path, "responses.request", summarizeJSONForLog(bodyBytes), false)
@@ -6320,27 +10083,16 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 			isPlanModeRequested := extractResponsesRequestModeFromBody(responsesReq) == "plan"
 			codexManagedPlanMode := isCodexManagedPlanModeFromResponsesBody(responsesReq)
 			enforceProxyPlanMode := isPlanModeRequested && !codexManagedPlanMode
-
-			translated, err := translateResponsesToChatCompletionsRequest(responsesReq)
-			if err != nil {
-				return 0, nil, nil, nil, fmt.Errorf("invalid responses request: %w", err)
-			}
-			translated, err = sjson.SetBytes(translated, "stream", false)
-			if err != nil {
-				return 0, nil, nil, nil, fmt.Errorf("error forcing non-stream bridge request: %w", err)
-			}
-			logTextTransform(pm.transformLogger, modelID, "bridge_request_controls", summarizeResponsesBridgeControls(responsesReq))
-			logTextTransform(pm.transformLogger, modelID, "bridge_sampling_controls", summarizeBridgeSamplingControls(translated))
-			logBodyTransform(pm.transformLogger, modelID, "bridge_translate_responses_to_chat", responsesReq, translated)
-			if strings.Contains(strings.ToLower(string(responsesReq)), "apply_patch") {
-				appendApplyPatchTrace("bridge.chat_request", map[string]any{
-					"model_id": modelID,
-					"summary":  summarizeApplyPatchResponsesRequest(responsesReq),
-				})
-				appendApplyPatchTrace("bridge.chat_request_translated", map[string]any{
-					"model_id": modelID,
-					"summary":  summarizeApplyPatchChatCompletionRequest(translated),
-				})
+			resolvedWebSearchItems := make([]any, 0, 4)
+			webSearchContinuations := 0
+			if isApplyPatchIntent && !enforceProxyPlanMode {
+				var firstReq map[string]any
+				if err := json.Unmarshal(responsesReq, &firstReq); err == nil {
+					appendApplyPatchFirstAttemptConstraint(firstReq)
+					if mutated, marshalErr := json.Marshal(firstReq); marshalErr == nil {
+						responsesReq = mutated
+					}
+				}
 			}
 
 			// Bridge requests already come pre-shaped by /v1/responses semantics.
@@ -6356,6 +10108,29 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 			var lastErr error
 
 			for attempt := 1; attempt <= maxBridgeAttempts; attempt++ {
+				translated, err := translateResponsesToChatCompletionsRequest(responsesReq)
+				if err != nil {
+					return 0, nil, nil, nil, fmt.Errorf("invalid responses request: %w", err)
+				}
+				translated, err = sjson.SetBytes(translated, "stream", false)
+				if err != nil {
+					return 0, nil, nil, nil, fmt.Errorf("error forcing non-stream bridge request: %w", err)
+				}
+				logTextTransform(pm.transformLogger, modelID, "bridge_request_controls", summarizeResponsesBridgeControls(responsesReq))
+				logTextTransform(pm.transformLogger, modelID, "bridge_sampling_controls", summarizeBridgeSamplingControls(translated))
+				logBodyTransform(pm.transformLogger, modelID, "bridge_translate_responses_to_chat", responsesReq, translated)
+				if strings.Contains(strings.ToLower(string(responsesReq)), "apply_patch") {
+					appendApplyPatchTrace("bridge.chat_request", map[string]any{
+						"model_id": modelID,
+						"summary":  summarizeApplyPatchResponsesRequest(responsesReq),
+						"attempt":  attempt,
+					})
+					appendApplyPatchTrace("bridge.chat_request_translated", map[string]any{
+						"model_id": modelID,
+						"summary":  summarizeApplyPatchChatCompletionRequest(translated),
+						"attempt":  attempt,
+					})
+				}
 				bridgeReq := r.Clone(r.Context())
 				bridgeReq.URL.Path = "/v1/chat/completions"
 				bridgeReq.Body = io.NopCloser(bytes.NewReader(translated))
@@ -6386,23 +10161,113 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 								logTextTransform(pm.transformLogger, modelID, "bridge_upstream_apply_patch_forensics", summarizeApplyPatchBridgeForensics(lastBody))
 							}
 						}
+						hasPriorToolOutput := requestContainsAnyToolOutput(bodyBytes)
 						applyPatchPathHint := strings.TrimSpace(extractApplyPatchPathHintFromResponsesRequestBody(bodyBytes))
 						applyPatchContentHint := strings.TrimSpace(extractApplyPatchContentHintFromResponsesRequestBody(bodyBytes))
 						applyPatchTypeHint := strings.TrimSpace(extractApplyPatchTypeHintFromResponsesRequestBody(bodyBytes))
+						if hasPriorToolOutput {
+							applyPatchPathHint = ""
+							applyPatchContentHint = ""
+							applyPatchTypeHint = ""
+						}
 						out, err := translateChatCompletionToResponsesResponse(lastBody, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint)
 						if err == nil {
 							if rewritten, changed, rewriteErr := rewriteResponsesToolCallPayload(out, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint); rewriteErr == nil && changed {
 								out = rewritten
 							}
-							if enforceProxyPlanMode {
+							if !hasPriorToolOutput && requestWantsShellInspectionBeforeApplyPatch(initialReq) && responseContainsApplyPatchCall(out) {
+								targetPath := applyPatchPathHint
+								if strings.TrimSpace(targetPath) == "" {
+									targetPath = extractApplyPatchPathFromResponse(out)
+								}
+								if strings.TrimSpace(targetPath) != "" {
+									out = forceShellInspectionResponse(out, targetPath)
+								}
+							}
+							if hasPriorToolOutput {
+								if exactReply := extractExactFinalReplyHintFromRequestBody(responsesReq); exactReply != "" {
+									out = enforceExactFinalReplyHint(out, exactReply)
+								}
+							}
+							if shouldResolveWebSearchLocally {
+								if searchCall, ok := extractPendingBridgeWebSearchCall(out); ok && webSearchContinuations < maxBridgeAttempts {
+									webSearchContinuations++
+									callID := strings.TrimSpace(fmt.Sprintf("%v", searchCall["call_id"]))
+									if callID == "" {
+										callID = fmt.Sprintf("call_web_search_%d", time.Now().UnixNano())
+										searchCall["call_id"] = callID
+									}
+									searchCall["status"] = "completed"
+									searchOutput := map[string]any{
+										"id":      fmt.Sprintf("wsout_%s", callID),
+										"type":    "web_search_call_output",
+										"call_id": callID,
+										"output":  mustJSONString(pm.executeBridgeWebSearch(r.Context(), normalizeMapValue(searchCall["action"]))),
+									}
+									resolvedWebSearchItems = append(resolvedWebSearchItems, cloneMap(searchCall), searchOutput)
+									if mutatedReq, appendErr := appendResponsesInputItems(responsesReq, searchCall, searchOutput); appendErr == nil {
+										responsesReq = mutatedReq
+										logTextTransform(pm.transformLogger, modelID, "bridge_web_search_continue", fmt.Sprintf("attempt=%d/%d call_id=%s", webSearchContinuations, maxBridgeAttempts, callID))
+										continue
+									}
+								}
+							}
+							if shouldEnforcePlanModeSyntheticRewrite(isPlanModeRequested, enforceProxyPlanMode, out) {
 								upstreamFinishedNormally := strings.EqualFold(strings.TrimSpace(gjson.GetBytes(lastBody, "choices.0.finish_reason").String()), "stop")
 								out = enforcePlanModeResponse(out, upstreamFinishedNormally)
+							}
+							if len(resolvedWebSearchItems) > 0 {
+								if mergedOut, mergeErr := prependResponsesOutputItems(out, resolvedWebSearchItems); mergeErr == nil {
+									out = mergedOut
+								}
 							}
 							if strings.Contains(strings.ToLower(string(out)), "apply_patch") {
 								appendApplyPatchTrace("bridge.responses_output", map[string]any{
 									"model_id": modelID,
 									"summary":  summarizeApplyPatchResponsesOutput(out),
 								})
+							}
+							if isApplyPatchIntent && !enforceProxyPlanMode && !(shellFirstBeforePatch && !hasPriorToolOutput) {
+								valid, reasonCode, sampledArgs := evaluateApplyPatchOutput(out)
+								if !valid {
+									if reasonCode == "wrong_tool_call" && isOversizedShellFileWrite(sampledArgs) {
+										reasonCode = "wrong_tool_call_oversized_shell_write"
+									}
+									if shouldForceStrictApplyPatchRetry(reasonCode) && attempt < maxBridgeAttempts {
+										var retryReq map[string]any
+										if err := json.Unmarshal(responsesReq, &retryReq); err == nil {
+											appendStrictApplyPatchToolOnlyInstruction(retryReq, reasonCode)
+											appendApplyPatchTailConstraintToUserTurn(retryReq, applyPatchTailConstraintText)
+											if mutated, marshalErr := json.Marshal(retryReq); marshalErr == nil {
+												responsesReq = mutated
+												logTextTransform(pm.transformLogger, modelID, "bridge_upstream_retry", fmt.Sprintf("class=apply_patch_%s attempt=%d/%d", reasonCode, attempt, maxBridgeAttempts))
+												continue
+											}
+										}
+									}
+									return rr.Code, rr.Header(), lastBody, buildApplyPatchRetryFailedResponse(out, reasonCode, sampledArgs), nil
+								}
+								if forceLocalApplyPatchFallback {
+									// Optional safety valve for environments where client-side continuation
+									// cannot execute apply_patch. Default behavior preserves native continuation.
+									if callID, operation, ok := extractFirstApplyPatchInvocationFromResponse(out); ok {
+										if originalCall := findFirstApplyPatchCallItem(out); originalCall != nil {
+											opForExec := cloneMap(operation)
+											if strings.TrimSpace(applyPatchPathHint) != "" {
+												opForExec["path"] = normalizeApplyPatchPathForWorkspace(applyPatchPathHint)
+											}
+											if summary, execErr := executeApplyPatchOperationLocallyWithDisplay(opForExec, applyPatchPathHint); execErr == nil {
+												out = buildSyntheticApplyPatchCompletedResponse(out, originalCall, callID, summary)
+											} else {
+												appendApplyPatchTrace("bridge.local_apply_patch_exec_error", map[string]any{
+													"error": execErr.Error(),
+													"path":  fmt.Sprintf("%v", opForExec["path"]),
+												})
+												return rr.Code, rr.Header(), lastBody, buildApplyPatchRetryFailedResponse(out, "local_exec_error", execErr.Error()), nil
+											}
+										}
+									}
+								}
 							}
 							return rr.Code, rr.Header(), lastBody, out, nil
 						}
@@ -6438,11 +10303,29 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 		}
 
 		if responsesRequestedStream {
+			requestedReasoningSummary := extractResponsesRequestReasoningSummaryFromBody(bodyBytes)
+			if isApplyPatchIntent || shouldResolveWebSearchLocally {
+				status, headers, _, out, err := execResponsesRequest(bodyBytes)
+				if err != nil {
+					return err
+				}
+				if status < 200 || status >= 300 {
+					for k, values := range headers {
+						for _, value := range values {
+							w.Header().Add(k, value)
+						}
+					}
+					w.WriteHeader(status)
+					_, _ = w.Write(out)
+					return nil
+				}
+				writeResponsesStream(w, out, requestedReasoningSummary)
+				return nil
+			}
+
 			isPlanModeRequested := extractResponsesRequestModeFromBody(bodyBytes) == "plan"
 			codexManagedPlanMode := isCodexManagedPlanModeFromResponsesBody(bodyBytes)
-			enforceProxyPlanMode := isPlanModeRequested && !codexManagedPlanMode
-
-			if useNativeStreamForward || codexManagedPlanMode {
+			if responsesRequestedStream {
 				translated, err := translateResponsesToChatCompletionsRequest(bodyBytes)
 				if err != nil {
 					return fmt.Errorf("invalid responses request: %w", err)
@@ -6486,6 +10369,11 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 				}()
 
 				var snap headerSnapshot
+				// Some local reasoning models take several seconds before the first
+				// streamed chunk, even though the SSE stream is healthy. Give the
+				// upstream chat-completions bridge enough time to surface headers so
+				// live reasoning deltas can flow instead of failing fast after 2s.
+				headerWait := 30 * time.Second
 				select {
 				case snap = <-pwWriter.headerCh:
 				case err := <-errCh:
@@ -6493,8 +10381,8 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 						return err
 					}
 					return fmt.Errorf("upstream stream ended before sending headers")
-				case <-time.After(2 * time.Second):
-					return fmt.Errorf("timeout waiting for upstream stream headers")
+				case <-time.After(headerWait):
+					return fmt.Errorf("timeout waiting for upstream stream headers after %s", headerWait)
 				}
 				if snap.code < 200 || snap.code >= 300 {
 					for k, values := range snap.header {
@@ -6510,7 +10398,7 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 
 				outMon := newSSEMonitor(r.Context(), modelID, "outgoing_sse", "out", r.URL.Path)
 				teeOut := &teeResponseWriter{w: w, onWrite: outMon.writeChunk}
-				err = writeResponsesStreamFromChatSSE(teeOut, pr, enforceProxyPlanMode)
+				err = writeResponsesStreamFromChatSSE(teeOut, pr, isPlanModeRequested, requestedReasoningSummary)
 				<-errCh
 				return err
 			}
@@ -6531,7 +10419,7 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 			}
 			outMon := newSSEMonitor(r.Context(), modelID, "outgoing_sse", "out", r.URL.Path)
 			teeOut := &teeResponseWriter{w: w, onWrite: outMon.writeChunk}
-			return writeResponsesStreamFromChatSSE(teeOut, bytes.NewReader(streamBody), enforceProxyPlanMode)
+			return writeResponsesStreamFromChatSSE(teeOut, bytes.NewReader(streamBody), isPlanModeRequested, requestedReasoningSummary)
 		}
 
 		status, headers, _, out, err := execResponsesRequest(bodyBytes)
@@ -6556,7 +10444,7 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 		}
 
 		if responsesRequestedStream {
-			writeResponsesStream(w, out)
+			writeResponsesStream(w, out, extractResponsesRequestReasoningSummaryFromBody(bodyBytes))
 			return nil
 		}
 
@@ -6761,6 +10649,15 @@ type ProxyManager struct {
 	ollamaClient      *http.Client
 	ollamaModels      map[string]OllamaModel
 	ollamaLastRefresh time.Time
+
+	// runtime local web-search fallback settings
+	webSearchFallbackEnabled bool
+	webSearchFallbackEngine  string
+	webSearchFallbackURL     string
+	webSearchManagedEnabled  bool
+	webSearchManagedCommand  string
+	webSearchManagedStopCmd  string
+	webSearchManagedService  *managedSidecar
 }
 
 type PromptOptimizationPolicy string
@@ -6927,7 +10824,15 @@ func New(proxyConfig config.Config) *ProxyManager {
 		ollamaEndpoint:            "http://127.0.0.1:11434",
 		ollamaClient:              &http.Client{Timeout: 20 * time.Second},
 		ollamaModels:              make(map[string]OllamaModel),
+		webSearchFallbackEnabled:  true,
+		webSearchFallbackEngine:   normalizeWebSearchFallbackEngine("duckduckgo_html"),
+		webSearchFallbackURL:      strings.TrimSpace(os.Getenv(llamaSwapWebSearchURLVar)),
+		webSearchManagedEnabled:   envBoolTrue(llamaSwapSearxngEnabledVar),
+		webSearchManagedCommand:   strings.TrimSpace(os.Getenv(llamaSwapSearxngCommandVar)),
+		webSearchManagedStopCmd:   strings.TrimSpace(os.Getenv(llamaSwapSearxngStopCommandVar)),
 	}
+	pm.webSearchManagedService = newManagedSidecar("searxng", proxyLogger)
+	pm.webSearchManagedService.SetStopCommand(pm.webSearchManagedStopCmd)
 
 	// create the process groups
 	for groupID := range proxyConfig.Groups {
@@ -6974,6 +10879,8 @@ func New(proxyConfig config.Config) *ProxyManager {
 			}
 		}()
 	}
+
+	pm.webSearchManagedService.StartIfEnabled(pm.shutdownCtx, pm.webSearchManagedEnabled, pm.webSearchManagedCommand)
 
 	return pm
 }
@@ -7181,11 +11088,16 @@ func (pm *ProxyManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // a complete shutdown, allowing for process replacement without full termination.
 func (pm *ProxyManager) StopProcesses(strategy StopStrategy) {
 	pm.Lock()
-	defer pm.Unlock()
+	service := pm.webSearchManagedService
+	processGroups := make([]*ProcessGroup, 0, len(pm.processGroups))
+	for _, processGroup := range pm.processGroups {
+		processGroups = append(processGroups, processGroup)
+	}
+	pm.Unlock()
 
 	// stop Processes in parallel
 	var wg sync.WaitGroup
-	for _, processGroup := range pm.processGroups {
+	for _, processGroup := range processGroups {
 		wg.Add(1)
 		go func(processGroup *ProcessGroup) {
 			defer wg.Done()
@@ -7194,18 +11106,26 @@ func (pm *ProxyManager) StopProcesses(strategy StopStrategy) {
 	}
 
 	wg.Wait()
+	if service != nil {
+		_ = service.Stop()
+	}
 }
 
 // Shutdown stops all processes managed by this ProxyManager
 func (pm *ProxyManager) Shutdown() {
 	pm.Lock()
-	defer pm.Unlock()
+	service := pm.webSearchManagedService
+	processGroups := make([]*ProcessGroup, 0, len(pm.processGroups))
+	for _, processGroup := range pm.processGroups {
+		processGroups = append(processGroups, processGroup)
+	}
+	pm.Unlock()
 
 	pm.proxyLogger.Debug("Shutdown() called in proxy manager")
 
 	var wg sync.WaitGroup
 	// Send shutdown signal to all process in groups
-	for _, processGroup := range pm.processGroups {
+	for _, processGroup := range processGroups {
 		wg.Add(1)
 		go func(processGroup *ProcessGroup) {
 			defer wg.Done()
@@ -7213,6 +11133,9 @@ func (pm *ProxyManager) Shutdown() {
 		}(processGroup)
 	}
 	wg.Wait()
+	if service != nil {
+		_ = service.Stop()
+	}
 	pm.shutdownCancel()
 }
 

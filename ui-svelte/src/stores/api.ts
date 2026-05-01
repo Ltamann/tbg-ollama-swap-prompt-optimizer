@@ -428,6 +428,16 @@ export interface PromptOptimizationSnapshot {
   optimizedBody: string;
 }
 
+export interface WebSearchSettings {
+  enabled: boolean;
+  engine: "duckduckgo_html" | "searxng";
+  url: string;
+  managedEnabled: boolean;
+  managedCommand: string;
+  managedStopCommand: string;
+  managedStatus: string;
+}
+
 export async function getPromptOptimizationPolicy(model: string): Promise<PromptOptimizationPolicy> {
   try {
     const response = await fetch(`/api/model/${encodeURIComponent(model)}/prompt-optimization`);
@@ -471,6 +481,51 @@ export async function getConfigPath(): Promise<string> {
     console.error("Failed to fetch config path:", error);
     return "config.yaml";
   }
+}
+
+export async function getWebSearchSettings(): Promise<WebSearchSettings> {
+  try {
+    const response = await fetch("/api/settings/web-search");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch web search settings: ${response.status}`);
+    }
+    const data = (await response.json()) as Partial<WebSearchSettings>;
+    return {
+      enabled: data.enabled !== false,
+      engine: data.engine === "searxng" ? "searxng" : "duckduckgo_html",
+      url: data.url || "",
+      managedEnabled: data.managedEnabled === true,
+      managedCommand: data.managedCommand || "",
+      managedStopCommand: data.managedStopCommand || "",
+      managedStatus: data.managedStatus || "stopped",
+    };
+  } catch (error) {
+    console.error("Failed to fetch web search settings:", error);
+    return {
+      enabled: true,
+      engine: "duckduckgo_html",
+      url: "",
+      managedEnabled: false,
+      managedCommand: "",
+      managedStopCommand: "",
+      managedStatus: "stopped",
+    };
+  }
+}
+
+export async function setWebSearchSettings(settings: WebSearchSettings): Promise<WebSearchSettings> {
+  const response = await fetch("/api/settings/web-search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(settings),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to set web search settings: ${response.status}`);
+  }
+  return (await response.json()) as WebSearchSettings;
 }
 
 export async function getLatestPromptOptimization(model: string): Promise<PromptOptimizationSnapshot | null> {

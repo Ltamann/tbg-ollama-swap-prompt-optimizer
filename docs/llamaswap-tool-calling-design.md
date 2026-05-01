@@ -38,12 +38,19 @@ Internal behavior change:
 ## Streaming Event Format Strategy
 Current:
 - `writeResponsesStream()` emits OpenAI responses-style event envelopes from final translated payload.
+- For Codex UI compatibility, native `reasoning` events may need a visible assistant `channel:"commentary"` companion because some Codex clients do not render the native reasoning lane for local model IDs even when the Responses event sequence is correct.
 
 Phase 2 target:
 1. Parse incremental upstream chat deltas.
 2. Assemble tool call fragments by call index/id.
 3. Emit deterministic `response.output_item.*` events for partial and done states.
 4. Preserve current event order for backward compatibility.
+
+Codex reasoning UI note:
+- Preferred order for think-bearing turns is `reasoning -> commentary -> final`.
+- `commentary` is a visibility workaround, not a replacement reasoning contract.
+- Prefer a short summary in `commentary` instead of full reasoning text because commentary can become part of replayed assistant history.
+- See [codex-reasoning-ui-study.md](codex-reasoning-ui-study.md).
 
 ## Chat-Template Integration Strategy
 llama-swap remains template-agnostic by design:

@@ -7,12 +7,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -359,6 +361,80 @@ func TestRewriteResponsesToolCallPayload_ApplyPatchCallKeepsInProgressStatus(t *
 	assert.Equal(t, "call_1", item["call_id"])
 	assert.Equal(t, "in_progress", item["status"])
 	assert.Equal(t, "in_progress", payload["status"])
+}
+
+func TestRewriteResponsesToolCallPayload_RepairsPlaceholderAppendContent(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "llamaswap-append-*.txt")
+	assert.NoError(t, err)
+	require.NoError(t, os.WriteFile(tmpFile.Name(), []byte("BASE\n"), 0o600))
+	defer os.Remove(tmpFile.Name())
+
+	body := []byte(`{
+		"output":[
+			{
+				"type":"function_call",
+				"call_id":"call_patch",
+				"name":"__llamaswap_apply_patch",
+				"arguments":"{\"operation\":{\"type\":\"update_file\",\"path\":\"` + "`" + `PLACEHOLDER` + "`" + `\",\"content\":\"[current content placeholder - will read first]\"}}",
+				"status":"completed"
+			}
+		]
+	}`)
+	body = []byte(strings.ReplaceAll(string(body), "`PLACEHOLDER`", tmpFile.Name()))
+
+	updated, changed, err := rewriteResponsesToolCallPayload(body, tmpFile.Name(), "ACTPATCH35_OK", "update_file")
+	assert.NoError(t, err)
+	assert.True(t, changed)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(updated, &payload))
+	output, ok := payload["output"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, output, 1) {
+		return
+	}
+	item, _ := output[0].(map[string]any)
+	operation, ok := item["operation"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "update_file", operation["type"])
+	assert.Equal(t, tmpFile.Name(), operation["path"])
+	assert.Equal(t, "ACTPATCH35_OK", operation["content"])
+}
+
+func TestRewriteResponsesToolCallPayload_RepairsCreateFileAppendDrift(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "llamaswap-append-*.txt")
+	assert.NoError(t, err)
+	require.NoError(t, os.WriteFile(tmpFile.Name(), []byte("BASE\n"), 0o600))
+	defer os.Remove(tmpFile.Name())
+
+	body := []byte(`{
+		"output":[
+			{
+				"type":"function_call",
+				"call_id":"call_patch",
+				"name":"__llamaswap_apply_patch",
+				"arguments":"{\"operation\":{\"type\":\"create_file\",\"path\":\"` + "`" + `PLACEHOLDER` + "`" + `\",\"content\":\"Chunk ID: 9231b4\\nACTPATCH35_OK\\n\"}}",
+				"status":"completed"
+			}
+		]
+	}`)
+	body = []byte(strings.ReplaceAll(string(body), "`PLACEHOLDER`", tmpFile.Name()))
+
+	updated, changed, err := rewriteResponsesToolCallPayload(body, tmpFile.Name(), "ACTPATCH35_OK", "update_file")
+	assert.NoError(t, err)
+	assert.True(t, changed)
+
+	var payload map[string]any
+	assert.NoError(t, json.Unmarshal(updated, &payload))
+	output, ok := payload["output"].([]any)
+	if !assert.True(t, ok) || !assert.Len(t, output, 1) {
+		return
+	}
+	item, _ := output[0].(map[string]any)
+	operation, ok := item["operation"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "update_file", operation["type"])
+	assert.Equal(t, tmpFile.Name(), operation["path"])
+	assert.Equal(t, "ACTPATCH35_OK", operation["content"])
 }
 
 func TestProcess_LowTTLValue(t *testing.T) {

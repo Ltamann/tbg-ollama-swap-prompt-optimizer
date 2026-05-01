@@ -4,10 +4,13 @@
     models,
     type PromptOptimizationPolicy,
     type PromptOptimizationSnapshot,
+    type WebSearchSettings,
     getPromptOptimizationPolicy,
     setPromptOptimizationPolicy,
     getConfigPath,
     getLatestPromptOptimization,
+    getWebSearchSettings,
+    setWebSearchSettings,
   } from "../stores/api";
   import type { Model } from "../lib/types";
 
@@ -47,6 +50,12 @@
   let latestInfo = $state<Record<string, string>>({});
   let latestSnapshotByModel = $state<Record<string, PromptOptimizationSnapshot | null>>({});
   let copyStatusByModel = $state<Record<string, string>>({});
+  let webSearchSettings = $state<WebSearchSettings>({
+    enabled: true,
+    engine: "duckduckgo_html",
+    url: "",
+  });
+  let webSearchStatus = $state("");
 
   const localModels = $derived.by(() => $models.filter((m) => !m.peerID).sort((a, b) => a.id.localeCompare(b.id)));
 
@@ -57,6 +66,7 @@
   });
   onMount(() => {
     void loadConfigPath();
+    void loadWebSearchSettings();
   });
 
   async function ensureLoaded(modelId: string): Promise<void> {
@@ -92,6 +102,20 @@
 
   async function loadConfigPath(): Promise<void> {
     configPath = await getConfigPath();
+  }
+
+  async function loadWebSearchSettings(): Promise<void> {
+    webSearchSettings = await getWebSearchSettings();
+  }
+
+  async function saveWebSearchSettings(): Promise<void> {
+    try {
+      webSearchSettings = await setWebSearchSettings(webSearchSettings);
+      webSearchStatus = "Saved.";
+    } catch (error) {
+      console.error(error);
+      webSearchStatus = "Save failed.";
+    }
   }
 
   async function loadLatestInfo(modelId: string): Promise<void> {
@@ -158,6 +182,79 @@
     <a href={`file://${configPath}`} title={configPath} class="underline">{configPath}</a>
   </p>
   <p class="text-sm text-txtsecondary mb-4">Control how prompts are optimized before requests are sent upstream.</p>
+
+  <div class="mb-6 rounded border border-gray-200 dark:border-white/10 p-4">
+    <h3 class="font-semibold mb-2">Local Web Search Fallback</h3>
+    <p class="text-sm text-txtsecondary mb-3">
+      Codex browser/MCP stays preferred. These settings control llama-swap’s local `web_search` fallback when the client cannot execute the first-party web search call.
+    </p>
+    <div class="flex items-center gap-2 mb-3">
+      <input id="ws-enabled" type="checkbox" bind:checked={webSearchSettings.enabled} />
+      <label for="ws-enabled">Enable llama-swap local web-search fallback</label>
+    </div>
+    <div class="grid gap-3 md:grid-cols-2">
+      <div>
+        <label class="block text-sm mb-1" for="ws-engine">Search Engine</label>
+        <select
+          id="ws-engine"
+          class="w-full rounded border border-gray-300 dark:border-white/20 bg-surface px-2 py-1 text-sm"
+          bind:value={webSearchSettings.engine}
+        >
+          <option value="duckduckgo_html">DuckDuckGo HTML</option>
+          <option value="searxng">SearXNG</option>
+        </select>
+      </div>
+      <div>
+        <label class="block text-sm mb-1" for="ws-url">SearXNG Endpoint</label>
+        <input
+          id="ws-url"
+          class="w-full rounded border border-gray-300 dark:border-white/20 bg-surface px-2 py-1 text-sm"
+          bind:value={webSearchSettings.url}
+          placeholder="http://127.0.0.1:8081/search"
+        />
+      </div>
+    </div>
+    <div class="mt-4 rounded border border-gray-200 dark:border-white/10 p-3">
+      <div class="font-medium mb-2">Managed SearXNG Sidecar</div>
+      <div class="flex items-center gap-2 mb-3">
+        <input id="ws-managed-enabled" type="checkbox" bind:checked={webSearchSettings.managedEnabled} />
+        <label for="ws-managed-enabled">Start SearXNG with llama-swap</label>
+      </div>
+      <div class="grid gap-3">
+        <div>
+          <label class="block text-sm mb-1" for="ws-managed-command">Start Command</label>
+          <input
+            id="ws-managed-command"
+            class="w-full rounded border border-gray-300 dark:border-white/20 bg-surface px-2 py-1 text-sm"
+            bind:value={webSearchSettings.managedCommand}
+            placeholder="docker run ... searxng or custom launcher"
+          />
+        </div>
+        <div>
+          <label class="block text-sm mb-1" for="ws-managed-stop-command">Stop Command</label>
+          <input
+            id="ws-managed-stop-command"
+            class="w-full rounded border border-gray-300 dark:border-white/20 bg-surface px-2 py-1 text-sm"
+            bind:value={webSearchSettings.managedStopCommand}
+            placeholder="optional custom stop command"
+          />
+        </div>
+      </div>
+      <div class="text-xs text-txtsecondary mt-2">
+        Status: {webSearchSettings.managedStatus || "stopped"}. When enabled, llama-swap starts this command during server startup and stops it on restart/shutdown.
+      </div>
+    </div>
+    <div class="text-xs text-txtsecondary mt-2">
+      Use `SearXNG` with a JSON endpoint like `/search?format=json`. Leave the endpoint blank to use DuckDuckGo HTML fallback.
+    </div>
+    <div class="mt-3 flex items-center gap-2">
+      <button class="btn btn--sm" onclick={saveWebSearchSettings}>Save Web Search Settings</button>
+      <button class="btn btn--sm" onclick={loadWebSearchSettings}>Reload</button>
+    </div>
+    {#if webSearchStatus}
+      <div class="text-xs text-txtsecondary mt-2">{webSearchStatus}</div>
+    {/if}
+  </div>
 
   <table class="w-full">
     <thead>

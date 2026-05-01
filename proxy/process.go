@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -222,6 +223,62 @@ func rewriteResponsesToolCallPayload(body []byte, applyPatchPathHint string, app
 	return updated, true, nil
 }
 
+func repairApplyPatchOperationWithHints(operation any, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string) (any, bool) {
+	op, ok := normalizeApplyPatchOperation(operation).(map[string]any)
+	if !ok {
+		return operation, false
+	}
+	pathHint := strings.TrimSpace(normalizeApplyPatchPathForWorkspace(applyPatchPathHint))
+	contentHint := strings.ReplaceAll(strings.TrimSpace(applyPatchContentHint), "\r\n", "\n")
+	typeHint := normalizeApplyPatchTypeHint(applyPatchTypeHint)
+	if pathHint == "" || contentHint == "" || typeHint != "update_file" || !applyPatchPathExistsLocally(pathHint) {
+		return operation, false
+	}
+
+	opType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", op["type"])))
+	if opType != "update_file" && opType != "create_file" {
+		return operation, false
+	}
+
+	raw, err := os.ReadFile(pathHint)
+	if err != nil {
+		return operation, false
+	}
+	existing := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	existingTrimmed := strings.TrimRight(existing, "\n")
+	desiredFull := contentHint
+	if existingTrimmed != "" {
+		desiredFull = existingTrimmed + "\n" + contentHint
+	}
+
+	currentContent := strings.ReplaceAll(strings.TrimSpace(fmt.Sprintf("%v", op["content"])), "\r\n", "\n")
+	currentDiff := normalizeApplyPatchDiff(strings.TrimSpace(fmt.Sprintf("%v", op["diff"])))
+	if currentDiff != "" {
+		if body := extractApplyPatchDiffBody(currentDiff); strings.TrimSpace(body) == strings.TrimSpace(contentHint) {
+			return op, false
+		}
+	}
+	if currentContent == "" {
+		return operation, false
+	}
+
+	contentLooksPlaceholder := strings.Contains(strings.ToLower(currentContent), "placeholder")
+	contentIsExactAppend := currentContent == contentHint
+	contentIsDesiredFull := strings.TrimRight(currentContent, "\n") == strings.TrimRight(desiredFull, "\n")
+	contentContainsHint := strings.Contains(currentContent, contentHint)
+	needsRepair := contentLooksPlaceholder || (!contentIsExactAppend && !contentIsDesiredFull && contentContainsHint) || (!contentContainsHint)
+	if !needsRepair {
+		return op, false
+	}
+
+	rewritten := cloneMap(op)
+	rewritten["type"] = "update_file"
+	rewritten["path"] = pathHint
+	rewritten["content"] = contentHint
+	delete(rewritten, "diff")
+	return rewritten, true
+}
+
 func rewriteResponsesOutputItem(rawItem any, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string) (any, bool) {
 	item, ok := rawItem.(map[string]any)
 	if !ok {
@@ -256,6 +313,9 @@ func rewriteResponsesOutputItem(rawItem any, applyPatchPathHint string, applyPat
 			if applyPatchOperationPayloadValid(recovered) {
 				operation = recovered
 			}
+		}
+		if repaired, repairedOK := repairApplyPatchOperationWithHints(operation, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint); repairedOK {
+			operation = repaired
 		}
 		if !hasNonEmptyApplyPatchOperation(operation) || !applyPatchOperationPayloadValid(operation) {
 			rewritten := map[string]any{
@@ -343,6 +403,9 @@ func rewriteResponsesOutputItem(rawItem any, applyPatchPathHint string, applyPat
 					operation = recovered
 				}
 			}
+		}
+		if repaired, repairedOK := repairApplyPatchOperationWithHints(operation, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint); repairedOK {
+			operation = repaired
 		}
 		if !hasNonEmptyApplyPatchOperation(operation) || !applyPatchOperationPayloadValid(operation) {
 			rewritten := map[string]any{
