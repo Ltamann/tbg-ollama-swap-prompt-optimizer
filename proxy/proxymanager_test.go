@@ -19,6 +19,7 @@ import (
 	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/event"
 	"github.com/Ltamann/tbg-ollama-swap-prompt-optimizer/proxy/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
 
@@ -1601,6 +1602,64 @@ func TestResponsesRequestToChatMessages_MergesReasoningIntoFollowingFunctionCall
 	assert.Equal(t, "/tmp/workspace", messages[1]["content"])
 }
 
+func TestResponsesRequestToChatMessages_DisableReasoningHistoryReplaySkipsStandaloneReasoningItems(t *testing.T) {
+	t.Setenv("LLAMASWAP_DISABLE_REASONING_HISTORY_REPLAY", "1")
+
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "reasoning",
+				"summary": []any{
+					map[string]any{
+						"type": "summary_text",
+						"text": "run the command first",
+					},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "exec_command",
+				"call_id":   "call_shell_1",
+				"arguments": `{"cmd":"pwd"}`,
+			},
+		},
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	if !assert.Len(t, messages, 1) {
+		return
+	}
+	assert.Equal(t, "assistant", messages[0]["role"])
+	_, hasReasoning := messages[0]["reasoning_content"]
+	assert.False(t, hasReasoning)
+}
+
+func TestResponsesRequestToChatMessages_DisableReasoningHistoryReplayPreservesInlineAssistantReasoning(t *testing.T) {
+	t.Setenv("LLAMASWAP_DISABLE_REASONING_HISTORY_REPLAY", "true")
+
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{
+						"type": "output_text",
+						"text": "<think>internal reasoning</think>\nVisible answer",
+					},
+				},
+			},
+		},
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	if !assert.Len(t, messages, 1) {
+		return
+	}
+	assert.Equal(t, "Visible answer", messages[0]["content"])
+	assert.Equal(t, "internal reasoning", messages[0]["reasoning_content"])
+}
+
 func TestResponsesRequestToChatMessages_PreservesRoleForUntypedRoleContentInput(t *testing.T) {
 	req := map[string]any{
 		"input": []any{
@@ -1827,6 +1886,516 @@ func TestNormalizeResponsesRequest_InjectsQwenToolPolicyForBuiltInTools(t *testi
 	assert.Contains(t, content, "Use apply_patch for any file creation, deletion, or modification.")
 	assert.Contains(t, content, "Do not use shell to edit files.")
 	assert.Contains(t, content, "Use web_search for current or external information.")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputInPlanContinuationAfterToolOutput(t *testing.T) {
+	req := map[string]any{
+		"model": "gpt-5.2",
+		"instructions": "Use the request_user_input tool in native Codex question format and ask exactly one short clarifying question.",
+		"tool_choice": "auto",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "write a plan for a small game"},
+				},
+			},
+			map[string]any{
+				"type": "function_call",
+				"name": "shell",
+				"call_id": "call_shell_1",
+				"arguments": `{"command":"pwd"}`,
+			},
+			map[string]any{
+				"type": "function_call_output",
+				"call_id": "call_shell_1",
+				"output": "c:/repo\n",
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "ask"},
+				},
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "shell"},
+			map[string]any{"type": "function", "name": "request_user_input"},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	toolChoice, ok := payload["tool_choice"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "function", toolChoice["type"])
+	fn, ok := toolChoice["function"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "request_user_input", fn["name"])
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputAfterExplorationBeforeAnyQuestion(t *testing.T) {
+	req := map[string]any{
+		"model": "gpt-5.2",
+		"instructions": "Plan mode request.",
+		"tool_choice": "auto",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "write a plan for a small game"},
+				},
+			},
+			map[string]any{
+				"type": "function_call",
+				"name": "shell",
+				"call_id": "call_shell_1",
+				"arguments": `{"command":"pwd"}`,
+			},
+			map[string]any{
+				"type": "function_call_output",
+				"call_id": "call_shell_1",
+				"output": "c:/repo\n",
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "shell"},
+			map[string]any{"type": "function", "name": "request_user_input"},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	toolChoice, ok := payload["tool_choice"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "function", toolChoice["type"])
+	fn, ok := toolChoice["function"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "request_user_input", fn["name"])
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_ForcesProposedPlanAfterCompletedRequestUserInput(t *testing.T) {
+	req := map[string]any{
+		"model": "gpt-5.2",
+		"instructions": "Plan mode request.",
+		"tool_choice": "auto",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "write a plan for a small game"},
+				},
+			},
+			map[string]any{
+				"type": "function_call",
+				"name": "request_user_input",
+				"call_id": "call_question_1",
+				"arguments": `{"questions":["What style should the game use?"]}`,
+			},
+			map[string]any{
+				"type": "function_call_output",
+				"call_id": "call_question_1",
+				"output": `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "shell"},
+			map[string]any{"type": "function", "name": "request_user_input"},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	assert.Equal(t, "none", payload["tool_choice"])
+	messages, ok := payload["messages"].([]any)
+	require.True(t, ok)
+	first, ok := messages[0].(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, fmt.Sprintf("%v", first["content"]), "Return exactly one complete <proposed_plan> block now.")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *testing.T) {
+	planDev := func() map[string]any {
+		return map[string]any{
+			"type": "message",
+			"role": "developer",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode."},
+			},
+		}
+	}
+	defaultDev := func() map[string]any {
+		return map[string]any{
+			"type": "message",
+			"role": "developer",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "<collaboration_mode># Collaboration Mode: Default\nYou are in Default mode."},
+			},
+		}
+	}
+	userMsg := func(text string) map[string]any {
+		return map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": text},
+			},
+		}
+	}
+	toolCall := func(name, callID, args string) map[string]any {
+		return map[string]any{
+			"type":      "function_call",
+			"name":      name,
+			"call_id":   callID,
+			"arguments": args,
+		}
+	}
+	toolOutput := func(callID, output string) map[string]any {
+		return map[string]any{
+			"type":    "function_call_output",
+			"call_id": callID,
+			"output":  output,
+		}
+	}
+	baseTools := func(names ...string) []any {
+		tools := make([]any, 0, len(names))
+		for _, name := range names {
+			tools = append(tools, map[string]any{"type": "function", "name": name})
+		}
+		return tools
+	}
+	baseReq := func(dev map[string]any, instructions string, user string, inputTail []any, tools []any, toolChoice any) map[string]any {
+		input := []any{dev, userMsg(user)}
+		input = append(input, inputTail...)
+		return map[string]any{
+			"model":        "gpt-5.2",
+			"instructions": instructions,
+			"tool_choice":  toolChoice,
+			"input":        input,
+			"tools":        tools,
+		}
+	}
+	type testCase struct {
+		name                     string
+		req                      map[string]any
+		wantToolChoiceString     string
+		wantToolChoiceFunction   string
+		wantInstructionContains  string
+		wantInstructionExcludes  string
+		wantToolAbsent           string
+	}
+	tests := []testCase{
+		{
+			name: "plan shell exploration forces request_user_input",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
+				baseTools("shell", "request_user_input"), "auto"),
+			wantToolChoiceFunction: "request_user_input",
+		},
+		{
+			name: "plan web search exploration forces request_user_input",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{toolCall("web_search", "call_web_1", `{"query":"game ideas"}`), toolOutput("call_web_1", "results")},
+				baseTools("web_search", "request_user_input"), "auto"),
+			wantToolChoiceFunction: "request_user_input",
+		},
+		{
+			name: "plan apply_patch history still forces request_user_input",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{toolCall("apply_patch", "call_patch_1", `{"patch":"*** Begin Patch"}`), toolOutput("call_patch_1", "ok")},
+				baseTools("apply_patch", "request_user_input"), "auto"),
+			wantToolChoiceFunction: "request_user_input",
+		},
+		{
+			name: "explicit native codex question request forces request_user_input before tool output",
+			req: baseReq(planDev(), "Use the request_user_input tool in native Codex question format and ask exactly one short clarifying question.",
+				"write a plan for a small game", nil, baseTools("request_user_input"), "auto"),
+			wantToolChoiceFunction: "request_user_input",
+		},
+		{
+			name: "explicit native codex question request after shell output still forces request_user_input",
+			req: baseReq(planDev(), "Use the request_user_input tool in native Codex question format and ask exactly one short clarifying question.",
+				"write a plan for a small game",
+				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
+				baseTools("shell", "request_user_input"), "auto"),
+			wantToolChoiceFunction: "request_user_input",
+		},
+		{
+			name: "plan continuation with required tool choice still resolves to request_user_input",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
+				baseTools("shell", "request_user_input"), "required"),
+			wantToolChoiceFunction: "request_user_input",
+		},
+		{
+			name: "specific shell tool choice is preserved in plan continuation",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
+				baseTools("shell", "request_user_input"), map[string]any{
+					"type": "function",
+					"function": map[string]any{
+						"name": "shell",
+					},
+				}),
+			wantToolChoiceFunction: "shell",
+		},
+		{
+			name: "plan continuation without request_user_input tool stays auto",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
+				baseTools("shell"), "auto"),
+			wantToolChoiceString: "auto",
+		},
+		{
+			name: "default mode exploration never forces request_user_input",
+			req: baseReq(defaultDev(), "Default mode request.", "write a plan for a small game",
+				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
+				baseTools("shell", "request_user_input"), "auto"),
+			wantToolChoiceString: "auto",
+		},
+		{
+			name: "no questions instruction blocks explicit question forcing",
+			req: baseReq(planDev(), "Use the request_user_input tool in native Codex question format and ask exactly one short clarifying question.",
+				"no questions please", nil, baseTools("request_user_input"), "auto"),
+			wantToolChoiceString: "auto",
+		},
+		{
+			name: "completed request_user_input forces proposed plan return",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`), toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`)},
+				baseTools("shell", "request_user_input"), "auto"),
+			wantToolChoiceString:    "none",
+			wantInstructionContains: "Return exactly one complete <proposed_plan> block now.",
+		},
+		{
+			name: "completed request_user_input after shell exploration still forces proposed plan return",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{
+					toolCall("shell", "call_shell_1", `{"command":"pwd"}`),
+					toolOutput("call_shell_1", "c:/repo\n"),
+					toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`),
+					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
+				},
+				baseTools("shell", "request_user_input"), "auto"),
+			wantToolChoiceString:    "none",
+			wantInstructionContains: "Return exactly one complete <proposed_plan> block now.",
+		},
+		{
+			name: "multiple completed request_user_input calls still force proposed plan return",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{
+					toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`),
+					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
+					toolCall("request_user_input", "call_q_2", `{"questions":["What colors?"]}`),
+					toolOutput("call_q_2", `{"answers":[{"id":"colors","value":"bright"}]}`),
+				},
+				baseTools("request_user_input"), "auto"),
+			wantToolChoiceString:    "none",
+			wantInstructionContains: "Return exactly one complete <proposed_plan> block now.",
+		},
+		{
+			name: "specific shell tool choice after completed request_user_input is preserved",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{
+					toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`),
+					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
+				},
+				baseTools("shell", "request_user_input"), map[string]any{
+					"type": "function",
+					"function": map[string]any{
+						"name": "shell",
+					},
+				}),
+			wantToolChoiceFunction:  "shell",
+			wantInstructionExcludes: "Return exactly one complete <proposed_plan> block now.",
+		},
+		{
+			name: "incomplete request_user_input does not force proposed plan return",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`)},
+				baseTools("request_user_input"), "auto"),
+			wantToolChoiceString: "auto",
+		},
+		{
+			name: "default mode with completed request_user_input does not force proposed plan return",
+			req: baseReq(defaultDev(), "Default mode request.", "write a plan for a small game",
+				[]any{
+					toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`),
+					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
+				},
+				baseTools("request_user_input"), "auto"),
+			wantToolChoiceString: "auto",
+		},
+		{
+			name: "plan return still forces without request_user_input tool exposed in tools",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{
+					toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`),
+					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
+				},
+				baseTools("shell"), "auto"),
+			wantToolChoiceString:    "none",
+			wantInstructionContains: "Return exactly one complete <proposed_plan> block now.",
+		},
+		{
+			name: "completed request_user_input with required tool choice still forces proposed plan return",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{
+					toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`),
+					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
+				},
+				baseTools("request_user_input"), "required"),
+			wantToolChoiceString:    "none",
+			wantInstructionContains: "Return exactly one complete <proposed_plan> block now.",
+		},
+		{
+			name: "default mode write a plan removes update_plan and adds wrapping instruction",
+			req: baseReq(defaultDev(), "Default mode request.", "write a plan for a small math game",
+				nil, baseTools("update_plan", "shell"), "auto"),
+			wantToolChoiceString:    "auto",
+			wantInstructionContains: "return the plan directly as assistant text wrapped in <proposed_plan>...</proposed_plan>",
+			wantToolAbsent:          "update_plan",
+		},
+		{
+			name: "default mode return a plan also removes update_plan",
+			req: baseReq(defaultDev(), "Default mode request.", "return a plan for a portfolio site",
+				nil, baseTools("update_plan", "shell"), "auto"),
+			wantToolChoiceString:    "auto",
+			wantInstructionContains: "return the plan directly as assistant text wrapped in <proposed_plan>...</proposed_plan>",
+			wantToolAbsent:          "update_plan",
+		},
+		{
+			name: "default mode implement this plan does not remove update_plan",
+			req: baseReq(defaultDev(), "Default mode request.", "please implement this plan using apply_patch",
+				nil, baseTools("update_plan", "apply_patch"), "auto"),
+			wantToolChoiceString:    "auto",
+			wantInstructionExcludes: "return the plan directly as assistant text wrapped in <proposed_plan>...</proposed_plan>",
+		},
+		{
+			name: "default mode non plan request keeps update_plan untouched",
+			req: baseReq(defaultDev(), "Default mode request.", "say hello",
+				nil, baseTools("update_plan", "shell"), "auto"),
+			wantToolChoiceString:    "auto",
+			wantInstructionExcludes: "return the plan directly as assistant text wrapped in <proposed_plan>...</proposed_plan>",
+		},
+		{
+			name: "plan mode does not inject default mode plan wrapping instruction",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				nil, baseTools("update_plan", "request_user_input"), "auto"),
+			wantToolChoiceString:    "auto",
+			wantInstructionExcludes: "return the plan directly as assistant text wrapped in <proposed_plan>...</proposed_plan>",
+		},
+		{
+			name: "specific request_user_input tool choice is preserved",
+			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
+				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
+				baseTools("shell", "request_user_input"), map[string]any{
+					"type": "function",
+					"function": map[string]any{
+						"name": "request_user_input",
+					},
+				}),
+			wantToolChoiceFunction: "request_user_input",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(tc.req)
+			require.NoError(t, err)
+
+			translated, err := translateResponsesToChatCompletionsRequest(body)
+			require.NoError(t, err)
+
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(translated, &payload))
+
+			if tc.wantToolChoiceFunction != "" {
+				toolChoice, ok := payload["tool_choice"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, "function", toolChoice["type"])
+				fn, ok := toolChoice["function"].(map[string]any)
+				require.True(t, ok)
+				assert.Equal(t, tc.wantToolChoiceFunction, fn["name"])
+			}
+			if tc.wantToolChoiceString != "" {
+				assert.Equal(t, tc.wantToolChoiceString, payload["tool_choice"])
+			}
+
+			messages, ok := payload["messages"].([]any)
+			require.True(t, ok)
+			var allContent []string
+			for _, rawMsg := range messages {
+				msg, ok := rawMsg.(map[string]any)
+				require.True(t, ok)
+				allContent = append(allContent, fmt.Sprintf("%v", msg["content"]))
+			}
+			joinedContent := strings.Join(allContent, "\n")
+
+			if tc.wantInstructionContains != "" {
+				assert.Contains(t, joinedContent, tc.wantInstructionContains)
+			}
+			if tc.wantInstructionExcludes != "" {
+				assert.NotContains(t, joinedContent, tc.wantInstructionExcludes)
+			}
+
+			if tc.wantToolAbsent != "" {
+				tools, ok := payload["tools"].([]any)
+				require.True(t, ok)
+				for _, rawTool := range tools {
+					tool, ok := rawTool.(map[string]any)
+					require.True(t, ok)
+					assert.NotEqual(t, tc.wantToolAbsent, tool["name"])
+				}
+			}
+		})
+	}
 }
 
 func TestNormalizeResponsesRequest_DoesNotInjectQwenToolPolicyForNonQwenModels(t *testing.T) {

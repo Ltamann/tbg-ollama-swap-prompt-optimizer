@@ -215,3 +215,100 @@
   - Next confirmed scope after redeploy:
     - instrument why reasoning arrives as a buffered summary chunk instead of true incremental live streaming
     - reduce commentary from full reasoning mirror toward short summary mode to lower history contamination risk
+
+## 2026-05-01 23:45:00 +0200
+- A/B intent:
+  - Baseline replayed captured requests before changing code.
+  - Results:
+    - cap 7 (35B question turn): still emits request_user_input.
+    - cap 9 (35B plan turn): still does not emit <proposed_plan>.
+    - cap 3 (NVFP4 implementation turn): still leaks escaped </think> markers.
+  - Next step:
+    - add a temporary bridge switch to disable replay of prior reasoning items into upstream reasoning_content, then rerun the same captures to test causation rather than infer from history growth.
+
+## 2026-05-01 23:52:00 +0200
+- Patch intent:
+  - Added temporary env-controlled bridge switch `LLAMASWAP_DISABLE_REASONING_HISTORY_REPLAY` in `responsesRequestToChatMessages(...)`.
+  - Scope is deliberately narrow: skip replay of standalone Responses `type:"reasoning"` history items into upstream `reasoning_content`, while preserving inline assistant reasoning extraction.
+  - Goal: run a true A/B against the same captured 35B/NVFP4 requests without changing broader tool or plan logic.
+## 2026-05-02 00:02:00 +0200
+- A/B outcome with `LLAMASWAP_DISABLE_REASONING_HISTORY_REPLAY=1`:
+  - Deployment correction:
+    - Verified the first restart was still using the stale copied binary.
+    - Confirmed mismatch between `/home/admmin/llama-swap/llama-swap-main/llama-swap` and `/home/admmin/bin/llama-swap`.
+    - Re-copied the fresh workspace binary through `\\wsl$` and restarted `llama-swap` with the env flag enabled.
+  - Replayed captured requests against the live service using the same request JSON bodies:
+    - `cap 7` (35B question turn): still emits `request_user_input`.
+    - `cap 9` (35B plan turn): still does **not** emit `<proposed_plan>`.
+    - `cap 3` (NVFP4 malformed implementation turn): escaped `</think>` leakage disappeared under the A/B replay.
+  - Conclusion:
+    - Disabling reasoning-history replay does **not** explain the 35B stop-before-plan bug; that failure persists.
+    - Disabling reasoning-history replay **does** affect NVFP4 output cleanliness, so reasoning replay is at least a contributing factor for malformed think-tag leakage there.
+    - Updated confidence:
+      - 35B missing-question/missing-plan behavior is still primarily a plan-continuation / tool-steering issue, not proven reasoning-history contamination.
+      - NVFP4 malformed output is influenced by reasoning replay, but likely still also depends on template/output integrity.
+## 2026-05-02 00:16:00 +0200
+- Patch intent:
+  - Fix the 35B plan-continuation auto-stop path.
+  - Change is intentionally narrow:
+    - if plan mode explicitly wants a native question, keep forcing `request_user_input` even after prior tool output
+    - if plan mode has prior tool output and the user explicitly wants the completed plan now, force `tool_choice="none"` and inject a continuation instruction to return one `<proposed_plan>` block immediately
+  - NVFP4 remains in the forensic bucket; no template or trainer-specific behavior changes in this iteration.
+## 2026-05-02 00:20:00 +0200
+- Verification note:
+  - Focused Go tests reached the real Linux path successfully via `wsl --cd` and `/usr/local/go/bin/go`.
+  - Immediate failure was not in the bridge logic; it was a test compile issue because `proxy/proxymanager_test.go` did not import `require` for the new cases.
+  - Next action: add the missing import, rerun the same targeted tests, then rebuild/copy/restart.
+## 2026-05-02 00:28:00 +0200
+- Iteration outcome before rebuild:
+  - Added 35B plan-continuation guards:
+    - explicit native-question continuations in plan mode keep forcing `request_user_input` even after prior tool output
+    - explicit short follow-up continuations like `do so` can now resolve to `return the completed <proposed_plan> now` when the prior assistant turn was already teeing up the final plan
+  - Focused tests passed:
+    - `TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputInPlanContinuationAfterToolOutput`
+    - `TestTranslateResponsesToChatCompletionsRequest_ForcesProposedPlanReturnAfterToolOutput`
+    - existing reasoning-history replay tests still pass
+## 2026-05-02 00:36:00 +0200
+- Correction:
+  - Reverted the overfit short-continuation plan-return heuristic.
+  - Reason: replay evidence showed `do so` was already the recovery turn that could produce the correct plan, so teaching short continuation phrases was the wrong target and pushed the bridge in the wrong direction.
+  - Kept the useful part only: native `request_user_input` forcing can still survive plan continuations after prior tool output.
+  - Next real fix target remains unchanged:
+    - why the model misses the first question turn
+    - why the model misses the first completed plan turn
+## 2026-05-02 00:43:00 +0200
+- Patch intent:
+  - Target the actual first-call 35B stalls structurally.
+  - New rule set:
+    - if a native plan turn already explored via tool output but has not yet completed any `request_user_input` call, force `request_user_input`
+    - if a native plan turn already has completed `request_user_input` output, stop tool calling and force the assistant to return one complete `<proposed_plan>` block
+  - This avoids teaching continuation phrases and instead uses plan-phase state from the Responses history.
+## 2026-05-02 00:46:00 +0200
+- Verification status before deploy:
+  - Focused structural 35B tests passed:
+    - `TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputInPlanContinuationAfterToolOutput`
+    - `TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputAfterExplorationBeforeAnyQuestion`
+    - `TestTranslateResponsesToChatCompletionsRequest_ForcesProposedPlanAfterCompletedRequestUserInput`
+  - Proceeding to rebuild/copy/restart and replay the same 35B captured requests against the live bridge.
+## 2026-05-02 00:58:00 +0200
+- Expanded verification from single replays to a broad matrix:
+  - Added `TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix`.
+  - Coverage now spans 24 distinct plan/question scenarios, including:
+    - plan-mode exploration continuations across `shell`, `web_search`, and `apply_patch`
+    - explicit native-question requests with and without prior tool output
+    - completed `request_user_input` cycles forcing plan return
+    - incomplete question cycles that must *not* force plan return yet
+    - explicit specific `tool_choice` preservation on continuations
+    - Default-mode direct-plan wrapping and `update_plan` removal behavior
+    - negative cases where plan-only instructions must not leak into Default mode and vice versa
+- Matrix result:
+  - all 24 targeted scenarios passed after fixing one continuation bug
+  - specific requested tool choices are now preserved instead of being dropped on prior-tool continuations
+- Deploy status:
+  - rebuilt workspace binary
+  - stopped the running `:8080` process
+  - copied the fresh binary to `/home/admmin/bin/llama-swap`
+  - restarted successfully on `0.0.0.0:8080`
+  - verified matching hashes for workspace and deployed binaries:
+    - `73a1bb8b17c9f9023573eee5f74465ca7611387e67d8bc74439306bb5954499a`
+  - `/health` returned `status: ok`

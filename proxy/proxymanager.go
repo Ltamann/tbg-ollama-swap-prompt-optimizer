@@ -2382,6 +2382,7 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	}
 
 	hasPriorToolOutput := requestMapContainsAnyToolOutput(req)
+	hasCompletedRequestUserInputOutput := requestHasCompletedToolOutputForName(req, "request_user_input")
 	forceFinalAfterSatisfiedApplyPatch := shouldForceFinalAnswerAfterSatisfiedApplyPatch(req)
 	if hasPriorToolOutput {
 		if exactReply := extractExactFinalReplyHintFromRequest(req); exactReply != "" {
@@ -2401,25 +2402,36 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 		}
 	}
 	if !proxyPlanEnforcement && !forceFinalAfterSatisfiedApplyPatch {
-		if toolChoice, ok := req["tool_choice"]; ok {
-			if normalized := normalizeBridgeToolChoice(toolChoice); normalized != nil {
-				if !(hasPriorToolOutput && toolChoiceTargetsSpecificTool(normalized)) {
-					out["tool_choice"] = normalized
-				}
-			}
+		requestedToolChoice := normalizeBridgeToolChoice(req["tool_choice"])
+		activeToolChoice := out["tool_choice"]
+		if requestedToolChoice != nil {
+			activeToolChoice = requestedToolChoice
 		}
-		if planModeRequested &&
-			!proxyPlanEnforcement &&
+		forcePlanQuestionContinuation := planModeRequested &&
 			bridgeToolListHasFunction(normalizedTools, "request_user_input") &&
-			requestExplicitlyWantsNativeCodexQuestion(req) &&
-			!hasPriorToolOutput &&
-			!toolChoiceTargetsSpecificTool(out["tool_choice"]) {
+			(requestExplicitlyWantsNativeCodexQuestion(req) || (hasPriorToolOutput && !hasCompletedRequestUserInputOutput)) &&
+			!toolChoiceTargetsSpecificTool(activeToolChoice)
+		forcePlanReturnAfterQuestions := planModeRequested &&
+			hasCompletedRequestUserInputOutput &&
+			!toolChoiceTargetsSpecificTool(activeToolChoice)
+
+		if requestedToolChoice != nil {
+			out["tool_choice"] = requestedToolChoice
+		}
+		if forcePlanQuestionContinuation {
 			out["tool_choice"] = map[string]any{
 				"type": "function",
 				"function": map[string]any{
 					"name": "request_user_input",
 				},
 			}
+		}
+		if forcePlanReturnAfterQuestions {
+			prependSystemInstructionOnce(req,
+				"Continuation mode: the required clarifying questions have already been asked and answered. "+
+					"Do not call request_user_input again. Do not call more tools. "+
+					"Return exactly one complete <proposed_plan> block now.")
+			out["tool_choice"] = "none"
 		}
 	} else {
 		out["tool_choice"] = "none"
@@ -3024,6 +3036,11 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 		})
 	}
 	pendingReasoningText := ""
+	disableReasoningHistoryReplay := false
+	switch value := strings.TrimSpace(strings.ToLower(os.Getenv("LLAMASWAP_DISABLE_REASONING_HISTORY_REPLAY"))); value {
+	case "1", "true", "yes", "on":
+		disableReasoningHistoryReplay = true
+	}
 
 	convertOne := func(role string, content any) {
 		if content == nil {
@@ -3135,6 +3152,9 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 			case "message":
 				convertOne(fmt.Sprintf("%v", item["role"]), item["content"])
 			case "reasoning":
+				if disableReasoningHistoryReplay {
+					continue
+				}
 				summary, _ := item["summary"].([]any)
 				reasoningParts := make([]string, 0, len(summary))
 				for _, rawSummary := range summary {
@@ -6954,6 +6974,47 @@ func requestExplicitlyWantsReturnedPlan(req map[string]any) bool {
 		strings.Contains(lowerText, "using apply_patch") ||
 		strings.Contains(lowerText, "do not use shell for writing")
 	return !hasImplementIntent
+}
+
+func requestHasCompletedToolOutputForName(req map[string]any, toolName string) bool {
+	if req == nil {
+		return false
+	}
+	toolName = strings.TrimSpace(strings.ToLower(toolName))
+	if toolName == "" {
+		return false
+	}
+	items, ok := req["input"].([]any)
+	if !ok || len(items) == 0 {
+		return false
+	}
+	callNamesByID := map[string]string{}
+	completedIDs := map[string]bool{}
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["type"])))
+		callID := strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))
+		switch itemType {
+		case "function_call":
+			name := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["name"])))
+			if callID != "" && name != "" {
+				callNamesByID[callID] = name
+			}
+		case "function_call_output":
+			if callID != "" {
+				completedIDs[callID] = true
+			}
+		}
+	}
+	for callID, name := range callNamesByID {
+		if name == toolName && completedIDs[callID] {
+			return true
+		}
+	}
+	return false
 }
 
 func toolChoiceTargetsSpecificTool(raw any) bool {
