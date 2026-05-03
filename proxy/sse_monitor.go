@@ -17,6 +17,9 @@ type sseMonitor struct {
 
 	buf          []byte
 	currentEvent string
+
+	responsesReasoningDeltaCount int
+	chatReasoningDeltaCount      int
 }
 
 func newSSEMonitor(ctx context.Context, modelID string, stage string, direction string, endpoint string) *sseMonitor {
@@ -89,6 +92,7 @@ func (m *sseMonitor) emitPayload(payload string) {
 		case "response.reasoning_summary_text.delta":
 			delta := strings.TrimSpace(parsed.Get("delta").String())
 			if delta != "" {
+				m.responsesReasoningDeltaCount++
 				emitMonitor(m.ctx, m.modelID, m.stage, m.direction, m.endpoint, ev, delta, false)
 			}
 			return
@@ -113,6 +117,9 @@ func (m *sseMonitor) emitPayload(payload string) {
 			if status == "" {
 				status = strings.TrimSpace(parsed.Get("type").String())
 			}
+			if m.responsesReasoningDeltaCount > 0 {
+				status = strings.TrimSpace(status + " reasoning_deltas=" + itoa(m.responsesReasoningDeltaCount))
+			}
 			emitMonitor(m.ctx, m.modelID, m.stage, m.direction, m.endpoint, ev, status, false)
 			return
 		}
@@ -125,13 +132,36 @@ func (m *sseMonitor) emitPayload(payload string) {
 			emitMonitor(m.ctx, m.modelID, m.stage, m.direction, m.endpoint, "chat.delta.content", c, false)
 		}
 		if rc := strings.TrimSpace(delta.Get("reasoning_content").String()); rc != "" {
+			m.chatReasoningDeltaCount++
 			emitMonitor(m.ctx, m.modelID, m.stage, m.direction, m.endpoint, "chat.delta.reasoning", rc, false)
 		}
 		if fr := strings.TrimSpace(choices.Get("0.finish_reason").String()); fr != "" {
+			if m.chatReasoningDeltaCount > 0 {
+				fr = strings.TrimSpace(fr + " reasoning_deltas=" + itoa(m.chatReasoningDeltaCount))
+			}
 			emitMonitor(m.ctx, m.modelID, m.stage, m.direction, m.endpoint, "chat.finish_reason", fr, false)
 		}
 		return
 	}
 
 	emitMonitor(m.ctx, m.modelID, m.stage, m.direction, m.endpoint, ev, payload, false)
+}
+
+func itoa(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	sign := ""
+	if v < 0 {
+		sign = "-"
+		v = -v
+	}
+	var digits [20]byte
+	i := len(digits)
+	for v > 0 {
+		i--
+		digits[i] = byte('0' + (v % 10))
+		v /= 10
+	}
+	return sign + string(digits[i:])
 }

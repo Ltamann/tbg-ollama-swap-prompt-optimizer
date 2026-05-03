@@ -2272,6 +2272,21 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 		prependSystemInstructionOnce(req, profile.instruction)
 	}
 	appendSerializedAgentOrchestrationInstruction(req)
+	if requestLooksLikeTextOnlyReply(req) {
+		req["parallel_tool_calls"] = false
+		req["tool_choice"] = "none"
+		delete(req, "tools")
+	}
+	if requestMentionsAgentOrchestration(req) {
+		keepOnlyNamedTools(req, "spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent")
+	}
+	if !planModeRequested && !requestMapContainsAnyToolOutput(req) {
+		if body, err := json.Marshal(req); err == nil &&
+			shouldEnableStrictApplyPatchIntent(req, body) &&
+			!requestWantsShellInspectionBeforeApplyPatch(req) {
+			keepOnlyNamedTools(req, "apply_patch")
+		}
+	}
 
 	out := map[string]any{}
 	normalizedTools := []any(nil)
@@ -2396,11 +2411,6 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 			"Continuation mode: the previous apply_patch already produced the requested file change. "+
 				"Do not call any more tools or modify files again. Provide the final answer immediately.")
 	}
-	if len(normalizedTools) > 0 {
-		if !forceFinalAfterSatisfiedApplyPatch {
-			out["tools"] = normalizedTools
-		}
-	}
 	if !proxyPlanEnforcement && !forceFinalAfterSatisfiedApplyPatch {
 		requestedToolChoice := normalizeBridgeToolChoice(req["tool_choice"])
 		activeToolChoice := out["tool_choice"]
@@ -2433,8 +2443,24 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 					"Return exactly one complete <proposed_plan> block now.")
 			out["tool_choice"] = "none"
 		}
+		if !toolChoiceTargetsSpecificTool(out["tool_choice"]) {
+			if allowedTools := deriveContinuationAllowedToolNames(req); len(allowedTools) > 0 {
+				normalizedTools = filterBridgeToolsToAllowedNames(normalizedTools, allowedTools...)
+			}
+		}
 	} else {
 		out["tool_choice"] = "none"
+	}
+	if forcedToolName := specificToolChoiceFunctionName(out["tool_choice"]); forcedToolName != "" {
+		normalizedTools = filterBridgeToolsToFunctionName(normalizedTools, forcedToolName)
+	}
+	if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", out["tool_choice"])), "none") {
+		normalizedTools = nil
+	}
+	if len(normalizedTools) > 0 && !forceFinalAfterSatisfiedApplyPatch {
+		out["tools"] = normalizedTools
+	} else {
+		delete(out, "tools")
 	}
 	conflictResult := stripGrammarToolsConflictMap(out)
 	if hasToolRequests && !conflictResult.removedGrammar {
@@ -2526,6 +2552,45 @@ func normalizeBridgeToolChoice(raw any) any {
 	default:
 		return raw
 	}
+}
+
+func specificToolChoiceFunctionName(raw any) string {
+	choice, ok := raw.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", choice["type"])), "function") {
+		return ""
+	}
+	fn, ok := choice["function"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+}
+
+func filterBridgeToolsToFunctionName(tools []any, name string) []any {
+	name = strings.TrimSpace(name)
+	if name == "" || len(tools) == 0 {
+		return tools
+	}
+	filtered := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fn, ok := tool["function"].(map[string]any); ok {
+			if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", fn["name"])), name) {
+				filtered = append(filtered, tool)
+			}
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", tool["name"])), name) {
+			filtered = append(filtered, tool)
+		}
+	}
+	return filtered
 }
 
 func normalizeBridgeChatTools(toolsRaw []any) []any {
@@ -5347,6 +5412,31 @@ func truncateBridgeDebugText(s string, max int) string {
 	return s[:max] + "...<truncated>"
 }
 
+func buildReasoningCommentaryPreview(reasoning string) string {
+	reasoning = strings.TrimSpace(stripLeadingReasoningDirective(reasoning))
+	if reasoning == "" {
+		return ""
+	}
+	reasoning = bridgeHTMLTagRegexp.ReplaceAllString(reasoning, " ")
+	reasoning = strings.Join(strings.Fields(reasoning), " ")
+	if reasoning == "" {
+		return ""
+	}
+	const maxLen = 220
+	if len(reasoning) <= maxLen {
+		return reasoning
+	}
+	trimmed := strings.TrimSpace(reasoning[:maxLen])
+	lastBreak := strings.LastIndexAny(trimmed, ".!?;:, ")
+	if lastBreak >= 80 {
+		trimmed = strings.TrimSpace(trimmed[:lastBreak])
+	}
+	if trimmed == "" {
+		trimmed = strings.TrimSpace(reasoning[:maxLen])
+	}
+	return trimmed + " ..."
+}
+
 func summarizeChatCompletionToolCalls(body []byte) string {
 	var parts []string
 	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
@@ -5958,7 +6048,10 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 		appendApplyPatchTrace("translate.promote_reasoning_to_text", map[string]any{
 			"model": model,
 		})
-		text = reasoningText
+		text = buildReasoningCommentaryPreview(reasoningText)
+		if strings.TrimSpace(text) == "" {
+			text = reasoningText
+		}
 		reasoningText = ""
 	}
 
@@ -6397,6 +6490,55 @@ func enforceExactFinalReplyHint(responseBody []byte, hint string) []byte {
 	return out
 }
 
+func collapsePreToolAssistantMessages(output []any) []any {
+	if len(output) < 3 {
+		return output
+	}
+	firstToolIndex := -1
+	for idx, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemType := strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
+		if itemType == "function_call" ||
+			itemType == "shell_call" ||
+			itemType == "apply_patch_call" ||
+			itemType == "mcp_tool_call" ||
+			itemType == "custom_tool_call" ||
+			itemType == "web_search_call" ||
+			itemType == "file_search_call" ||
+			itemType == "code_interpreter_call" ||
+			itemType == "image_generation_call" ||
+			itemType == "computer_call" {
+			firstToolIndex = idx
+			break
+		}
+	}
+	if firstToolIndex <= 1 {
+		return output
+	}
+	seenAssistantMessage := false
+	collapsed := make([]any, 0, len(output))
+	for idx, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			collapsed = append(collapsed, raw)
+			continue
+		}
+		if idx < firstToolIndex &&
+			strings.TrimSpace(fmt.Sprintf("%v", item["type"])) == "message" &&
+			strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["role"])), "assistant") {
+			if seenAssistantMessage {
+				continue
+			}
+			seenAssistantMessage = true
+		}
+		collapsed = append(collapsed, raw)
+	}
+	return collapsed
+}
+
 func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedReasoningSummary string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -6493,8 +6635,33 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 	if needsContinuation {
 		full["status"] = "requires_action"
 	}
+	buildToolValidationMessageItem := func(outputIndex int, warning string) map[string]any {
+		return map[string]any{
+			"id":   fmt.Sprintf("msg_%s_tool_validation_%d", respID, outputIndex),
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{
+					"type": "output_text",
+					"text": warning,
+				},
+			},
+		}
+	}
+	isShellLikeToolItem := func(item map[string]any) bool {
+		itemType := strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
+		if strings.EqualFold(itemType, "shell_call") {
+			return true
+		}
+		if !strings.EqualFold(itemType, "function_call") {
+			return false
+		}
+		name := strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
+		return strings.EqualFold(name, "shell") || strings.EqualFold(name, "shell_command")
+	}
 	output := gjson.GetBytes(responseJSON, "output").Array()
 	normalizedOutput := make([]any, 0, len(output))
+	hasValidToolCall := false
 	for _, itemResult := range output {
 		item := map[string]any{}
 		if err := json.Unmarshal([]byte(itemResult.Raw), &item); err != nil {
@@ -6540,6 +6707,11 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 				item["input"] = input
 			}
 		}
+		if isShellLikeToolItem(item) {
+			if ok, warning := validateBridgeToolCallItem(item); !ok {
+				item = buildToolValidationMessageItem(outputIndex, warning)
+			}
+		}
 		addedItem := item
 		itemType := strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
 		if itemType == "function_call" ||
@@ -6552,6 +6724,7 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 			itemType == "code_interpreter_call" ||
 			itemType == "image_generation_call" ||
 			itemType == "computer_call" {
+			hasValidToolCall = true
 			if _, ok := addedItem["id"]; !ok {
 				addedItem = cloneMap(item)
 			}
@@ -6710,7 +6883,8 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 		normalizedOutput = append(normalizedOutput, doneItem)
 		if itemType == "reasoning" {
 			reasoningText := strings.TrimSpace(extractResponsesInputText(item["summary"]))
-			if reasoningText != "" {
+			commentaryText := buildReasoningCommentaryPreview(reasoningText)
+			if commentaryText != "" {
 				commentaryOutputIndex := len(normalizedOutput)
 				commentaryItemID := fmt.Sprintf("msg_%s_%d", respID, commentaryOutputIndex)
 				commentaryItem := map[string]any{
@@ -6719,7 +6893,7 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 					"role":    "assistant",
 					"channel": "commentary",
 					"content": []any{
-						map[string]any{"type": "output_text", "text": reasoningText},
+						map[string]any{"type": "output_text", "text": commentaryText},
 					},
 				}
 				writeEvent("response.output_item.added", map[string]any{
@@ -6747,21 +6921,21 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 					"item_id":       commentaryItemID,
 					"output_index":  commentaryOutputIndex,
 					"content_index": 0,
-					"delta":         reasoningText,
+					"delta":         commentaryText,
 				})
 				writeEvent("response.output_text.done", map[string]any{
 					"response_id":   respID,
 					"item_id":       commentaryItemID,
 					"output_index":  commentaryOutputIndex,
 					"content_index": 0,
-					"text":          reasoningText,
+					"text":          commentaryText,
 				})
 				writeEvent("response.content_part.done", map[string]any{
 					"response_id":   respID,
 					"item_id":       commentaryItemID,
 					"output_index":  commentaryOutputIndex,
 					"content_index": 0,
-					"part":          map[string]any{"type": "output_text", "text": reasoningText},
+					"part":          map[string]any{"type": "output_text", "text": commentaryText},
 				})
 				writeEvent("response.output_item.done", map[string]any{
 					"response_id":  respID,
@@ -6773,7 +6947,11 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 		}
 	}
 	if len(normalizedOutput) > 0 {
+		normalizedOutput = collapsePreToolAssistantMessages(normalizedOutput)
 		full["output"] = normalizedOutput
+	}
+	if needsContinuation && !hasValidToolCall {
+		full["status"] = "completed"
 	}
 
 	// Always finish the SSE stream with a `response.completed` event. If a tool
@@ -7015,6 +7193,157 @@ func requestHasCompletedToolOutputForName(req map[string]any, toolName string) b
 		}
 	}
 	return false
+}
+
+func extractCompletedToolNamesFromRequest(req map[string]any) []string {
+	if req == nil {
+		return nil
+	}
+	items, ok := req["input"].([]any)
+	if !ok || len(items) == 0 {
+		return nil
+	}
+	callNamesByID := map[string]string{}
+	completedOrdered := make([]string, 0, 4)
+	completedSet := map[string]struct{}{}
+	appendCompleted := func(name string) {
+		name = normalizeToolTierName(name)
+		if name == "" {
+			return
+		}
+		if _, exists := completedSet[name]; exists {
+			return
+		}
+		completedSet[name] = struct{}{}
+		completedOrdered = append(completedOrdered, name)
+	}
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", item["type"])))
+		callID := strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))
+		switch itemType {
+		case "function_call", "custom_tool_call":
+			name := normalizeToolTierName(strings.TrimSpace(fmt.Sprintf("%v", item["name"])))
+			if callID != "" && name != "" {
+				callNamesByID[callID] = name
+			}
+		case "apply_patch_call":
+			if callID != "" {
+				callNamesByID[callID] = "apply_patch"
+			}
+		case "shell_call":
+			if callID != "" {
+				callNamesByID[callID] = "shell"
+			}
+		case "function_call_output", "custom_tool_call_output":
+			if callID != "" {
+				appendCompleted(callNamesByID[callID])
+			}
+		case "apply_patch_call_output":
+			appendCompleted("apply_patch")
+		case "shell_call_output":
+			appendCompleted("shell")
+		}
+	}
+	return completedOrdered
+}
+
+func completedToolNamesContain(names []string, want string) bool {
+	want = normalizeToolTierName(want)
+	for _, name := range names {
+		if normalizeToolTierName(name) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func allCompletedToolNamesWithinSet(names []string, allowed ...string) bool {
+	if len(names) == 0 {
+		return false
+	}
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, name := range allowed {
+		normalized := normalizeToolTierName(name)
+		if normalized != "" {
+			allowedSet[normalized] = struct{}{}
+		}
+	}
+	if len(allowedSet) == 0 {
+		return false
+	}
+	for _, name := range names {
+		if _, ok := allowedSet[normalizeToolTierName(name)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func filterBridgeToolsToAllowedNames(tools []any, allowedNames ...string) []any {
+	if len(tools) == 0 || len(allowedNames) == 0 {
+		return tools
+	}
+	allowedSet := make(map[string]struct{}, len(allowedNames))
+	for _, name := range allowedNames {
+		normalized := normalizeToolTierName(name)
+		if normalized != "" {
+			allowedSet[normalized] = struct{}{}
+		}
+	}
+	if len(allowedSet) == 0 {
+		return tools
+	}
+	filtered := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := normalizeToolTierName(extractFunctionToolName(tool))
+		if name == "" {
+			name = normalizeToolTierName(strings.TrimSpace(fmt.Sprintf("%v", tool["type"])))
+		}
+		if _, ok := allowedSet[name]; ok {
+			filtered = append(filtered, tool)
+		}
+	}
+	if len(filtered) == 0 {
+		return tools
+	}
+	return filtered
+}
+
+func deriveContinuationAllowedToolNames(req map[string]any) []string {
+	if req == nil || !requestMapContainsAnyToolOutput(req) {
+		return nil
+	}
+	completed := extractCompletedToolNamesFromRequest(req)
+	if requestMentionsAgentOrchestration(req) || allCompletedToolNamesWithinSet(completed, "spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent") {
+		return []string{"spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent"}
+	}
+	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	wantsShell := strings.Contains(text, "shell") || strings.Contains(text, "verify with shell") || strings.Contains(text, "use shell")
+	wantsPatchFamily := requestInputMentionsApplyPatch(req) || requestWantsShellInspectionBeforeApplyPatch(req) || completedToolNamesContain(completed, "apply_patch")
+	if wantsPatchFamily {
+		allowed := make([]string, 0, 2)
+		if completedToolNamesContain(completed, "shell") || wantsShell || requestWantsShellInspectionBeforeApplyPatch(req) {
+			allowed = append(allowed, "shell")
+		}
+		if requestInputMentionsApplyPatch(req) || completedToolNamesContain(completed, "apply_patch") {
+			allowed = append(allowed, "apply_patch")
+		}
+		if len(allowed) > 0 {
+			return allowed
+		}
+	}
+	if len(completed) == 1 && completedToolNamesContain(completed, "shell") {
+		return []string{"shell"}
+	}
+	return nil
 }
 
 func toolChoiceTargetsSpecificTool(raw any) bool {
@@ -8251,6 +8580,7 @@ func requestMentionsAgentOrchestration(req map[string]any) bool {
 		strings.Contains(text, "resume_agent") ||
 		strings.Contains(text, "close_agent") ||
 		strings.Contains(text, "send_input") ||
+		strings.Contains(text, "child") ||
 		strings.Contains(text, "child agent") ||
 		strings.Contains(text, "subagent")
 	if !hasAgentVerb {
@@ -8293,6 +8623,48 @@ func appendSerializedAgentOrchestrationInstruction(req map[string]any) {
 	}
 	prependSystemInstructionOnce(req, instruction)
 	req["parallel_tool_calls"] = false
+}
+
+func keepOnlyNamedTools(req map[string]any, allowedNames ...string) bool {
+	if req == nil || len(allowedNames) == 0 {
+		return false
+	}
+	tools, ok := req["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return false
+	}
+	allowed := make(map[string]struct{}, len(allowedNames))
+	for _, name := range allowedNames {
+		normalized := normalizeToolTierName(name)
+		if normalized == "" {
+			continue
+		}
+		allowed[normalized] = struct{}{}
+	}
+	if len(allowed) == 0 {
+		return false
+	}
+	filtered := make([]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := normalizeToolTierName(extractFunctionToolName(tool))
+		if name == "" {
+			toolType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", tool["type"])))
+			name = normalizeToolTierName(toolType)
+		}
+		if _, ok := allowed[name]; ok {
+			filtered = append(filtered, tool)
+		}
+	}
+	if len(filtered) == 0 {
+		return false
+	}
+	req["tools"] = filtered
+	delete(req, "tool_choice")
+	return true
 }
 
 func appendEmptyPostToolRecoveryInstruction(req map[string]any) {
@@ -8347,6 +8719,57 @@ func extractExactFinalReplyHintFromRequestBody(body []byte) string {
 		return ""
 	}
 	return extractExactFinalReplyHintFromRequest(req)
+}
+
+func requestLooksLikeTextOnlyReply(req map[string]any) bool {
+	if req == nil || requestMapContainsAnyToolOutput(req) {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if text == "" {
+		return false
+	}
+	exactReply := extractExactFinalReplyHintFromRequest(req)
+	hasReplyOnlyIntent := exactReply != "" ||
+		strings.Contains(text, "reply exactly") ||
+		strings.Contains(text, "answer exactly") ||
+		strings.Contains(text, "acknowledge receipt and reply") ||
+		strings.Contains(text, "reply with")
+	if !hasReplyOnlyIntent {
+		return false
+	}
+	toolIntentMarkers := []string{
+		"apply_patch",
+		"shell",
+		"web search",
+		"web_search",
+		"file search",
+		"file_search",
+		"code interpreter",
+		"code_interpreter",
+		"image generation",
+		"image_generation",
+		"computer",
+		"playwright",
+		"browser_",
+		"spawn_agent",
+		"send_input",
+		"resume_agent",
+		"wait_agent",
+		"close_agent",
+		"request_user_input",
+		"update_plan",
+		"navigate to",
+		"take screenshot",
+		"use shell",
+		"use apply_patch",
+	}
+	for _, marker := range toolIntentMarkers {
+		if strings.Contains(text, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 func requestWantsShellInspectionBeforeApplyPatch(req map[string]any) bool {
@@ -8434,36 +8857,7 @@ func appendShellInspectionBeforeApplyPatchInstruction(req map[string]any) {
 }
 
 func keepOnlyShellTools(req map[string]any) bool {
-	if req == nil {
-		return false
-	}
-	tools, ok := req["tools"].([]any)
-	if !ok || len(tools) == 0 {
-		return false
-	}
-	filtered := make([]any, 0, len(tools))
-	for _, raw := range tools {
-		tool, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		toolType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", tool["type"])))
-		name := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", tool["name"])))
-		if name == "" {
-			if fn, ok := tool["function"].(map[string]any); ok {
-				name = strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", fn["name"])))
-			}
-		}
-		if toolType == "shell" || name == "shell" || name == "exec_command" || name == "shellcommand" {
-			filtered = append(filtered, tool)
-		}
-	}
-	if len(filtered) == 0 {
-		return false
-	}
-	req["tools"] = filtered
-	delete(req, "tool_choice")
-	return true
+	return keepOnlyNamedTools(req, "shell", "exec_command", "shellcommand")
 }
 
 func responseMentionsApplyPatch(responseBody []byte) bool {
@@ -9710,7 +10104,9 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			reasoningSeen = true
 			startReasoningIfNeeded()
 			startCommentaryIfNeeded()
+			previousCommentaryPreview := buildReasoningCommentaryPreview(reasoningText.String())
 			reasoningText.WriteString(reasoningDelta)
+			nextCommentaryPreview := buildReasoningCommentaryPreview(reasoningText.String())
 			writeEvent("response.reasoning_summary_text.delta", map[string]any{
 				"response_id":   respID,
 				"item_id":       reasoningItemID,
@@ -9718,13 +10114,19 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 				"summary_index": 0,
 				"delta":         reasoningDelta,
 			})
-			writeEvent("response.output_text.delta", map[string]any{
-				"response_id":   respID,
-				"item_id":       commentaryMsgID,
-				"output_index":  commentaryOutputIndex,
-				"content_index": 0,
-				"delta":         reasoningDelta,
-			})
+			commentaryDelta := nextCommentaryPreview
+			if previousCommentaryPreview != "" && strings.HasPrefix(nextCommentaryPreview, previousCommentaryPreview) {
+				commentaryDelta = strings.TrimPrefix(nextCommentaryPreview, previousCommentaryPreview)
+			}
+			if commentaryDelta != "" {
+				writeEvent("response.output_text.delta", map[string]any{
+					"response_id":   respID,
+					"item_id":       commentaryMsgID,
+					"output_index":  commentaryOutputIndex,
+					"content_index": 0,
+					"delta":         commentaryDelta,
+				})
+			}
 			continue
 		}
 		fullText.WriteString(delta)
@@ -9747,13 +10149,18 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 
 	finalText := strings.TrimSpace(fullText.String())
 	reasoningDoneText := strings.TrimSpace(reasoningText.String())
+	commentaryReasoningText := buildReasoningCommentaryPreview(reasoningDoneText)
 	promotedReasoning := false
 	if !isPlanMode && strings.TrimSpace(finalText) == "" && reasoningDoneText != "" && len(toolOrder) == 0 {
 		// Codex clients may hide reasoning lanes. If upstream produced reasoning-only output,
 		// surface it on the normal output_text lane to avoid empty assistant messages.
 		promotedReasoning = true
-		finalText = reasoningDoneText
+		finalText = commentaryReasoningText
+		if strings.TrimSpace(finalText) == "" {
+			finalText = reasoningDoneText
+		}
 		reasoningDoneText = ""
+		commentaryReasoningText = ""
 		startMessageIfNeeded()
 		writeEvent("response.output_text.delta", map[string]any{
 			"response_id":   respID,
@@ -9844,14 +10251,14 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			"item_id":       commentaryMsgID,
 			"output_index":  commentaryOutputIndex,
 			"content_index": 0,
-			"text":          reasoningDoneText,
+			"text":          commentaryReasoningText,
 		})
 		writeEvent("response.content_part.done", map[string]any{
 			"response_id":   respID,
 			"item_id":       commentaryMsgID,
 			"output_index":  commentaryOutputIndex,
 			"content_index": 0,
-			"part":          map[string]any{"type": "output_text", "text": reasoningDoneText},
+			"part":          map[string]any{"type": "output_text", "text": commentaryReasoningText},
 		})
 		commentaryItem = map[string]any{
 			"id":      commentaryMsgID,
@@ -9859,7 +10266,7 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			"role":    "assistant",
 			"channel": "commentary",
 			"content": []any{
-				map[string]any{"type": "output_text", "text": reasoningDoneText},
+				map[string]any{"type": "output_text", "text": commentaryReasoningText},
 			},
 		}
 		writeEvent("response.output_item.done", map[string]any{

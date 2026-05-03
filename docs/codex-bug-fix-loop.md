@@ -48,6 +48,9 @@ Primary captures:
 - Corrected finding:
   - reasoning is emitted in valid Responses event shape
   - in the investigated runs it appears as one buffered summary delta, not a continuous stream during execution
+- Latest repair status:
+  - bridge stream paths still forward each upstream reasoning chunk as its own native `response.reasoning_summary_text.delta`
+  - SSE monitor output now annotates completion/finish events with `reasoning_deltas=<n>` so buffered-upstream behavior can be distinguished from bridge-side coalescing
 
 ### B4: reasoning/commentary duplication
 
@@ -56,6 +59,9 @@ Primary captures:
   - the user-visible comment is coming from `commentary`
   - native reasoning is still emitted separately
   - duplication is expected until native reasoning UI becomes reliable
+- Latest repair status:
+  - commentary now mirrors a shortened reasoning preview instead of replaying the full reasoning chain verbatim
+  - native `reasoning` items still preserve the full reasoning summary lane
 
 ### B5: native reasoning panel suppression
 
@@ -66,10 +72,13 @@ Primary captures:
 
 ### B6: reasoning-history contamination
 
-- Status: risk, not proven
+- Status: mitigated in bridge output, replay causation still not fully proven
 - Corrected finding:
   - full reasoning in commentary may pollute replayed assistant history
   - the current captures do not yet prove that replay path
+- Latest repair status:
+  - non-stream reasoning promotion now uses a shortened preview instead of full reasoning text
+  - non-stream and chat-SSE commentary lanes now emit shortened reasoning previews instead of full chains
 
 ## Repair Order
 

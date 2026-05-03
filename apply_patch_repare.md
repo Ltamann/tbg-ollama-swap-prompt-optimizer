@@ -312,3 +312,37 @@
   - verified matching hashes for workspace and deployed binaries:
     - `73a1bb8b17c9f9023573eee5f74465ca7611387e67d8bc74439306bb5954499a`
   - `/health` returned `status: ok`
+## 2026-05-02 07:48:00 +0200
+- New repair intent for `B01` backend 502s:
+  - Focus the first patch on payload minimization without changing tool semantics.
+  - Observation from live bridge traces:
+    - narrow turns like native question continuations and strict apply_patch retries still forward the full translated tool catalog
+    - those payloads are among the requests correlated with unstable upstream 502 behavior
+  - Patch hypothesis:
+    - when bridge translation has already forced a specific function tool choice, keep only that tool in the translated upstream request
+    - when bridge translation forces `tool_choice="none"`, remove translated tools entirely
+  - Expected impact:
+    - smaller translated chat payloads on continuation/retry turns
+    - lower upstream churn for plan/question and apply_patch recovery requests
+    - no behavior change for auto-tool turns
+## 2026-05-02 08:13:00 +0200
+- `B01` iteration 1 outcome:
+  - Implemented bridge-side tool pruning when translation already forces a specific function tool choice.
+  - Also remove translated tools entirely when bridge forces `tool_choice="none"`.
+  - Added focused tests:
+    - `TestTranslateResponsesToChatCompletionsRequest_CodexManagedPlanModePrefersRequestUserInputTool`
+    - `TestTranslateResponsesToChatCompletionsRequest_PrunesToolsToForcedSpecificToolChoice`
+  - Targeted Go tests passed.
+- Live validation notes:
+  - The normal launcher path still points at `/home/admmin/bin/llama-swap`, and that deployed copy did not update cleanly because replacement of the running binary kept failing.
+  - For validation, the service was launched directly from the rebuilt workspace binary:
+    - `/home/admmin/llama-swap/llama-swap-main/llama-swap`
+  - Focused `B01` repro loop improved materially:
+    - `T50` no longer produced backend `502` rows and once completed in a single `200` request
+    - `T52` repeatedly ran with `200`-only backend rows
+    - remaining backend `502`s are now concentrated in `T55` and `T57`
+  - Interpretation:
+    - pruning forced-tool turns reduced one real `502` cluster
+    - the remaining `502` path is likely tied to auto-tool turns, especially agent orchestration and some apply_patch continuation cases
+  - Next likely target:
+    - narrow or stabilize auto-tool exposure on the remaining `T55` / `T57` paths without relying on prompt-specific heuristics

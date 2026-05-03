@@ -1,5 +1,8 @@
 # llama-swap Tool Calling Design (vLLM-aligned)
 
+Related investigation:
+- See [harness-forensics-remediation-report.md](harness-forensics-remediation-report.md) for the Pi/OpenCode/`llama-swap` harness comparison and the recommended adapter-oriented remediation direction.
+
 ## Interfaces
 ```go
 type ParsedToolCall struct {

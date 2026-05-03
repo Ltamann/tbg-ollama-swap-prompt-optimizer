@@ -799,6 +799,42 @@ func TestTranslateChatCompletionToResponsesResponse_PromotesReasoningWhenContent
 	assert.Equal(t, "only reasoning", gjson.GetBytes(out, "output.0.content.0.text").String())
 }
 
+func TestBuildReasoningCommentaryPreview_TruncatesAndStripsTags(t *testing.T) {
+	input := "<think>\nThis is a long internal reasoning chain with extra whitespace. " +
+		strings.Repeat("detail ", 60) + "\n</think>"
+
+	got := buildReasoningCommentaryPreview(input)
+	assert.NotContains(t, got, "<think>")
+	assert.NotContains(t, got, "</think>")
+	assert.Less(t, len(got), len(input))
+	assert.Contains(t, got, "This is a long internal reasoning chain")
+	assert.Contains(t, got, "...")
+}
+
+func TestTranslateChatCompletionToResponsesResponse_PromotesReasoningPreviewWhenContentEmptyLong(t *testing.T) {
+	longReasoning := "I am thinking through the task carefully. " + strings.Repeat("step detail ", 40) + "final hidden thought"
+	body := []byte(`{
+	  "id": "chatcmpl-reasoning-only-long",
+	  "model": "qwen-test",
+	  "choices": [{
+	    "message": {
+	      "role": "assistant",
+	      "content": "",
+	      "reasoning_content": "` + longReasoning + `"
+	    },
+	    "finish_reason": "stop"
+	  }]
+	}`)
+
+	out, err := translateChatCompletionToResponsesResponse(body, "", "", "")
+	require.NoError(t, err)
+
+	preview := buildReasoningCommentaryPreview(longReasoning)
+	assert.Equal(t, preview, gjson.GetBytes(out, "output_text").String())
+	assert.Equal(t, preview, gjson.GetBytes(out, "output.0.content.0.text").String())
+	assert.NotContains(t, gjson.GetBytes(out, "output_text").String(), "final hidden thought")
+}
+
 func TestTranslateChatCompletionToResponsesResponse_StripsThinkFromMergedContent(t *testing.T) {
 	body := []byte(`{
 	  "id": "chatcmpl-reasoning-merged",
@@ -3433,6 +3469,7 @@ func TestWriteResponsesStreamFromChatSSE_StreamsReasoningIntoCommentaryAndKeepsF
 	require.NoError(t, err)
 
 	body := rec.Body.String()
+	preview := buildReasoningCommentaryPreview("The user wants a plan.")
 	assert.Contains(t, body, `"output_index":0`)
 	assert.Contains(t, body, `"type":"reasoning"`)
 	assert.Contains(t, body, `"output_index":1`)
@@ -3441,9 +3478,31 @@ func TestWriteResponsesStreamFromChatSSE_StreamsReasoningIntoCommentaryAndKeepsF
 	assert.Contains(t, body, `"channel":"final"`)
 	assert.Contains(t, body, `"reasoning":{"summary":"detailed"}`)
 	assert.Contains(t, body, `"summary_mode":"detailed"`)
-	assert.Contains(t, body, `The user wants a plan.`)
+	assert.Contains(t, body, preview)
 	assert.Contains(t, body, `Here's a plan for a small, fun math game:`)
 	assert.NotContains(t, body, `</think>`)
+}
+
+func TestWriteResponsesStreamFromChatSSE_CommentaryUsesReasoningPreview(t *testing.T) {
+	reasoning := "The user wants a plan. " + strings.Repeat("detail ", 50) + "tail marker"
+	preview := buildReasoningCommentaryPreview(reasoning)
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl-workaround-preview","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"` + reasoning + `"},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl-workaround-preview","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Short final answer."},"finish_reason":null}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	err := writeResponsesStreamFromChatSSE(rec, strings.NewReader(upstream), false, "detailed")
+	require.NoError(t, err)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, preview)
+	assert.NotContains(t, body, `"channel":"commentary","content":[{"type":"output_text","text":"`+reasoning+`"}]`)
+	assert.Contains(t, body, "tail marker")
 }
 
 func TestWriteResponsesStream_ReplaysReasoningItems(t *testing.T) {
@@ -3476,6 +3535,30 @@ func TestWriteResponsesStream_ReplaysReasoningItems(t *testing.T) {
 	assert.Contains(t, body, `"channel":"commentary"`)
 	assert.Contains(t, body, "thinking one")
 	assert.Contains(t, body, "answer one")
+}
+
+func TestWriteResponsesStream_ReplaysReasoningItemsWithShortCommentaryPreview(t *testing.T) {
+	reasoning := "thinking one " + strings.Repeat("detail ", 50) + "tail marker"
+	preview := buildReasoningCommentaryPreview(reasoning)
+	responseJSON := []byte(`{
+	  "id":"resp_reasoning_stream_preview",
+	  "object":"response",
+	  "created_at":123,
+	  "model":"qwen-test",
+	  "status":"completed",
+	  "output":[
+	    {"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"` + reasoning + `"}]},
+	    {"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer one"}]}
+	  ],
+	  "output_text":"answer one"
+	}`)
+
+	rec := httptest.NewRecorder()
+	writeResponsesStream(rec, responseJSON, "detailed")
+
+	body := rec.Body.String()
+	assert.Contains(t, body, preview)
+	assert.NotContains(t, body, `"channel":"commentary","content":[{"type":"output_text","text":"`+reasoning+`"}]`)
 }
 
 func TestWriteResponsesStreamFromChatSSE_EmitsToolCallArgumentDeltas(t *testing.T) {
@@ -3541,7 +3624,7 @@ func TestWriteResponsesStreamFromChatSSE_EmitsEachReasoningChunkWithoutCoalescin
 	assert.Contains(t, body, `"delta":"second chunk"`)
 	assert.Equal(t, 2, strings.Count(body, "event: response.reasoning_summary_text.delta"))
 	assert.Contains(t, body, `"channel":"commentary"`)
-	assert.Contains(t, body, `"text":"first chunk second chunk"`)
+	assert.Contains(t, body, `"text":"`+buildReasoningCommentaryPreview("first chunk second chunk")+`"`)
 	assert.Contains(t, body, "final answer")
 }
 
@@ -4147,9 +4230,341 @@ func TestTranslateResponsesToChatCompletionsRequest_CodexManagedPlanModePrefersR
 	assert.Contains(t, text, "Arguments must contain a questions array with exactly one short question")
 	assert.Contains(t, text, `"tool_choice":{"function":{"name":"request_user_input"},"type":"function"}`)
 	assert.Contains(t, text, `"name":"request_user_input"`)
-	assert.Contains(t, text, `"name":"update_plan"`)
-	assert.Contains(t, text, `"name":"shell"`)
+	assert.NotContains(t, text, `"name":"update_plan"`)
+	assert.NotContains(t, text, `"name":"shell"`)
 	assert.NotContains(t, text, `"name":"apply_patch"`)
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_PrunesToolsToForcedSpecificToolChoice(t *testing.T) {
+	body := []byte(`{
+	  "model":"gpt-5.2",
+	  "stream":false,
+	  "tools":[
+	    {"type":"function","function":{"name":"request_user_input"}},
+	    {"type":"function","function":{"name":"apply_patch"}},
+	    {"type":"function","function":{"name":"shell"}}
+	  ],
+	  "tool_choice":{"type":"function","function":{"name":"request_user_input"}},
+	  "input":[
+	    {
+	      "type":"message",
+	      "role":"user",
+	      "content":[{"type":"input_text","text":"Ask one native clarifying question."}]
+	    }
+	  ]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	text := string(out)
+	assert.Contains(t, text, `"tool_choice":{"function":{"name":"request_user_input"},"type":"function"}`)
+	assert.Contains(t, text, `"name":"request_user_input"`)
+	assert.NotContains(t, text, `"name":"apply_patch"`)
+	assert.NotContains(t, text, `"name":"shell"`)
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_PrunesStrictApplyPatchIntentTools(t *testing.T) {
+	body := []byte(`{
+	  "model":"gpt-5.2",
+	  "stream":false,
+	  "tools":[
+	    {"type":"function","function":{"name":"apply_patch"}},
+	    {"type":"function","function":{"name":"shell"}},
+	    {"type":"function","function":{"name":"spawn_agent"}}
+	  ],
+	  "tool_choice":"auto",
+	  "parallel_tool_calls":true,
+	  "input":[
+	    {
+	      "type":"message",
+	      "role":"user",
+	      "content":[{"type":"input_text","text":"Use apply_patch to update /tmp/demo.txt by appending PATCH_OK. Then reply exactly DONE."}]
+	    }
+	  ]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	text := string(out)
+	assert.Contains(t, text, `"name":"apply_patch"`)
+	assert.NotContains(t, text, `"name":"shell"`)
+	assert.NotContains(t, text, `"name":"spawn_agent"`)
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_PrunesExplicitAgentOrchestrationTools(t *testing.T) {
+	body := []byte(`{
+	  "model":"gpt-5.2",
+	  "stream":false,
+	  "tools":[
+	    {"type":"function","function":{"name":"spawn_agent"}},
+	    {"type":"function","function":{"name":"send_input"}},
+	    {"type":"function","function":{"name":"resume_agent"}},
+	    {"type":"function","function":{"name":"wait_agent"}},
+	    {"type":"function","function":{"name":"close_agent"}},
+	    {"type":"function","function":{"name":"apply_patch"}},
+	    {"type":"function","function":{"name":"shell"}},
+	    {"type":"function","function":{"name":"mcp__playwright__browser_navigate"}}
+	  ],
+	  "tool_choice":"auto",
+	  "parallel_tool_calls":true,
+	  "input":[
+	    {
+	      "type":"message",
+	      "role":"user",
+	      "content":[{"type":"input_text","text":"Variation C: spawn one child, wait for completion, and if resume is needed use it explicitly before ending with exactly AGENT_DONE."}]
+	    }
+	  ]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	text := string(out)
+	assert.Contains(t, text, `"parallel_tool_calls":false`)
+	assert.Contains(t, text, `"name":"spawn_agent"`)
+	assert.Contains(t, text, `"name":"wait_agent"`)
+	assert.Contains(t, text, `"name":"resume_agent"`)
+	assert.Contains(t, text, `"name":"send_input"`)
+	assert.Contains(t, text, `"name":"close_agent"`)
+	toolNames := gjson.GetBytes(out, "tools.#.function.name").Array()
+	serialized := make([]string, 0, len(toolNames))
+	for _, name := range toolNames {
+		serialized = append(serialized, name.String())
+	}
+	assert.NotContains(t, serialized, "apply_patch")
+	assert.NotContains(t, serialized, "shell")
+	assert.NotContains(t, serialized, "mcp__playwright__browser_navigate")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_KeepsAgentPruningAfterPriorToolOutput(t *testing.T) {
+	body := []byte(`{
+	  "model":"gpt-5.2",
+	  "stream":false,
+	  "tools":[
+	    {"type":"function","function":{"name":"spawn_agent"}},
+	    {"type":"function","function":{"name":"send_input"}},
+	    {"type":"function","function":{"name":"resume_agent"}},
+	    {"type":"function","function":{"name":"wait_agent"}},
+	    {"type":"function","function":{"name":"close_agent"}},
+	    {"type":"function","function":{"name":"apply_patch"}},
+	    {"type":"function","function":{"name":"shell"}},
+	    {"type":"function","function":{"name":"mcp__playwright__browser_navigate"}}
+	  ],
+	  "tool_choice":"auto",
+	  "parallel_tool_calls":true,
+	  "input":[
+	    {
+	      "type":"message",
+	      "role":"user",
+	      "content":[{"type":"input_text","text":"Variation C: spawn one child, wait for completion, and if resume is needed use it explicitly before ending with exactly AGENT_DONE."}]
+	    },
+	    {
+	      "type":"function_call",
+	      "name":"shell",
+	      "arguments":"{\"command\":[\"rg\",\"--files\"]}",
+	      "call_id":"call_1"
+	    },
+	    {
+	      "type":"function_call_output",
+	      "call_id":"call_1",
+	      "output":"hello.txt"
+	    }
+	  ]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	text := string(out)
+	assert.Contains(t, text, `"parallel_tool_calls":false`)
+	assert.Contains(t, text, `"name":"spawn_agent"`)
+	assert.Contains(t, text, `"name":"wait_agent"`)
+	assert.Contains(t, text, `"name":"resume_agent"`)
+	assert.Contains(t, text, `"name":"send_input"`)
+	assert.Contains(t, text, `"name":"close_agent"`)
+	toolNames := gjson.GetBytes(out, "tools.#.function.name").Array()
+	serialized := make([]string, 0, len(toolNames))
+	for _, name := range toolNames {
+		serialized = append(serialized, name.String())
+	}
+	assert.NotContains(t, serialized, "apply_patch")
+	assert.NotContains(t, serialized, "shell")
+	assert.NotContains(t, serialized, "mcp__playwright__browser_navigate")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_StripsToolsForTextOnlyExactReply(t *testing.T) {
+	body := []byte(`{
+	  "model":"gpt-5.2",
+	  "stream":false,
+	  "tools":[
+	    {"type":"function","function":{"name":"shell"}},
+	    {"type":"function","function":{"name":"apply_patch"}},
+	    {"type":"function","function":{"name":"spawn_agent"}}
+	  ],
+	  "tool_choice":"auto",
+	  "parallel_tool_calls":true,
+	  "input":[
+	    {
+	      "type":"message",
+	      "role":"user",
+	      "content":[{"type":"input_text","text":"Reply exactly MT00_READY"}]
+	    }
+	  ]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	text := string(out)
+	assert.Contains(t, text, `"tool_choice":"none"`)
+	assert.Contains(t, text, `"parallel_tool_calls":false`)
+	assert.NotContains(t, text, `"name":"shell"`)
+	assert.NotContains(t, text, `"name":"apply_patch"`)
+	assert.NotContains(t, text, `"name":"spawn_agent"`)
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_StripsToolsForAcknowledgeAndReplyPrompt(t *testing.T) {
+	body := []byte(`{
+	  "model":"gpt-5.2",
+	  "stream":false,
+	  "tools":[
+	    {"type":"function","function":{"name":"shell"}},
+	    {"type":"function","function":{"name":"apply_patch"}},
+	    {"type":"function","function":{"name":"spawn_agent"}}
+	  ],
+	  "tool_choice":"auto",
+	  "parallel_tool_calls":true,
+	  "input":[
+	    {
+	      "type":"message",
+	      "role":"user",
+	      "content":[{"type":"input_text","text":"Acknowledge receipt and reply with \"Child agent done.\""}]
+	    }
+	  ]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	text := string(out)
+	assert.Contains(t, text, `"tool_choice":"none"`)
+	assert.Contains(t, text, `"parallel_tool_calls":false`)
+	assert.NotContains(t, text, `"name":"shell"`)
+	assert.NotContains(t, text, `"name":"apply_patch"`)
+	assert.NotContains(t, text, `"name":"spawn_agent"`)
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_ContinuationKeepsExecutionSubset(t *testing.T) {
+	body := []byte(`{
+	  "model":"gpt-5.2",
+	  "stream":false,
+	  "tools":[
+	    {"type":"function","function":{"name":"shell"}},
+	    {"type":"function","function":{"name":"apply_patch"}},
+	    {"type":"function","function":{"name":"spawn_agent"}},
+	    {"type":"function","function":{"name":"wait_agent"}},
+	    {"type":"function","function":{"name":"mcp__playwright__browser_navigate"}}
+	  ],
+	  "tool_choice":"auto",
+	  "parallel_tool_calls":true,
+	  "input":[
+	    {
+	      "type":"message",
+	      "role":"user",
+	      "content":[{"type":"input_text","text":"First use shell to inspect demo.txt. Then use apply_patch to append one line: PATCH_OK. Then verify with shell and reply exactly DONE."}]
+	    },
+	    {
+	      "type":"function_call",
+	      "name":"shell",
+	      "arguments":"{\"commands\":[\"Get-Content demo.txt\"]}",
+	      "call_id":"call_1"
+	    },
+	    {
+	      "type":"function_call_output",
+	      "call_id":"call_1",
+	      "output":"BASE"
+	    }
+	  ]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	toolNames := gjson.GetBytes(out, "tools.#.function.name").Array()
+	serialized := make([]string, 0, len(toolNames))
+	for _, name := range toolNames {
+		serialized = append(serialized, name.String())
+	}
+	assert.Contains(t, serialized, "shell")
+	assert.Contains(t, serialized, "apply_patch")
+	assert.NotContains(t, serialized, "spawn_agent")
+	assert.NotContains(t, serialized, "wait_agent")
+	assert.NotContains(t, serialized, "mcp__playwright__browser_navigate")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_ContinuationAfterApplyPatchDoesNotReopenFullCatalog(t *testing.T) {
+	body := []byte(`{
+	  "model":"gpt-5.2",
+	  "stream":false,
+	  "tools":[
+	    {"type":"function","function":{"name":"shell"}},
+	    {"type":"function","function":{"name":"apply_patch"}},
+	    {"type":"function","function":{"name":"spawn_agent"}},
+	    {"type":"function","function":{"name":"mcp__playwright__browser_navigate"}}
+	  ],
+	  "tool_choice":"auto",
+	  "parallel_tool_calls":true,
+	  "input":[
+	    {
+	      "type":"message",
+	      "role":"user",
+	      "content":[{"type":"input_text","text":"Use apply_patch to update demo.txt by appending one line PATCH_OK, then verify with shell and reply exactly DONE."}]
+	    },
+	    {
+	      "type":"function_call",
+	      "name":"apply_patch",
+	      "arguments":"{\"operation\":{\"type\":\"update_file\",\"path\":\"demo.txt\",\"content\":\"BASE\\nPATCH_OK\\n\"}}",
+	      "call_id":"call_1"
+	    },
+	    {
+	      "type":"function_call_output",
+	      "call_id":"call_1",
+	      "output":"Success"
+	    }
+	  ]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	toolNames := gjson.GetBytes(out, "tools.#.function.name").Array()
+	serialized := make([]string, 0, len(toolNames))
+	for _, name := range toolNames {
+		serialized = append(serialized, name.String())
+	}
+	assert.Contains(t, serialized, "shell")
+	assert.Contains(t, serialized, "apply_patch")
+	assert.NotContains(t, serialized, "spawn_agent")
+	assert.NotContains(t, serialized, "mcp__playwright__browser_navigate")
+}
+
+func TestCollapsePreToolAssistantMessages_KeepsOnlyFirstAssistantMessageBeforeTool(t *testing.T) {
+	output := []any{
+		map[string]any{"type": "reasoning"},
+		map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "first"}}},
+		map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "second"}}},
+		map[string]any{"type": "custom_tool_call", "name": "apply_patch"},
+	}
+
+	collapsed := collapsePreToolAssistantMessages(output)
+	require.Len(t, collapsed, 3)
+	assert.Equal(t, "reasoning", collapsed[0].(map[string]any)["type"])
+	assert.Equal(t, "message", collapsed[1].(map[string]any)["type"])
+	assert.Equal(t, "custom_tool_call", collapsed[2].(map[string]any)["type"])
+	text := collapsed[1].(map[string]any)["content"].([]any)[0].(map[string]any)["text"]
+	assert.Equal(t, "first", text)
 }
 
 func TestTranslateChatCompletionToResponsesResponse_RecoversRequestUserInputArgsFromReasoning(t *testing.T) {
@@ -4506,6 +4921,30 @@ func TestWriteResponsesStream_CustomApplyPatchCallRebuildsWeakInputFromOperation
 	assert.Contains(t, body, "-DEBUG=true")
 	assert.Contains(t, body, "+MODE=prod")
 	assert.NotContains(t, body, "\n TITLE=alpha\n ENV=dev\n DEBUG=true")
+}
+
+func TestWriteResponsesStream_EmptyShellArgumentsBecomeValidationMessage(t *testing.T) {
+	responseJSON := []byte(`{
+	  "id":"resp_empty_shell",
+	  "object":"response",
+	  "created_at":123,
+	  "model":"qwen-test",
+	  "status":"requires_action",
+	  "output":[
+	    {"id":"fc_1","type":"shell_call","call_id":"call_1","action":{}}
+	  ]
+	}`)
+
+	rec := httptest.NewRecorder()
+	writeResponsesStream(rec, responseJSON, "")
+
+	body := rec.Body.String()
+	assert.NotContains(t, body, `"name":"shell"`)
+	assert.NotContains(t, body, `event: response.function_call_arguments.done`)
+	assert.Contains(t, body, shellValidationWarningPrefix)
+	assert.Contains(t, body, "Provide a non-empty `command` string or `commands` array and retry.")
+	assert.Contains(t, body, `"status":"completed"`)
+	assert.NotContains(t, body, `"status":"requires_action"`)
 }
 
 func TestWriteResponsesStreamFromChatSSE_ApplyPatchUsesContentDrivenReplacementHunk(t *testing.T) {
