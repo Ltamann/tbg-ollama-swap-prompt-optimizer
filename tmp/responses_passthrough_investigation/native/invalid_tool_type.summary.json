@@ -1,0 +1,11 @@
+{
+  "http_status": 400,
+  "duration_ms": 0,
+  "error_text": "HTTP Error 400: Bad Request",
+  "stream": false,
+  "error_summary": {
+    "error_type": "invalid_request_error",
+    "error_code": 400,
+    "message": "'type' of tool must be 'function'"
+  }
+}

@@ -1383,6 +1383,16 @@ func TestNormalizeResponsesRequest_AdaptsComputerUsePreviewTool(t *testing.T) {
 	assert.Equal(t, "echo", second["name"])
 }
 
+func TestBuildQwenResponsesToolPolicy_UsesExactWrapperNamesForBuiltInTools(t *testing.T) {
+	policy := buildQwenResponsesToolPolicy([]string{"web_search", "file_search", "computer"})
+
+	assert.Contains(t, policy, llamaSwapWebSearchFunctionName)
+	assert.Contains(t, policy, llamaSwapFileSearchFunctionName)
+	assert.Contains(t, policy, llamaSwapComputerFunctionName)
+	assert.NotContains(t, policy, "- Use web_search for current or external information.")
+	assert.NotContains(t, policy, "- Use computer actions for UI automation requests.")
+}
+
 func TestNormalizeResponsesRequest_AdaptsCustomApplyPatchTool(t *testing.T) {
 	body := []byte(`{
 		"model":"gpt-5.3-codex",
@@ -1846,6 +1856,110 @@ func TestTranslateResponsesToChatCompletionsRequest_MergesDeveloperIntoLeadingSy
 	assert.Equal(t, "hello", second["content"])
 }
 
+func TestTranslateResponsesToChatCompletionsRequest_TextOnlyNativeStreamSkipsCloseThinkGuard(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.2",
+		"stream":true,
+		"reasoning":{"effort":"medium"},
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Reply exactly PORT8080_OK"}]}
+		]
+	}`)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	assert.Equal(t, "none", gjson.GetBytes(translated, "tool_choice").String())
+	assert.True(t, gjson.GetBytes(translated, "chat_template_kwargs.enable_thinking").Bool())
+	assert.False(t, gjson.GetBytes(translated, "grammar").Exists())
+	assert.False(t, gjson.GetBytes(translated, "logit_bias.248069").Exists())
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_PlanOnlyNativeStreamSkipsCloseThinkGuard(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.2",
+		"stream":true,
+		"reasoning":{"effort":"medium"},
+		"instructions":"Planning mode is active. Do NOT execute tasks, claim execution, or start implementing changes.",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Stay in plan mode for a hypothetical patch to repo_mirror/config.yaml, do not edit anything, and explicitly say you are not executing. End with exactly T22_SENTINEL."}]}
+		]
+	}`)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	assert.Equal(t, "none", gjson.GetBytes(translated, "tool_choice").String())
+	assert.True(t, gjson.GetBytes(translated, "chat_template_kwargs.enable_thinking").Bool())
+	assert.False(t, gjson.GetBytes(translated, "grammar").Exists())
+	assert.False(t, gjson.GetBytes(translated, "logit_bias.248069").Exists())
+	assert.False(t, gjson.GetBytes(translated, "parallel_tool_calls").Bool())
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_PlanOnlyNoToolDisablesParallelToolCalls(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.2",
+		"stream":false,
+		"reasoning":{"effort":"medium"},
+		"parallel_tool_calls":true,
+		"tools":[
+			{"type":"function","function":{"name":"shell"}},
+			{"type":"function","function":{"name":"apply_patch"}}
+		],
+		"instructions":"Planning mode is active. Do NOT execute tasks, claim execution, or start implementing changes.",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Stay in plan mode for a hypothetical patch to repo_mirror/config.yaml, do not edit anything, and explicitly say you are not executing. End with exactly T22_SENTINEL."}]}
+		]
+	}`)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	assert.Equal(t, "none", gjson.GetBytes(translated, "tool_choice").String())
+	assert.False(t, gjson.GetBytes(translated, "parallel_tool_calls").Bool())
+	assert.False(t, gjson.GetBytes(translated, "tools").Exists())
+	assert.False(t, gjson.GetBytes(translated, "grammar").Exists())
+	assert.False(t, gjson.GetBytes(translated, "logit_bias.248069").Exists())
+}
+
+func TestRequestExplicitlyWantsShellVerification_MatchesFinalFileContentPhrase(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "First use shell to inspect mutations/base_a.txt, then use apply_patch to append ORDERED_T11, then verify the final file content with shell. Finish with exactly T11_SENTINEL.",
+					},
+				},
+			},
+		},
+	}
+
+	assert.True(t, requestExplicitlyWantsShellVerification(req))
+}
+
+func TestNormalizeChatCompletionReasoningBoundary_MovesLeakedFinalAnswerOutOfReasoning(t *testing.T) {
+	body := []byte(`{
+	  "id":"chatcmpl-bad-reasoning-split",
+	  "choices":[{
+	    "message":{
+	      "role":"assistant",
+	      "content":"",
+	      "reasoning_content":"</think>\n\nWhat task would you like me to help you with? T20_SENTINEL"
+	    },
+	    "finish_reason":"stop"
+	  }]
+	}`)
+
+	normalized := normalizeChatCompletionReasoningBoundary(body)
+	assert.Equal(t, "What task would you like me to help you with? T20_SENTINEL", gjson.GetBytes(normalized, "choices.0.message.content").String())
+	assert.False(t, gjson.GetBytes(normalized, "choices.0.message.reasoning_content").Exists())
+	assert.NotContains(t, string(normalized), "</think>")
+}
+
 func TestNormalizeResponsesRequest_InjectsQwenToolPolicyForBuiltInTools(t *testing.T) {
 	body := []byte(`{
 		"model":"Qwen3.5-35B-A3B-Q8",
@@ -1890,9 +2004,9 @@ func TestNormalizeResponsesRequest_InjectsQwenToolPolicyForBuiltInTools(t *testi
 
 func TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputInPlanContinuationAfterToolOutput(t *testing.T) {
 	req := map[string]any{
-		"model": "gpt-5.2",
+		"model":        "gpt-5.2",
 		"instructions": "Use the request_user_input tool in native Codex question format and ask exactly one short clarifying question.",
-		"tool_choice": "auto",
+		"tool_choice":  "auto",
 		"input": []any{
 			map[string]any{
 				"type": "message",
@@ -1909,15 +2023,15 @@ func TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputInPlan
 				},
 			},
 			map[string]any{
-				"type": "function_call",
-				"name": "shell",
-				"call_id": "call_shell_1",
+				"type":      "function_call",
+				"name":      "shell",
+				"call_id":   "call_shell_1",
 				"arguments": `{"command":"pwd"}`,
 			},
 			map[string]any{
-				"type": "function_call_output",
+				"type":    "function_call_output",
 				"call_id": "call_shell_1",
-				"output": "c:/repo\n",
+				"output":  "c:/repo\n",
 			},
 			map[string]any{
 				"type": "message",
@@ -1952,9 +2066,9 @@ func TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputInPlan
 
 func TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputAfterExplorationBeforeAnyQuestion(t *testing.T) {
 	req := map[string]any{
-		"model": "gpt-5.2",
+		"model":        "gpt-5.2",
 		"instructions": "Plan mode request.",
-		"tool_choice": "auto",
+		"tool_choice":  "auto",
 		"input": []any{
 			map[string]any{
 				"type": "message",
@@ -1971,15 +2085,15 @@ func TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputAfterE
 				},
 			},
 			map[string]any{
-				"type": "function_call",
-				"name": "shell",
-				"call_id": "call_shell_1",
+				"type":      "function_call",
+				"name":      "shell",
+				"call_id":   "call_shell_1",
 				"arguments": `{"command":"pwd"}`,
 			},
 			map[string]any{
-				"type": "function_call_output",
+				"type":    "function_call_output",
 				"call_id": "call_shell_1",
-				"output": "c:/repo\n",
+				"output":  "c:/repo\n",
 			},
 		},
 		"tools": []any{
@@ -2007,9 +2121,9 @@ func TestTranslateResponsesToChatCompletionsRequest_ForcesRequestUserInputAfterE
 
 func TestTranslateResponsesToChatCompletionsRequest_ForcesProposedPlanAfterCompletedRequestUserInput(t *testing.T) {
 	req := map[string]any{
-		"model": "gpt-5.2",
+		"model":        "gpt-5.2",
 		"instructions": "Plan mode request.",
-		"tool_choice": "auto",
+		"tool_choice":  "auto",
 		"input": []any{
 			map[string]any{
 				"type": "message",
@@ -2026,15 +2140,15 @@ func TestTranslateResponsesToChatCompletionsRequest_ForcesProposedPlanAfterCompl
 				},
 			},
 			map[string]any{
-				"type": "function_call",
-				"name": "request_user_input",
-				"call_id": "call_question_1",
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_question_1",
 				"arguments": `{"questions":["What style should the game use?"]}`,
 			},
 			map[string]any{
-				"type": "function_call_output",
+				"type":    "function_call_output",
 				"call_id": "call_question_1",
-				"output": `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+				"output":  `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
 			},
 		},
 		"tools": []any{
@@ -2052,12 +2166,12 @@ func TestTranslateResponsesToChatCompletionsRequest_ForcesProposedPlanAfterCompl
 	var payload map[string]any
 	require.NoError(t, json.Unmarshal(translated, &payload))
 
-	assert.Equal(t, "none", payload["tool_choice"])
+	assert.Equal(t, "auto", payload["tool_choice"])
 	messages, ok := payload["messages"].([]any)
 	require.True(t, ok)
 	first, ok := messages[0].(map[string]any)
 	require.True(t, ok)
-	assert.Contains(t, fmt.Sprintf("%v", first["content"]), "Return exactly one complete <proposed_plan> block now.")
+	assert.NotContains(t, fmt.Sprintf("%v", first["content"]), "Return exactly one complete <proposed_plan> block now.")
 }
 
 func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *testing.T) {
@@ -2076,6 +2190,15 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 			"role": "developer",
 			"content": []any{
 				map[string]any{"type": "input_text", "text": "<collaboration_mode># Collaboration Mode: Default\nYou are in Default mode."},
+			},
+		}
+	}
+	noisyDefaultDev := func() map[string]any {
+		return map[string]any{
+			"type": "message",
+			"role": "developer",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "<collaboration_mode># Collaboration Mode: Default\nYou are in Default mode.\nIf you truly need clarification, use the request_user_input tool in native Codex question format.\nDo not use it unless the current request explicitly asks for a clarification question."},
 			},
 		}
 	}
@@ -2122,13 +2245,13 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 		}
 	}
 	type testCase struct {
-		name                     string
-		req                      map[string]any
-		wantToolChoiceString     string
-		wantToolChoiceFunction   string
-		wantInstructionContains  string
-		wantInstructionExcludes  string
-		wantToolAbsent           string
+		name                    string
+		req                     map[string]any
+		wantToolChoiceString    string
+		wantToolChoiceFunction  string
+		wantInstructionContains string
+		wantInstructionExcludes string
+		wantToolAbsent          string
 	}
 	tests := []testCase{
 		{
@@ -2167,6 +2290,13 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 			wantToolChoiceFunction: "request_user_input",
 		},
 		{
+			name: "ask how they want it built still forces native question tool",
+			req: baseReq(planDev(), "Use request_user_input in native question format and ask how they would like this built.",
+				"ask the user how they would like this game built and which approach they prefer",
+				nil, baseTools("request_user_input"), "auto"),
+			wantToolChoiceFunction: "request_user_input",
+		},
+		{
 			name: "plan continuation with required tool choice still resolves to request_user_input",
 			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
 				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
@@ -2200,6 +2330,42 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 			wantToolChoiceString: "auto",
 		},
 		{
+			name: "default mode simple hello does not force request_user_input from boilerplate",
+			req: baseReq(noisyDefaultDev(), "Default mode request.", "hi",
+				nil, baseTools("shell", "request_user_input"), "auto"),
+			wantToolChoiceString: "auto",
+		},
+		{
+			name: "default mode web search does not force request_user_input from boilerplate",
+			req: baseReq(noisyDefaultDev(), "Default mode request.", "search the web for YLAB",
+				nil, baseTools("web_search", "request_user_input", "shell"), "auto"),
+			wantToolChoiceString: "auto",
+		},
+		{
+			name: "plan followup with web research before plan keeps tools available",
+			req: baseReq(planDev(), "Plan mode request.", "write a native plan and do web research before",
+				[]any{
+					toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`),
+					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
+				},
+				baseTools("shell", "request_user_input", "web_search"), "auto"),
+			wantToolChoiceString: "auto",
+		},
+		{
+			name: "later reddit search in plan conversation keeps tools available",
+			req: baseReq(planDev(), "Plan mode request.", "find all qwen 3.6 models in reddit webside",
+				[]any{
+					toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`),
+					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
+					toolCall("web_search", "call_ws_1", `{"query":"ylab architects principles"}`),
+					toolOutput("call_ws_1", `{"query":"ylab architects principles","results":[{"title":"YLAB"}]}`),
+					toolCall("mcp__playwright__browser_navigate", "call_browser_1", `{"url":"https://www.ylab.es/en/"}`),
+					toolOutput("call_browser_1", `{"url":"https://www.ylab.es/en/"}`),
+				},
+				baseTools("request_user_input", "web_search", "mcp__playwright__browser_navigate"), "auto"),
+			wantToolChoiceString: "auto",
+		},
+		{
 			name: "no questions instruction blocks explicit question forcing",
 			req: baseReq(planDev(), "Use the request_user_input tool in native Codex question format and ask exactly one short clarifying question.",
 				"no questions please", nil, baseTools("request_user_input"), "auto"),
@@ -2210,8 +2376,8 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
 				[]any{toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`), toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`)},
 				baseTools("shell", "request_user_input"), "auto"),
-			wantToolChoiceString:    "none",
-			wantInstructionContains: "Return exactly one complete <proposed_plan> block now.",
+			wantToolChoiceString:    "auto",
+			wantInstructionExcludes: "Return exactly one complete <proposed_plan> block now.",
 		},
 		{
 			name: "completed request_user_input after shell exploration still forces proposed plan return",
@@ -2223,8 +2389,8 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
 				},
 				baseTools("shell", "request_user_input"), "auto"),
-			wantToolChoiceString:    "none",
-			wantInstructionContains: "Return exactly one complete <proposed_plan> block now.",
+			wantToolChoiceString:    "auto",
+			wantInstructionExcludes: "Return exactly one complete <proposed_plan> block now.",
 		},
 		{
 			name: "multiple completed request_user_input calls still force proposed plan return",
@@ -2236,8 +2402,8 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 					toolOutput("call_q_2", `{"answers":[{"id":"colors","value":"bright"}]}`),
 				},
 				baseTools("request_user_input"), "auto"),
-			wantToolChoiceString:    "none",
-			wantInstructionContains: "Return exactly one complete <proposed_plan> block now.",
+			wantToolChoiceString:    "auto",
+			wantInstructionExcludes: "Return exactly one complete <proposed_plan> block now.",
 		},
 		{
 			name: "specific shell tool choice after completed request_user_input is preserved",
@@ -2263,14 +2429,15 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 			wantToolChoiceString: "auto",
 		},
 		{
-			name: "default mode with completed request_user_input does not force proposed plan return",
+			name: "default mode with completed request_user_input still forces proposed plan return",
 			req: baseReq(defaultDev(), "Default mode request.", "write a plan for a small game",
 				[]any{
 					toolCall("request_user_input", "call_q_1", `{"questions":["What style?"]}`),
 					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
 				},
 				baseTools("request_user_input"), "auto"),
-			wantToolChoiceString: "auto",
+			wantToolChoiceString:    "auto",
+			wantInstructionExcludes: "Return exactly one complete <proposed_plan> block now.",
 		},
 		{
 			name: "plan return still forces without request_user_input tool exposed in tools",
@@ -2280,8 +2447,8 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
 				},
 				baseTools("shell"), "auto"),
-			wantToolChoiceString:    "none",
-			wantInstructionContains: "Return exactly one complete <proposed_plan> block now.",
+			wantToolChoiceString:    "auto",
+			wantInstructionExcludes: "Return exactly one complete <proposed_plan> block now.",
 		},
 		{
 			name: "completed request_user_input with required tool choice still forces proposed plan return",
@@ -2291,8 +2458,8 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 					toolOutput("call_q_1", `{"answers":[{"id":"style","value":"kid-friendly"}]}`),
 				},
 				baseTools("request_user_input"), "required"),
-			wantToolChoiceString:    "none",
-			wantInstructionContains: "Return exactly one complete <proposed_plan> block now.",
+			wantToolChoiceString:    "required",
+			wantInstructionExcludes: "Return exactly one complete <proposed_plan> block now.",
 		},
 		{
 			name: "default mode write a plan removes update_plan and adds wrapping instruction",
@@ -2314,8 +2481,24 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 			name: "default mode implement this plan does not remove update_plan",
 			req: baseReq(defaultDev(), "Default mode request.", "please implement this plan using apply_patch",
 				nil, baseTools("update_plan", "apply_patch"), "auto"),
-			wantToolChoiceString:    "auto",
 			wantInstructionExcludes: "return the plan directly as assistant text wrapped in <proposed_plan>...</proposed_plan>",
+		},
+		{
+			name: "retry after invalid apply patch keeps tools available",
+			req: baseReq(defaultDev(), "Default mode request.", "try again",
+				[]any{
+					toolCall("request_user_input", "call_q_1", `{"questions":["What platform?"]}`),
+					toolOutput("call_q_1", `{"answers":[{"id":"platform","value":"html"}]}`),
+					map[string]any{
+						"type": "message",
+						"role": "assistant",
+						"content": []any{
+							map[string]any{"type": "output_text", "text": "apply_patch call was not executed because operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."},
+						},
+					},
+				},
+				baseTools("request_user_input", "apply_patch", "shell"), "auto"),
+			wantToolChoiceString: "auto",
 		},
 		{
 			name: "default mode non plan request keeps update_plan untouched",
@@ -2394,8 +2577,1095 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 					assert.NotEqual(t, tc.wantToolAbsent, tool["name"])
 				}
 			}
+			if tc.name == "retry after invalid apply patch keeps tools available" {
+				tools, ok := payload["tools"].([]any)
+				require.True(t, ok)
+				assert.NotEmpty(t, tools)
+			}
 		})
 	}
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_PostPatchContinuationKeepsBroadTools(t *testing.T) {
+	req := map[string]any{
+		"model":        "gpt-5.2",
+		"instructions": "Default mode request.",
+		"tool_choice":  "auto",
+		"tools": []any{
+			map[string]any{"type": "function", "name": "apply_patch"},
+			map[string]any{"type": "function", "name": "shell"},
+			map[string]any{"type": "function", "name": "browser_navigate"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Collaboration Mode: Default\nYou are in Default mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Continue by checking the created file and open it in the browser."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "apply_patch",
+				"call_id":   "call_patch_1",
+				"arguments": `{"operation":{"type":"create_file","path":"biology-quiz.html","content":"<html></html>"}}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_patch_1",
+				"output":  "Success. Updated the following files:\nA biology-quiz.html",
+			},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+	assert.Equal(t, "auto", payload["tool_choice"])
+
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.Len(t, tools, 3)
+
+	names := make([]string, 0, len(tools))
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		require.True(t, ok)
+		names = append(names, extractFunctionToolName(tool))
+	}
+	assert.Contains(t, names, "apply_patch")
+	assert.Contains(t, names, "shell")
+	assert.Contains(t, names, "browser_navigate")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_WebSearchFollowupAfterQuestionKeepsTools(t *testing.T) {
+	req := map[string]any{
+		"model":       "gpt-5.2",
+		"tool_choice": "auto",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "do a web_search for it"},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_question_1",
+				"arguments": `{"questions":["What style should the game use?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_question_1",
+				"output":  `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "request_user_input"},
+			map[string]any{"type": "web_search"},
+			map[string]any{"type": "function", "name": "shell"},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	assert.Equal(t, "auto", payload["tool_choice"])
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, tools)
+	names := make([]string, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		require.True(t, ok)
+		if fn, ok := tool["function"].(map[string]any); ok {
+			names = append(names, strings.TrimSpace(fmt.Sprintf("%v", fn["name"])))
+			continue
+		}
+		names = append(names, strings.TrimSpace(fmt.Sprintf("%v", tool["name"])))
+	}
+	assert.Contains(t, names, "web_search")
+}
+
+func TestResponsesRequestToChatMessages_NormalizesApplyPatchToolOutputTranscript(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "apply_patch",
+				"call_id":   "call_patch_1",
+				"arguments": `{"operation":{"type":"create_file","path":"biology-quiz.html","content":"<html></html>"}}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_patch_1",
+				"output":  "Success. Updated the following files:\nA biology-quiz.html",
+			},
+		},
+	}
+
+	messages := responsesRequestToChatMessages(req)
+	require.Len(t, messages, 2)
+	assert.Equal(t, "tool", messages[1]["role"])
+	assert.Equal(t, "Success. Updated the following files:\ncreated: biology-quiz.html", messages[1]["content"])
+}
+
+func TestRequestStillWantsStructuredPlan_FalseForImplementationRetry(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_q_1",
+				"arguments": `{"questions":["What platform?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_q_1",
+				"output":  `{"answers":[{"id":"platform","value":"html"}]}`,
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "apply_patch call was not executed because operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "try again"},
+				},
+			},
+		},
+	}
+
+	assert.False(t, requestStillWantsStructuredPlan(req, buildToolWorkflowState(req)))
+}
+
+func TestRequestStillWantsStructuredPlan_FalseForExplicitExplorationFollowup(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "do a web_search for it"},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_question_1",
+				"arguments": `{"questions":["What style should the game use?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_question_1",
+				"output":  `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+			},
+		},
+	}
+
+	assert.False(t, requestStillWantsStructuredPlan(req, buildToolWorkflowState(req)))
+}
+
+func TestRequestStillWantsStructuredPlan_FalseForWebResearchBeforePlanFollowup(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "write a native plan and do web research before"},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_question_1",
+				"arguments": `{"questions":["What style should the game use?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_question_1",
+				"output":  `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+			},
+		},
+	}
+
+	assert.False(t, requestStillWantsStructuredPlan(req, buildToolWorkflowState(req)))
+}
+
+func TestTextIndicatesSearchIntent_TrueForInvestigateTheWeb(t *testing.T) {
+	assert.True(t, textIndicatesSearchIntent("investigate the web for 10 best chemistry knowledge questions"))
+}
+
+func TestRequestStillWantsStructuredPlan_TrueForInvestigateTheWebAfterResearchAndAnsweredQuestionInCodexPlanMode(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "investigate the web for 10 best chemie nolege questions, than write a small quiz game with it - ask me question about how to write it."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "web_search",
+				"call_id":   "call_search_1",
+				"arguments": `{"query":"10 most difficult chemistry riddles globalquiz.org questions answers"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_search_1",
+				"output":  `{"results":[{"title":"10 most difficult chemistry riddles","url":"https://globalquiz.org/en/toughest-chemistry-riddles/"}]}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_question_1",
+				"arguments": `{"questions":["How should the game be built?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_question_1",
+				"output":  `{"answers":{"quiz_format":{"answers":["HTML/JS single file (Recommended)"]}}}`,
+			},
+		},
+	}
+
+	assert.True(t, requestStillWantsStructuredPlan(req, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryMissingWebSearchCall_WhenOriginalRequestHasSearchToolButTranslatedTurnDoesNot(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "web_search"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "dig into the web for 10 chemistry knowledge questions"},
+				},
+			},
+		},
+	}
+
+	translatedChatRequest := []byte(`{"tool_choice":"none","messages":[{"role":"user","content":"dig into the web for 10 chemistry knowledge questions"}]}`)
+	chatResponse := []byte(`{
+		"choices":[{"message":{"role":"assistant","content":"<websearch>\n<query>best chemistry quiz questions</query>\n</websearch>","reasoning_content":"I still need external research before answering."},"finish_reason":"stop"}]
+	}`)
+	translatedResponse := []byte(`{"output":[]}`)
+
+	assert.True(t, shouldRetryMissingWebSearchCall(req, translatedChatRequest, chatResponse, translatedResponse, ToolWorkflowState{}))
+}
+
+func TestRequestStillWantsStructuredPlan_TrueForCodexPlanModeAfterAnsweredQuestion(t *testing.T) {
+	req := map[string]any{
+		"instructions": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode.",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "help me design a TBG ETUR quiz game"},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_q_1",
+				"arguments": `{"questions":["What style should the game use?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_q_1",
+				"output":  `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+			},
+		},
+	}
+
+	assert.True(t, requestStillWantsStructuredPlan(req, buildToolWorkflowState(req)))
+}
+
+func TestRequestExplicitlyWantsSearchIntent_FalseAfterResearchAndAnsweredQuestionInCodexPlanMode(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "investigate the web for 10 best chemie nolege questions, than write a small quiz game with it - ask me question about how to write it."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "web_search",
+				"call_id":   "call_search_1",
+				"arguments": `{"query":"10 most difficult chemistry riddles globalquiz.org questions answers"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_search_1",
+				"output":  `{"results":[{"title":"10 most difficult chemistry riddles","url":"https://globalquiz.org/en/toughest-chemistry-riddles/"}]}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_question_1",
+				"arguments": `{"questions":["How should the game be built?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_question_1",
+				"output":  `{"answers":{"quiz_format":{"answers":["HTML/JS single file (Recommended)"]}}}`,
+			},
+		},
+	}
+
+	assert.False(t, requestExplicitlyWantsSearchIntent(req, buildToolWorkflowState(req)))
+	assert.True(t, requestStillWantsStructuredPlan(req, buildToolWorkflowState(req)))
+}
+
+func TestRequestExplicitlyWantsSearchIntent_FalseAfterBrowserResearchAndAnsweredQuestionInCodexPlanMode(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "investigate the web for 10 best chemie nolege questions, than write a small quiz game with it - ask me question about how to write it."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "mcp__playwright__browser_navigate",
+				"call_id":   "call_browser_1",
+				"arguments": `{"url":"https://globalquiz.org/en/toughest-chemistry-riddles/"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_browser_1",
+				"output":  `{"page":"loaded"}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "mcp__playwright__browser_snapshot",
+				"call_id":   "call_browser_2",
+				"arguments": `{}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_browser_2",
+				"output":  `{"snapshot":"chemistry riddles page"}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_question_1",
+				"arguments": `{"questions":["How should the game be built?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_question_1",
+				"output":  `{"answers":{"quiz_format":{"answers":["HTML/JS single file (Recommended)"]}}}`,
+			},
+		},
+	}
+
+	assert.False(t, requestExplicitlyWantsSearchIntent(req, buildToolWorkflowState(req)))
+	assert.True(t, requestStillWantsStructuredPlan(req, buildToolWorkflowState(req)))
+}
+
+func TestRequestExplicitlyWantsNativeCodexQuestion_IgnoresInstructionBoilerplate(t *testing.T) {
+	req := map[string]any{
+		"instructions": "Use the request_user_input tool when a native Codex question is explicitly requested.",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "find all qwen 3.6 models in reddit webside"},
+				},
+			},
+		},
+	}
+
+	assert.False(t, requestExplicitlyWantsNativeCodexQuestion(req))
+}
+
+func TestStructuredPlanOutputRequiredFromRequestBody_TrueForCodexPlanModeContract(t *testing.T) {
+	req := map[string]any{
+		"model":        "gpt-5.2",
+		"instructions": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode.",
+		"tool_choice":  "auto",
+		"stream":       true,
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "investigate the web for 10 best chemistry questions and ask me how to build the quiz"},
+				},
+			},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+	assert.True(t, structuredPlanOutputRequiredFromRequestBody(body))
+	assert.Equal(t, "plan", extractResponsesRequestModeFromBody(body))
+}
+
+func TestShellToolArgumentsLookLikePlainQuestion_LiveShape(t *testing.T) {
+	args := map[string]any{
+		"command": []any{"What", "does", "synthesis", "gas", "(water", "gas)", "consist", "of?"},
+	}
+
+	assert.True(t, shellToolArgumentsLookLikePlainQuestion(args))
+}
+
+func TestDerivePlanModeFallbackText_MergesReasoningAndVisiblePlanDetails(t *testing.T) {
+	visiblePlan := `Now I'll build the quiz. Here's the plan:
+
+- Single HTML file with embedded CSS + JS
+- 10 multiple-choice questions from the chemistry research
+- Colorful & fun design
+- Score tracking
+- Progress bar`
+
+	reasoning := `The user has answered:
+- Tech: HTML + JavaScript (Recommended)
+- Features: Classic quiz (Recommended)
+- Style: Colorful & Fun`
+
+	plan := derivePlanModeFallbackText(visiblePlan, reasoning)
+
+	assert.Contains(t, plan, "HTML + JavaScript")
+	assert.Contains(t, plan, "10 researched chemistry questions")
+	assert.Contains(t, plan, "Colorful & Fun")
+	assert.NotContains(t, plan, "\n6. Finish")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_TopLevelPlanInstructions_WebResearchBeforePlanKeepsTools(t *testing.T) {
+	req := map[string]any{
+		"model":        "gpt-5.2",
+		"instructions": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode.",
+		"tool_choice":  "auto",
+		"stream":       true,
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "request_user_input",
+				"description": "Ask structured questions",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"questions": map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "string"},
+						},
+					},
+					"required": []string{"questions"},
+				},
+			},
+			map[string]any{"type": "web_search_preview"},
+			map[string]any{"type": "shell"},
+		},
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_q_1",
+				"arguments": `{"questions":["What style should the game use?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_q_1",
+				"output":  `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "write a native plan and do web research before"},
+				},
+			},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	assert.Equal(t, "auto", payload["tool_choice"])
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, tools)
+	names := make([]string, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		require.True(t, ok)
+		if fn, ok := tool["function"].(map[string]any); ok {
+			names = append(names, strings.TrimSpace(fmt.Sprintf("%v", fn["name"])))
+		}
+	}
+	assert.Contains(t, names, "web_search")
+	assert.Contains(t, names, "request_user_input")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_CodexPlanAfterResearchAndAnsweredQuestionRequestsProposedPlan(t *testing.T) {
+	req := map[string]any{
+		"model":        "gpt-5.2",
+		"instructions": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode.",
+		"tool_choice":  "auto",
+		"stream":       true,
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "request_user_input",
+				"description": "Ask structured questions",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"questions": map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "string"},
+						},
+					},
+					"required": []string{"questions"},
+				},
+			},
+			map[string]any{"type": "web_search_preview"},
+			map[string]any{"type": "shell"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "investigate the web for 10 best chemie nolege questions, than write a small quiz game with it - ask me question about how to write it."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "web_search",
+				"call_id":   "call_search_1",
+				"arguments": `{"query":"10 most difficult chemistry riddles globalquiz.org questions answers"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_search_1",
+				"output":  `{"results":[{"title":"10 most difficult chemistry riddles","url":"https://globalquiz.org/en/toughest-chemistry-riddles/"}]}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_question_1",
+				"arguments": `{"questions":["How should the game be built?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_question_1",
+				"output":  `{"answers":{"quiz_format":{"answers":["HTML/JS single file (Recommended)"]}}}`,
+			},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	assert.Equal(t, "auto", payload["tool_choice"])
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, tools)
+	names := make([]string, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		require.True(t, ok)
+		if fn, ok := tool["function"].(map[string]any); ok {
+			names = append(names, strings.TrimSpace(fmt.Sprintf("%v", fn["name"])))
+		}
+	}
+	assert.Contains(t, names, "web_search")
+	assert.Contains(t, names, "request_user_input")
+
+	messages, ok := payload["messages"].([]any)
+	require.True(t, ok)
+	systemText := make([]string, 0, len(messages))
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		require.True(t, ok)
+		if strings.TrimSpace(fmt.Sprintf("%v", msg["role"])) == "system" {
+			systemText = append(systemText, strings.TrimSpace(fmt.Sprintf("%v", msg["content"])))
+		}
+	}
+	joined := strings.Join(systemText, "\n")
+	assert.Contains(t, joined, "Codex Plan Mode is still active.")
+	assert.Contains(t, joined, "return exactly one <proposed_plan>...</proposed_plan> block now")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_CodexPlanAfterBrowserResearchAndAnsweredQuestionRequestsProposedPlan(t *testing.T) {
+	req := map[string]any{
+		"model":        "gpt-5.2",
+		"instructions": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode.",
+		"tool_choice":  "auto",
+		"stream":       true,
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "request_user_input",
+				"description": "Ask structured questions",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"questions": map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "string"},
+						},
+					},
+					"required": []string{"questions"},
+				},
+			},
+			map[string]any{
+				"type":        "function",
+				"name":        "mcp__playwright__browser_navigate",
+				"description": "Navigate browser",
+				"parameters":  map[string]any{"type": "object"},
+			},
+			map[string]any{
+				"type":        "function",
+				"name":        "mcp__playwright__browser_snapshot",
+				"description": "Snapshot browser",
+				"parameters":  map[string]any{"type": "object"},
+			},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "investigate the web for 10 best chemie nolege questions, than write a small quiz game with it - ask me question about how to write it."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "mcp__playwright__browser_navigate",
+				"call_id":   "call_browser_1",
+				"arguments": `{"url":"https://globalquiz.org/en/toughest-chemistry-riddles/"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_browser_1",
+				"output":  `{"page":"loaded"}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "mcp__playwright__browser_snapshot",
+				"call_id":   "call_browser_2",
+				"arguments": `{}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_browser_2",
+				"output":  `{"snapshot":"chemistry riddles page"}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_question_1",
+				"arguments": `{"questions":["How should the game be built?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_question_1",
+				"output":  `{"answers":{"quiz_format":{"answers":["HTML/JS single file (Recommended)"]}}}`,
+			},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	assert.Equal(t, "auto", payload["tool_choice"])
+	messages, ok := payload["messages"].([]any)
+	require.True(t, ok)
+	systemText := make([]string, 0, len(messages))
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		require.True(t, ok)
+		if strings.TrimSpace(fmt.Sprintf("%v", msg["role"])) == "system" {
+			systemText = append(systemText, strings.TrimSpace(fmt.Sprintf("%v", msg["content"])))
+		}
+	}
+	joined := strings.Join(systemText, "\n")
+	assert.Contains(t, joined, "Codex Plan Mode is still active.")
+	assert.Contains(t, joined, "return exactly one <proposed_plan>...</proposed_plan> block now")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_TopLevelPlanInstructions_LaterRedditSearchKeepsTools(t *testing.T) {
+	req := map[string]any{
+		"model":        "gpt-5.2",
+		"instructions": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode.",
+		"tool_choice":  "auto",
+		"stream":       true,
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "request_user_input",
+				"description": "Ask structured questions",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"questions": map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "string"},
+						},
+					},
+					"required": []string{"questions"},
+				},
+			},
+			map[string]any{"type": "web_search_preview"},
+			map[string]any{"type": "shell"},
+		},
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_q_1",
+				"arguments": `{"questions":["What style should the game use?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_q_1",
+				"output":  `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "web_search",
+				"call_id":   "call_ws_1",
+				"arguments": `{"query":"ylab architects principles"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_ws_1",
+				"output":  `{"query":"ylab architects principles","results":[{"title":"YLAB"}]}`,
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "find all qwen 3.6 models in reddit webside"},
+				},
+			},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	assert.Equal(t, "auto", payload["tool_choice"])
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, tools)
+	names := make([]string, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		require.True(t, ok)
+		if fn, ok := tool["function"].(map[string]any); ok {
+			names = append(names, strings.TrimSpace(fmt.Sprintf("%v", fn["name"])))
+		}
+	}
+	assert.Contains(t, names, "web_search")
+}
+
+func TestRequestStillWantsStructuredPlan_FalseForSearchRetryAfterPseudoSearchOutput(t *testing.T) {
+	req := map[string]any{
+		"instructions": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode.",
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_q_1",
+				"arguments": `{"questions":["What style should the game use?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_q_1",
+				"output":  `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "<tool_code>\nprint(websearch(query=\"site:reddit.com qwen 3.6 model\"))\n</tool_code>"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "try again"},
+				},
+			},
+		},
+	}
+
+	assert.False(t, requestStillWantsStructuredPlan(req, buildToolWorkflowState(req)))
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_SearchRetryAfterPseudoSearchOutputKeepsTools(t *testing.T) {
+	req := map[string]any{
+		"model":        "gpt-5.2",
+		"instructions": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode.",
+		"tool_choice":  "auto",
+		"stream":       true,
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "request_user_input",
+				"description": "Ask structured questions",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"questions": map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "string"},
+						},
+					},
+					"required": []string{"questions"},
+				},
+			},
+			map[string]any{"type": "web_search_preview"},
+			map[string]any{"type": "shell"},
+		},
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_q_1",
+				"arguments": `{"questions":["What style should the game use?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_q_1",
+				"output":  `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "web_search",
+				"call_id":   "call_ws_1",
+				"arguments": `{"query":"site:reddit.com qwen 3.6 model"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_ws_1",
+				"output":  `{"query":"site:reddit.com qwen 3.6 model","results":[]}`,
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "<tool_code>\nprint(websearch(query=\"site:reddit.com qwen 3.6 model\"))\n</tool_code>"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "try again"},
+				},
+			},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	assert.Equal(t, "auto", payload["tool_choice"])
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, tools)
+	names := make([]string, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		require.True(t, ok)
+		if fn, ok := tool["function"].(map[string]any); ok {
+			names = append(names, strings.TrimSpace(fmt.Sprintf("%v", fn["name"])))
+		}
+	}
+	assert.Contains(t, names, "web_search")
+	assert.Contains(t, names, "request_user_input")
+	assert.Contains(t, names, "shell")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_PlanResearchBeforeWritingPlanKeepsSearchTools(t *testing.T) {
+	req := map[string]any{
+		"model":        "gpt-5.2",
+		"instructions": "<collaboration_mode># Plan Mode (Conversational)\nYou are in Plan Mode.",
+		"tool_choice":  "auto",
+		"stream":       false,
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "request_user_input",
+				"description": "Ask structured questions",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"questions": map[string]any{
+							"type":  "array",
+							"items": map[string]any{"type": "string"},
+						},
+					},
+					"required": []string{"questions"},
+				},
+			},
+			map[string]any{"type": "web_search"},
+			map[string]any{"type": "shell"},
+		},
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_q_1",
+				"arguments": `{"questions":["What style should the game use?"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_q_1",
+				"output":  `{"answers":[{"id":"style","value":"kid-friendly"}]}`,
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "research current OpenAI responses API news before writing the plan"},
+				},
+			},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	assert.Equal(t, "auto", payload["tool_choice"])
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, tools)
+	names := make([]string, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		require.True(t, ok)
+		if fn, ok := tool["function"].(map[string]any); ok {
+			names = append(names, strings.TrimSpace(fmt.Sprintf("%v", fn["name"])))
+		}
+	}
+	assert.Contains(t, names, "web_search")
+	assert.Contains(t, names, "request_user_input")
+	assert.Contains(t, names, "shell")
 }
 
 func TestNormalizeResponsesRequest_DoesNotInjectQwenToolPolicyForNonQwenModels(t *testing.T) {

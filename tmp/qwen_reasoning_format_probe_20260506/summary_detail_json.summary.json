@@ -1,0 +1,12 @@
+{
+  "case": "summary_detail_json",
+  "duration_ms": 117749,
+  "finish_reasons": [
+    "stop"
+  ],
+  "reasoning_preview": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Goal:** Design a reasoning format for a coding agent.\n   - **Requirements:** \n     - Short user-facing progress updates\n     - Full detailed reasoning\n   - **Output:** Then answer briefly (presumably meaning provide the format design and then a brief explanation/example).\n\n2.  **Deconstruct Requirements:**\n   - Need a structured format that separates two streams:\n     - `user_progress`: Concise, human-readable status updates\n     - `reasoning`: Detailed, step-by-step internal thought process\n   - Should be machine-parseable but human-friendly\n   - Should follow the system prompt's instruction: \"start the reasoning with a compact JSON object on one line with keys goal, decision, next_action, status, then continue full detailed reasoning after a blank line.\"\n   - Wait, the system prompt says: \"When thinking, start the reasoning with a compact JSON object on one line with keys goal, decision, next_action, status, then continue full detailed reasoning after a blank line. Keep each JSON value short.\" This is a constraint on *my* thinking process, not necessarily the format I'm designing. But I should follow it in my response",
+  "content_preview": "{goal: \"design dual-stream agent format\", decision: \"use tagged markdown structure\", next_action: \"output format + guidelines + example\", status: \"ready\"}\n\n**Format Design**\n```text\n[PROGRESS] <1-2 line human-readable status>\n[REASONING]\n<Full technical breakdown: problem analysis, algorithm choice, step-by-step implementation plan, edge cases, complexity, and self-correction>\n```\n\n**Usage Guidelines**\n- **Streaming:** Repeat `[PROGRESS]`/`[REASONING]` pairs per logical step to enable real-time UI updates without interrupting the chain-of-thought.\n- **PROGRESS:** Only surface meaningful milest",
+  "has_summary_tag": false,
+  "has_detail_tag": false,
+  "starts_with_json": false
+}

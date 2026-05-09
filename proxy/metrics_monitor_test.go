@@ -1344,4 +1344,43 @@ func TestMetricsMonitor_WrapHandler_Capture(t *testing.T) {
 			assert.Equal(t, "/v1/responses", capture.ReqPath)
 		}
 	})
+
+	t.Run("preserves capture stages added during handler execution", func(t *testing.T) {
+		mm := newMetricsMonitor(testLogger, 10, 5)
+
+		requestBody := `{"model":"test","input":"Reply exactly OK"}`
+		responseBody := `{"usage":{"prompt_tokens":3,"completion_tokens":1}}`
+
+		nextHandler := func(modelID string, w http.ResponseWriter, r *http.Request) error {
+			addCaptureStage(r.Context(), "bridge.responses_request", []byte(requestBody))
+			addCaptureStage(r.Context(), "bridge.chat_completions_request", []byte(`{"messages":[{"role":"user","content":"Reply exactly OK"}]}`))
+			addCaptureStage(r.Context(), "bridge.chat_completions_response", []byte(`{"choices":[{"message":{"role":"assistant","content":"OK"}}]}`))
+			addCaptureStage(r.Context(), "bridge.responses_output", []byte(`{"output":[{"type":"message"}]}`))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(responseBody))
+			return nil
+		}
+
+		req := httptest.NewRequest("POST", "/v1/responses", bytes.NewBufferString(requestBody))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(rec)
+
+		err := mm.wrapHandler("test-model", ginCtx.Writer, req, nextHandler)
+		assert.NoError(t, err)
+
+		metrics := mm.getMetrics()
+		if assert.Len(t, metrics, 1) {
+			capture := mm.getCaptureByID(metrics[0].ID)
+			if assert.NotNil(t, capture) {
+				if assert.Len(t, capture.Stages, 4) {
+					assert.Equal(t, "bridge.responses_request", capture.Stages[0].Name)
+					assert.Equal(t, "bridge.chat_completions_request", capture.Stages[1].Name)
+					assert.Equal(t, "bridge.chat_completions_response", capture.Stages[2].Name)
+					assert.Equal(t, "bridge.responses_output", capture.Stages[3].Name)
+				}
+			}
+		}
+	})
 }

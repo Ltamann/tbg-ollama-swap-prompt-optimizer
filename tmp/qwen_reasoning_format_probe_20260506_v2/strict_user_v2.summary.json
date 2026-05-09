@@ -1,0 +1,11 @@
+{
+  "case": "strict_user_v2",
+  "duration_ms": 140840,
+  "reasoning_starts_summary": false,
+  "reasoning_has_summary": true,
+  "reasoning_has_detail": true,
+  "content_starts_summary": true,
+  "content_has_summary": true,
+  "reasoning_preview": "Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Goal: Design a reasoning format for a coding agent.\n    *   Features: Short user-facing progress, full detailed reasoning.\n    *   Constraint: \"Inside your thinking block only, do not use numbered lists or prefaces like Here is my thinking. Begin immediately with exactly: [SUMMARY]... [DETAIL]...\"\n    *   Constraint: \"Do not repeat the summary in the final visible answer.\"\n    *   Output: Answer briefly (after the thinking block).\n\n2.  **Drafting the Thinking Block:**\n    *   Must start with `[SUMMARY]`.\n    *   Must follow the format: GOAL, DECISION, NEXT, STATUS.\n    *   Must follow with `[DETAIL]`.\n    *   Must contain full reasoning about the coding agent design.\n    *   No numbered lists.\n    *   No \"Here is my thinking\".\n\n    *Drafting Summary:*\n    [SUMMARY]\n    GOAL: Design agent reasoning format with dual output streams.\n  ",
+  "content_preview": "[SUMMARY]\nGOAL: Design coding agent reasoning format with split visibility.\nDECISION: Use distinct tags for internal logic and external status updates.\nNEXT: Define the structure and provide a concise explanation.\nSTATUS: ready\n\n[DETAIL]\nThe design focuses on separating cognitive load from interface clarity. The agent needs a mechanism to perform deep reasoning without overwhelming the user. The solution involves a text-based protocol using specific delimiters. The internal component should allo"
+}

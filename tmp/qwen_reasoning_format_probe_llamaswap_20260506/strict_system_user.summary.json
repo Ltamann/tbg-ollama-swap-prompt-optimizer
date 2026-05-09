@@ -1,0 +1,14 @@
+{
+  "case": "strict_system_user",
+  "duration_ms": 195577,
+  "finish_reasons": [
+    "stop"
+  ],
+  "reasoning_starts_summary": false,
+  "reasoning_has_summary": true,
+  "reasoning_has_detail": true,
+  "content_starts_summary": true,
+  "content_has_summary": true,
+  "reasoning_preview": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Task:** Design a reasoning format for a coding agent.\n   - **Requirements:** \n     - Short user-facing progress updates\n     - Full detailed reasoning (internal/hidden)\n     - Answer briefly at the end.\n   - **Constraint (from system prompt):** Inside the thinking block only, do not use numbered lists or prefaces like \"Here is my thinking.\" Begin immediately with exactly:\n     [SUMMARY]\n     GOAL: <short>\n     DECISION: <short>\n     NEXT: <short>\n     STATUS: <ready|working|blocked|done>\n     [DETAIL]\n     Then continue the rest of your full reasoning. Do not repeat the summary in the final visible answer.\n\n2.  **Deconstruct Constraints:**\n   - Must start thinking block with exact format.\n   - No numbered lists in thinking block.\n   - No prefaces.\n   - Final answer should be brief.\n   - The reasoning format itself needs to be",
+  "content_preview": "[SUMMARY]\nGOAL: Design a dual-layer reasoning format for coding agents\nDECISION: Use a structured template separating streamed progress from hidden detailed reasoning\nNEXT: Define the template, explain usage, and provide a brief final answer\nSTATUS: ready\n\n[DETAIL]\nThe format requires a clear boundary between user-facing telemetry and internal chain-of-thought. I will structure it using explicit markers that can be parsed by an orchestrator. The progress layer will be optimized for streaming, co"
+}

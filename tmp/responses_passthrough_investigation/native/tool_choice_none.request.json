@@ -1,0 +1,28 @@
+{
+  "method": "POST",
+  "path_template": "/responses",
+  "target_model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+  "body": {
+    "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+    "input": "Reply with exactly: NO_TOOL_OK",
+    "tools": [
+      {
+        "type": "function",
+        "name": "echo_tool",
+        "description": "echo_tool test tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        }
+      }
+    ],
+    "tool_choice": "none"
+  }
+}

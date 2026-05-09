@@ -1,0 +1,10 @@
+{
+  "method": "POST",
+  "path_template": "/responses",
+  "target_model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+  "body": {
+    "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+    "instructions": "You are a terse assistant.",
+    "input": "Reply with exactly: INSTR_OK"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "method": "GET",
+  "path_template": "/responses/{response_id}",
+  "target_model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+  "dynamic_response_id_from": "post_basic",
+  "resolved_response_id": "resp_tBBgGVKr3Iwnm2J7y1DxVtnXrQWnHNcc"
+}

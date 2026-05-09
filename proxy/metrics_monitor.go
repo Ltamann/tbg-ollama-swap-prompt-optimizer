@@ -382,6 +382,18 @@ func (mp *metricsMonitor) getMetrics() []TokenMetrics {
 	return result
 }
 
+func (mp *metricsMonitor) getMetricByID(id int) *TokenMetrics {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	for i := range mp.metrics {
+		if mp.metrics[i].ID == id {
+			metric := mp.metrics[i]
+			return &metric
+		}
+	}
+	return nil
+}
+
 // getMetricsJSON returns metrics as JSON
 func (mp *metricsMonitor) getMetricsJSON() ([]byte, error) {
 	mp.mu.RLock()
@@ -560,6 +572,7 @@ func (mp *metricsMonitor) finalizeMetricCapture(
 		redactHeaders(respHeaders)
 		delete(respHeaders, "Content-Encoding")
 		stages := getCaptureStages(request.Context())
+		mp.logger.Infof("capture finalize path=%s stages=%d names=%s", request.URL.Path, len(stages), summarizeCaptureStageNames(stages))
 		capture = &ReqRespCapture{
 			ReqPath:     request.URL.Path,
 			ReqHeaders:  reqHeaders,
@@ -586,6 +599,21 @@ func (mp *metricsMonitor) finalizeMetricCapture(
 	mp.invokeChatCaptureCallbacks(request.URL.Path, reqBody, body, tm)
 
 	return nil
+}
+
+func summarizeCaptureStageNames(stages []CaptureStage) string {
+	if len(stages) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(stages))
+	for _, stage := range stages {
+		name := strings.TrimSpace(stage.Name)
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	return strings.Join(names, ",")
 }
 
 func processStreamingResponse(modelID string, start time.Time, body []byte) (TokenMetrics, error) {

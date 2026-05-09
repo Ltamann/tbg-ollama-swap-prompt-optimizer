@@ -1,0 +1,26 @@
+{
+  "http_status": 200,
+  "duration_ms": 850,
+  "error_text": "",
+  "stream": false,
+  "response_summary": {
+    "response_id": "resp_chatcmpl-2bkPqkmhZZ8T7hWqYlWH7Up015PsSJwB",
+    "response_status": "completed",
+    "object": "response",
+    "output_types": [
+      "message"
+    ],
+    "tool_item_count": 0,
+    "message_item_count": 1,
+    "reasoning_item_count": 0,
+    "mixed_message_tool": false,
+    "top_level_output_text_present": true,
+    "usage_present": true,
+    "timings_present": false,
+    "plan_wrapper_present": false,
+    "first_message_text": "The user wants a specific output: \"TOKENS_OK\". This looks like a simple string request, likely from a system or an automated script checking for a specific",
+    "final_message_text": "The user wants a specific output: \"TOKENS_OK\". This looks like a simple string request, likely from a system or an automated script checking for a specific",
+    "tool_item_statuses": [],
+    "tool_item_names": []
+  }
+}

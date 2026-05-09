@@ -1,0 +1,14 @@
+{
+  "case": "strict_user",
+  "duration_ms": 161393,
+  "finish_reasons": [
+    "stop"
+  ],
+  "reasoning_starts_summary": false,
+  "reasoning_has_summary": true,
+  "reasoning_has_detail": true,
+  "content_starts_summary": true,
+  "content_has_summary": true,
+  "reasoning_preview": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Constraint 1:** Inside the thinking block only, do not use numbered lists or prefaces like \"Here is my thinking.\"\n   - **Constraint 2:** Begin immediately with exactly:\n     [SUMMARY]\n     GOAL: <short>\n     DECISION: <short>\n     NEXT: <short>\n     STATUS: <ready|working|blocked|done>\n   - **Constraint 3:** [DETAIL] Then continue the rest of your full reasoning.\n   - **Constraint 4:** Do not repeat the summary in the final visible answer.\n   - **Task:** Design a reasoning format for a coding agent that gives short user-facing progress plus full detailed reasoning. Then answer briefly.\n\n2.  **Deconstruct Constraints & Requirements:**\n   - The thinking block must start exactly with the specified summary format.\n   - No numbered lists or prefaces in the thinking block.\n   - After the summary, provide detailed reasoning under [D",
+  "content_preview": "[SUMMARY]\nGOAL: Design dual-track reasoning format for coding agent\nDECISION: Implement separated progress and reasoning streams using explicit tags\nNEXT: Define structure and output brief implementation guide\nSTATUS: ready\n\n[DETAIL]\nThe format needs to solve two problems: cognitive load for users and analytical depth for the agent. I will structure it as a dual-stream template. The first stream, `::PROGRESS::`, is strictly bounded, imperative, and user-facing. It reports what changed, why it ma"
+}

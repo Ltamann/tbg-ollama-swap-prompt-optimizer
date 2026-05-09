@@ -1,0 +1,7 @@
+{
+  "method": "GET",
+  "path_template": "/responses/{response_id}",
+  "target_model": "GLM-4.7-Flash-UD-Q8_K_XL",
+  "dynamic_response_id_from": "post_basic",
+  "resolved_response_id": "resp_chatcmpl-u0k1GRlIxU9oFlW8Bfl1iKhhFhTX34Kd"
+}

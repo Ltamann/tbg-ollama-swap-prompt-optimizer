@@ -1,0 +1,12 @@
+{
+  "case": "summary_detail_text",
+  "duration_ms": 110953,
+  "finish_reasons": [
+    "stop"
+  ],
+  "reasoning_preview": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Goal:** Design a reasoning format for a coding agent.\n   - **Requirements:** \n     - Short user-facing progress updates\n     - Full detailed reasoning\n     - Answer briefly\n   - **Implicit Need:** The format should be structured, clear, and separate the concise user-facing part from the detailed internal reasoning.\n\n2.  **Identify Key Components:**\n   - Need a clear delimiter/structure\n   - User-facing part: brief, actionable, progress-oriented\n   - Detailed reasoning part: comprehensive, step-by-step, internal\n   - Must be easy for an agent to generate and for a system to parse/display\n   - Should follow the exact structure requested in the system prompt for *my* thinking, but the user is asking me to *design* a format for a coding agent.\n\n3.  **Design the Format:**\n   Let's create a structured template:\n   ```\n   [PROGRESS]\n   <1-2 sentences for user: current step, status, next action>\n\n   [REASONING]\n   <Full detailed breakdown: analysis, decisions, code snippets, edge cases, verification steps>\n   ```\n   Wait, the system prompt says: \"When thinking, always begin reasoning with exactly this structure: [SUMMARY]... [D",
+  "content_preview": "[SUMMARY]\nGOAL: Design agent reasoning format with user progress + detailed reasoning\nDECISION: Use clear delimited sections separating concise updates from full analysis\nNEXT: Present the template and briefly explain its usage\nSTATUS: ready\n\n[DETAIL]\nHere is the designed format:\n\n```\n[USER_PROGRESS]\n<1\u20132 lines: Current phase, what\u2019s being done, and immediate next step>\n\n[DETAILED_REASONING]\n<Full step-by-step analysis: problem breakdown, architecture/code decisions, edge cases, test strategy, and verification logic>\n```\n\n**How it works:** The agent emits `[USER_PROGRESS]` first for instant UI",
+  "has_summary_tag": true,
+  "has_detail_tag": true,
+  "starts_with_json": false
+}

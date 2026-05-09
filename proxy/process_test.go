@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -88,6 +89,31 @@ func TestProcess_WaitOnMultipleStarts(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	assert.Equal(t, StateReady, process.CurrentState())
+}
+
+func TestProcess_StartConcurrentCallsSettleCleanly(t *testing.T) {
+	expectedMessage := "testing91931"
+	config := getTestSimpleResponderConfig(expectedMessage)
+
+	process := NewProcess("test-process", 5, config, debugLogger, debugLogger, debugLogger)
+	defer process.Stop()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- process.start()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		assert.NoError(t, err)
+	}
 	assert.Equal(t, StateReady, process.CurrentState())
 }
 
@@ -259,6 +285,71 @@ func TestRewriteResponsesToolCallPayload(t *testing.T) {
 	assert.Equal(t, "computer_call", seventh["type"])
 	action, _ = seventh["action"].(map[string]any)
 	assert.Equal(t, "click", action["action"])
+}
+
+func TestProcess_AdoptHealthyUpstream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	parsed, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+
+	cfg := config.ModelConfig{
+		Proxy:         parsed.String(),
+		CheckEndpoint: "/health",
+	}
+	process := NewProcess("adopt-test", 2, cfg, debugLogger, debugLogger, debugLogger)
+	process.forceState(StateStopped)
+	process.failedStartCount = 3
+
+	ok := process.adoptHealthyUpstream(srv.URL+"/health", "unit-test")
+	require.True(t, ok)
+	assert.Equal(t, StateReady, process.CurrentState())
+	assert.Equal(t, 0, process.failedStartCount)
+}
+
+func TestProcess_AdoptHealthyUpstream_FailsWhenUnhealthy(t *testing.T) {
+	cfg := config.ModelConfig{
+		Proxy:         "http://127.0.0.1:1",
+		CheckEndpoint: "/health",
+	}
+	process := NewProcess("adopt-test-fail", 1, cfg, debugLogger, debugLogger, debugLogger)
+	process.forceState(StateStopped)
+	process.failedStartCount = 2
+
+	ok := process.adoptHealthyUpstream("http://127.0.0.1:1/health", "unit-test")
+	assert.False(t, ok)
+	assert.Equal(t, StateStopped, process.CurrentState())
+	assert.Equal(t, 2, process.failedStartCount)
+}
+
+func TestCalculateUnexpectedRestartDelay(t *testing.T) {
+	t.Run("base delay for first retry", func(t *testing.T) {
+		delay := calculateUnexpectedRestartDelay(1, 0)
+		assert.Equal(t, 1500*time.Millisecond, delay)
+	})
+
+	t.Run("second retry doubles delay", func(t *testing.T) {
+		delay := calculateUnexpectedRestartDelay(2, 500*time.Millisecond)
+		assert.Equal(t, 2500*time.Millisecond, delay)
+	})
+
+	t.Run("caps at max delay", func(t *testing.T) {
+		delay := calculateUnexpectedRestartDelay(10, 0)
+		assert.Equal(t, 8*time.Second, delay)
+	})
+
+	t.Run("no delay once elapsed exceeds target", func(t *testing.T) {
+		delay := calculateUnexpectedRestartDelay(3, 10*time.Second)
+		assert.Equal(t, time.Duration(0), delay)
+	})
 }
 
 func TestRewriteResponsesToolCallPayload_ApplyPatchAcceptsPatchString(t *testing.T) {
@@ -828,6 +919,57 @@ func TestProcess_ReverseProxyPanicIsHandled(t *testing.T) {
 
 	// If we get here, the panic was properly recovered in ProxyRequest
 	// The process should still be in a ready state
+	assert.Equal(t, StateReady, process.CurrentState())
+}
+
+func TestProcess_ProxyRequestMarksStoppedAfterBadGatewayWhenHealthFails(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			http.Error(w, "dead", http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+
+	conf := config.ModelConfig{
+		Proxy:         upstream.URL,
+		CheckEndpoint: "/health",
+	}
+	process := NewProcess("proxy-502-dead", 1, conf, debugLogger, debugLogger, debugLogger)
+	process.forceState(StateReady)
+
+	req := httptest.NewRequest("GET", "/v1/responses", nil)
+	w := httptest.NewRecorder()
+	process.ProxyRequest(w, req)
+
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+	assert.Equal(t, StateStopped, process.CurrentState())
+}
+
+func TestProcess_ProxyRequestKeepsReadyAfterBadGatewayWhenHealthPasses(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+
+	conf := config.ModelConfig{
+		Proxy:         upstream.URL,
+		CheckEndpoint: "/health",
+	}
+	process := NewProcess("proxy-502-healthy", 1, conf, debugLogger, debugLogger, debugLogger)
+	process.forceState(StateReady)
+
+	req := httptest.NewRequest("GET", "/v1/responses", nil)
+	w := httptest.NewRecorder()
+	process.ProxyRequest(w, req)
+
+	assert.Equal(t, http.StatusBadGateway, w.Code)
 	assert.Equal(t, StateReady, process.CurrentState())
 }
 

@@ -1,0 +1,7 @@
+{
+  "http_status": 404,
+  "duration_ms": 0,
+  "error_text": "HTTP Error 404: Not Found",
+  "stream": false,
+  "non_json_body": ""
+}

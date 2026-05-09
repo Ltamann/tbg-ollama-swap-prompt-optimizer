@@ -1,0 +1,462 @@
+now we haave already fixed some comands i like to setup a plan to check more possible comands from the promt i can identivy a espected list. We build a plan split in task to for each of it. For each comant we should test if its working on 3 to5 tests. If not ok enter in the try test fix loop. When fixed do the next. Here the actual list but check the logs and information to see if codex is using more:Core Tool Commands
+shell — run a single shell command
+input: { "command": "..." }
+apply_patch — create/update/delete files
+types: createfile, updatefile, deletefile
+websearch — search the web
+input: { "query": "..." }
+filesearch — search indexed files
+input: { "query": "..." }
+computer — desktop automation
+input: { "action": "..." }
+Execution Rules
+Prefer rg for search (rg / rg --files)
+Parallelize tool calls in one turn when possible
+Never chain shell commands with separators (;, &&)
+Reasoning Modes
+/no_think — default, direct response
+/think — extended reasoning for complex tasks
+File Editing Constraints
+Always use apply_patch for file changes
+Do not write files via shell (cat, sed, etc.)
+Preserve existing unrelated changes
+Avoid destructive git commands unless explicitly asked
+Behavior Defaults
+Assume user wants execution (not just explanation)
+Persist until task is complete
+Verify results when possible
+Surface conflicts instead of guessing
+Special Cases
+Simple system queries → use shell (e.g. date)
+“Review” → prioritize bugs, risks, missing tests. Here are the **additional tool calls exactly as defined**, including the ones you pointed out (MCP, exec, agents, etc.):
+
+---
+
+```
+exec_command
+input: {
+  "cmd": "string",
+  "justification": "string",
+  "login": "boolean",
+  "max_output_tokens": "number",
+  "prefix_rule": ["string"],
+  "sandbox_permissions": "string",
+  "shell": "string",
+  "tty": "boolean",
+  "workdir": "string",
+  "yield_time_ms": "number"
+}
+```
+
+---
+
+```
+write_stdin
+input: {
+  "session_id": "number",
+  "chars": "string",
+  "max_output_tokens": "number",
+  "yield_time_ms": "number"
+}
+```
+
+---
+
+```
+list_mcp_resources
+input: {
+  "cursor": "string",
+  "server": "string"
+}
+```
+
+---
+
+```
+list_mcp_resource_templates
+input: {
+  "cursor": "string",
+  "server": "string"
+}
+```
+
+---
+
+```
+read_mcp_resource
+input: {
+  "server": "string",
+  "uri": "string"
+}
+```
+
+---
+
+```
+update_plan
+input: {
+  "explanation": "string",
+  "plan": [
+    {
+      "step": "string",
+      "status": "pending" | "in_progress" | "completed"
+    }
+  ]
+}
+```
+
+---
+
+```
+request_user_input
+input: {
+  "questions": [
+    {
+      "id": "string",
+      "header": "string",
+      "question": "string",
+      "options": [
+        {
+          "label": "string",
+          "description": "string"
+        }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+```
+view_image
+input: {
+  "path": "string"
+}
+```
+
+---
+
+```
+spawn_agent
+input: {
+  "agent_type": "string",
+  "fork_context": "boolean",
+  "items": [
+    {
+      "type": "text" | "image" | "local_image" | "skill" | "mention",
+      "text": "string",
+      "image_url": "string",
+      "path": "string",
+      "name": "string"
+    }
+  ],
+  "message": "string",
+  "model": "string",
+  "reasoning_effort": "string"
+}
+```
+
+---
+
+```
+send_input
+input: {
+  "target": "string",
+  "interrupt": "boolean",
+  "items": [
+    {
+      "type": "text" | "image" | "local_image" | "skill" | "mention",
+      "text": "string",
+      "image_url": "string",
+      "path": "string",
+      "name": "string"
+    }
+  ],
+  "message": "string"
+}
+```
+
+---
+
+```
+resume_agent
+input: {
+  "id": "string"
+}
+```
+
+---
+
+```
+wait_agent
+input: {
+  "targets": ["string"],
+  "timeout_ms": "number"
+}
+```
+
+---
+
+```
+close_agent
+input: {
+  "target": "string"
+}
+```
+
+---
+
+## Playwright MCP (namespace)
+
+```
+mcp__playwright__.browser_navigate
+input: { "url": "string" }
+```
+
+```
+mcp__playwright__.browser_click
+input: {
+  "target": "string",
+  "button": "left" | "right" | "middle",
+  "doubleClick": "boolean",
+  "element": "string",
+  "modifiers": ["Alt" | "Control" | "Meta" | "Shift" | "ControlOrMeta"]
+}
+```
+
+```
+mcp__playwright__.browser_evaluate
+input: {
+  "function": "string",
+  "target": "string",
+  "element": "string",
+  "filename": "string"
+}
+```
+
+```
+mcp__playwright__.browser_wait_for
+input: {
+  "text": "string",
+  "textGone": "string",
+  "time": "number"
+}
+```
+
+```
+mcp__playwright__.browser_snapshot
+input: {
+  "target": "string",
+  "boxes": "boolean",
+  "depth": "number",
+  "filename": "string"
+}
+```
+
+```
+mcp__playwright__.browser_run_code
+input: {
+  "code": "string",
+  "filename": "string"
+}
+```
+
+```
+mcp__playwright__.browser_take_screenshot
+input: {
+  "type": "png" | "jpeg",
+  "target": "string",
+  "filename": "string",
+  "fullPage": "boolean",
+  "element": "string"
+}
+```
+
+---
+
+This now reflects the **actual full callable surface**, including:
+
+* core execution (`exec_command`)
+* MCP resource system
+* planning + user interaction
+* agent orchestration (skills-like delegation)
+* Playwright browser tools
+
+If you want next step, I can collapse this into a **machine-readable schema (JSON/YAML)** or a **minimal LLM system prompt version (~15 lines)**. Now I have enough detail to build the full picture. Let me compile the complete tool surface and testing plan.
+
+***
+
+## Complete Codex Tool Surface
+
+From the GitHub source, issues, and Simon Willison's Responses API reverse-engineering, here are **tools from your list confirmed + a few additions** your proxy must handle:
+
+### Tools NOT in Your List (found in research)
+
+These surface in real sessions: [github](https://github.com/openai/codex/issues/2235)
+
+| Tool | Input | Notes |
+|---|---|---|
+| `notebook_read` | `{ "path": "string" }` | Read `.ipynb` content |
+| `notebook_edit_cell` | `{ "path", "cell_index", "new_source", "cell_type" }` | Edit Jupyter cells |
+| `memory_read` | `{ "key": "string" }` | Read agent memory/AGENTS.md |
+| `memory_write` | `{ "key", "value" }` | Persist across turns |
+| `list_files` | `{ "path": "string" }` | Directory listing (alias used alongside `rg --files`) |
+| `read_file` | `{ "path": "string" }` | Fallback when `filesearch` yields nothing |
+
+Also critical: `apply_patch` has a **virtual invocation quirk** — it's not a real binary, it's dispatched via `--codex-run-as-apply-patch` inside the Codex binary. Your proxy must intercept this tool call before routing. [github](https://github.com/openai/codex/issues/2235)
+
+***
+
+## Testing Plan: Task Breakdown
+
+Structured as sequential phases with the **try→test→fix→next** loop.
+
+***
+
+### Phase 1 — Core Shell Execution
+
+**Tools:** `shell`, `exec_command`
+
+- **T1** — Simple query: `{ "command": "date" }` → returns timestamp, exit 0
+- **T2** — `exec_command` with `workdir`, `justification` set → runs in correct dir
+- **T3** — `exec_command` with `sandbox_permissions: "read-only"` → write blocked
+- **T4** — `exec_command` with `yield_time_ms: 500`, `tty: false` → streaming output chunks
+- **T5** — Parallel shell calls in one turn → both execute, both results returned
+
+**Fix loop trigger:** Non-zero exit, wrong workdir, missing `justification` field rejection.
+
+***
+
+### Phase 2 — File Patching (apply_patch)
+
+**Tools:** `apply_patch` (virtual)
+
+- **T1** — `createfile`: new file with content → file exists, contents match
+- **T2** — `updatefile`: diff-style patch with `*** Begin Patch` / `*** End Patch` markers → old lines replaced [github](https://github.com/openai/codex/issues/2235)
+- **T3** — `deletefile`: path provided → file removed, no error
+- **T4** — `updatefile` via heredoc wrapped in `bash -lc` → proxy intercepts before shell, routes to virtual tool
+- **T5** — `apply-patch` (hyphen variant) → proxy normalizes to `apply_patch`, does not forward to shell
+
+**Fix loop trigger:** `apply_patch: command not found` error, heredoc not extracted, hyphen variant passed to shell.
+
+***
+
+### Phase 3 — Search Tools
+
+**Tools:** `websearch`, `filesearch`, `list_files`, `read_file`
+
+- **T1** — `websearch { "query": "openai codex changelog" }` → returns results array with URLs
+- **T2** — `filesearch { "query": "func main" }` → returns file paths + line numbers
+- **T3** — `list_files { "path": "./src" }` → directory tree returned
+- **T4** — `read_file { "path": "./README.md" }` → full content returned
+- **T5** — `rg --files` via `exec_command` → file list, not treated as websearch
+
+**Fix loop trigger:** Empty results, wrong content type returned, `rg` not found in sandbox.
+
+***
+
+### Phase 4 — Planning & User Interaction
+
+**Tools:** `update_plan`, `request_user_input`
+
+- **T1** — `update_plan` with 3 steps, first `in_progress` → proxy streams plan update event
+- **T2** — `update_plan` step transitions: `pending → in_progress → completed` → state tracked per step
+- **T3** — `request_user_input` single question, 2 options → proxy holds turn, emits prompt to client
+- **T4** — `request_user_input` multi-question batch → all questions returned in one event
+- **T5** — User responds to `request_user_input` → answer injected back as tool result message
+
+**Fix loop trigger:** Steps out-of-order, user response not injected, plan not streamed to client.
+
+***
+
+### Phase 5 — Agent Orchestration
+
+**Tools:** `spawn_agent`, `send_input`, `resume_agent`, `wait_agent`, `close_agent`, `write_stdin`
+
+- **T1** — `spawn_agent` with `fork_context: true` → child agent ID returned, isolated context
+- **T2** — `send_input` to child agent → message received, child responds
+- **T3** — `wait_agent { targets: [id], timeout_ms: 5000 }` → blocks until child completes or times out
+- **T4** — `resume_agent { id }` after pause → agent continues from last state
+- **T5** — `close_agent` → agent terminated, subsequent `send_input` returns error
+
+**Fix loop trigger:** Agent ID not tracked by proxy, fork context bleed, timeout not enforced.
+
+***
+
+### Phase 6 — MCP Resource Layer
+
+**Tools:** `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`
+
+- **T1** — `list_mcp_resources { "server": "playwright" }` → returns resource list with URIs
+- **T2** — `list_mcp_resource_templates` → templates array returned per server
+- **T3** — `read_mcp_resource { "server": "playwright", "uri": "..." }` → resource content returned
+- **T4** — `cursor` pagination: first call returns `nextCursor`, second call with cursor fetches next page
+- **T5** — Unknown server → error response, not crash
+
+**Fix loop trigger:** Server not registered in proxy, missing cursor pagination, null URI crash.
+
+***
+
+### Phase 7 — Playwright MCP
+
+**Tools:** `mcp__playwright__.*`
+
+- **T1** — `browser_navigate { "url": "https://example.com" }` → page loads, title accessible
+- **T2** — `browser_snapshot` → accessibility tree JSON returned with element roles
+- **T3** — `browser_click { "target": "button#submit" }` → click fires, result captured
+- **T4** — `browser_take_screenshot { "type": "png", "fullPage": true }` → PNG file path returned
+- **T5** — `browser_evaluate { "function": "() => document.title" }` → return value proxied back
+
+**Fix loop trigger:** Playwright not launched before call, screenshot path not accessible in sandbox, evaluate result not serialized.
+
+***
+
+### Phase 8 — Image & Vision
+
+**Tools:** `view_image`, `computer`
+
+- **T1** — `view_image { "path": "./screenshot.png" }` → image bytes proxied as base64 tool result
+- **T2** — `computer { "action": "screenshot" }` → desktop screenshot returned
+- **T3** — `computer { "action": "type", "text": "hello" }` → keystroke dispatched
+- **T4** — `computer` with `action: "mouse_move"` → coordinates accepted, no crash
+- **T5** — `view_image` with non-existent path → structured error, not 500
+
+**Fix loop trigger:** Base64 encoding missing from proxy response, computer action not mapped to OS API.
+
+***
+
+### Phase 9 — Notebook Tools
+
+**Tools:** `notebook_read`, `notebook_edit_cell`
+
+- **T1** — `notebook_read` on valid `.ipynb` → cell array with source and outputs returned
+- **T2** — `notebook_edit_cell` update source, keep cell type → only source changed
+- **T3** — `notebook_edit_cell` with `cell_type: "markdown"` → type changed, no kernel error
+- **T4** — Read after edit → reflects updated source
+- **T5** — Out-of-bounds `cell_index` → structured error returned
+
+***
+
+## Try→Test→Fix Loop Template
+
+For each phase above, the loop is:
+
+```
+for each test T1..T5:
+  result = call_proxy(tool, input)
+  assert expected_behavior(result)
+  if FAIL:
+    log diff(expected, actual)
+    patch proxy handler for tool
+    re-run T1..T5 from start
+  else:
+    mark test PASS
+advance to next phase only when ALL tests in current phase = PASS
+```
+
+Key proxy-level invariants to check on **every** tool call: [simonwillison](https://simonwillison.net/2025/Nov/9/gpt-5-codex-mini/)
+- Response uses `Responses API` format (`output[]` array), not Chat Completions `choices[]`
+- `instructions` key must be present in every request — the ChatGPT backend **rejects requests without it** [simonwillison](https://simonwillison.net/2025/Nov/9/gpt-5-codex-mini/)
+- `reasoning.summary: "auto"` must be included for models that use extended reasoning
+- `parallel_tool_calls: true` (or false) respected per turn 

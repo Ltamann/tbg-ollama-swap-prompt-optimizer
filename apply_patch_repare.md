@@ -258,6 +258,71 @@
 - Verification note:
   - Focused Go tests reached the real Linux path successfully via `wsl --cd` and `/usr/local/go/bin/go`.
   - Immediate failure was not in the bridge logic; it was a test compile issue because `proxy/proxymanager_test.go` did not import `require` for the new cases.
+
+## 2026-05-08 10:40:00 +0200
+- Iteration intent:
+  - Finish the forensics presentation slice for the new Qwen semantic stream stage.
+  - Promote `bridge.qwen_stream_normalization` into top-level `/api/forensics` output and add classification notes so localhost debugging does not require manual `stages[]` inspection.
+- Iteration outcome:
+  - Added top-level `qwen_stream` to `RequestForensicSummary`.
+  - `/api/forensics` now promotes the normalized Qwen stream summary from the capture stage into the main forensic payload.
+  - Added semantic forensic notes for:
+    - malformed normalized reasoning
+    - recovered question semantics
+    - recovered plan semantics
+    - semantic message errors
+    - reasoning-only stream routes with no visible commentary/final output
+  - Added `TestBuildRequestForensicSummary_PromotesQwenStreamAndMalformedReasoning`.
+  - Updated structured forensics API test to assert top-level `qwen_stream` and the recovered-question note.
+  - Focused proxy tests passed.
+  - `go build -o llama-swap .` passed.
+
+## 2026-05-08 11:05:00 +0200
+- Iteration intent:
+  - Improve forensic presentation for streamed upstream chat responses.
+  - Goal: stop surfacing raw streamed chat-completions payloads as `error_text` when they can be summarized structurally.
+- Iteration outcome:
+  - `summarizeForensicChatResponse(...)` now detects raw SSE payloads and parses them into a structured streamed chat-response summary.
+  - Added streamed chat forensic fields:
+    - `is_stream`
+    - `chunk_count`
+    - `has_done_marker`
+  - Streamed upstream chat response summaries now preserve:
+    - model
+    - finish reason
+    - content preview
+    - reasoning preview
+    - tool call names
+  - Added regression test:
+    - `TestSummarizeForensicChatResponse_StreamedChatCompletions`
+  - Focused proxy tests passed.
+  - `go build -o llama-swap .` passed.
+
+## 2026-05-08 11:35:00 +0200
+- Iteration intent:
+  - Repair the latest manual CLI biology-quiz failure where an implementation retry turn was translated upstream with `tool_choice:"none"` and zero tools.
+  - Hypothesis: stale post-`request_user_input` / post-plan continuation state is leaking into implementation/retry turns, disabling tools before Qwen sees the request.
+- Change applied:
+  - Added implementation/retry intent detection for current Responses requests.
+  - `requestStillWantsStructuredPlan(...)` now exits early for explicit implementation/retry turns.
+  - Continuation controller no longer forces stale plan/question follow-up behavior when the current turn is an implementation retry.
+  - Added regressions for:
+    - retry after invalid `apply_patch` keeps tools available
+    - implementation retry after native question keeps tools enabled
+    - structured-plan detection stays false on `try again` after invalid patch feedback
+- Iteration outcome:
+  - Focused continuation/plan/stream proxy tests passed.
+  - `go build -o llama-swap .` passed.
+  - Rebuilt, copied, and restarted live `:8080` successfully.
+  - Localhost retry repro now keeps tools exposed through the chat translation layer:
+    - `bridge.responses_request.tool_choice = "auto"`
+    - `bridge.chat_completions_request.tool_choice = "auto"`
+    - `bridge.chat_completions_request.tools_count = 3`
+  - Fresh localhost repro also produced native upstream tool behavior instead of pseudo-tool text:
+    - `bridge.chat_completions_response.finish_reason = "tool_calls"`
+    - `tool_call_names = ["apply_patch"]`
+    - `bridge.responses_output.status = "requires_action"`
+  - The previous bad symptom (`<tool_code> apply_patch(...)` as final assistant text) did not occur in the localhost retry repro after this patch.
   - Next action: add the missing import, rerun the same targeted tests, then rebuild/copy/restart.
 ## 2026-05-02 00:28:00 +0200
 - Iteration outcome before rebuild:
@@ -346,3 +411,622 @@
     - the remaining `502` path is likely tied to auto-tool turns, especially agent orchestration and some apply_patch continuation cases
   - Next likely target:
     - narrow or stabilize auto-tool exposure on the remaining `T55` / `T57` paths without relying on prompt-specific heuristics
+## 2026-05-05 19:05:00 +0200
+- Patch intent:
+  - Target the true-local T11 regression where Codex stops after the first shell turn even though the bridge returns an apply_patch tool phase.
+  - Strongest current evidence: capture 5 shows the bridge emits a commentary assistant message before the apply_patch_call on a tool-continuation turn.
+  - Minimal fix hypothesis: preserve reasoning lanes but suppress assistant commentary messages on turns that contain live tool calls, in both writeResponsesStream() and writeResponsesStreamFromChatSSE().
+  - Validation gate after patch:
+    - focused Go tests for stream/replay tool-turn commentary behavior
+    - rebuild
+    - true-local Codex smoke + T20 + T11
+
+## 2026-05-05 19:18:00 +0200
+- Patch outcome before live retest:
+  - Suppressed assistant commentary messages on tool turns in both response replay and direct chat-SSE reconstruction paths.
+  - Direct chat-SSE path now buffers plain text until finalization and only emits a final assistant message when the turn actually finishes as a non-tool answer.
+  - Added focused regressions:
+    - TestWriteResponsesStream_SuppressesCommentaryWhenToolContinuationIsRequired
+    - TestWriteResponsesStreamFromChatSSE_SuppressesCommentaryOnToolTurn
+  - Focused gate passed:
+    - TestWriteResponsesStream_SuppressesCommentaryWhenToolContinuationIsRequired
+    - TestWriteResponsesStreamFromChatSSE_SuppressesCommentaryOnToolTurn
+    - TestWriteResponsesStreamFromChatSSE_EmitsToolCallArgumentDeltas
+    - TestProxyCompatibilitySuite
+
+## 2026-05-05 19:33:00 +0200
+- Second T11 repair iteration:
+  - Proven working localhost artifact uses streamed apply_patch as a normal function_call with name=apply_patch and structured JSON arguments.
+  - Bridge was currently rewriting streamed apply_patch into apply_patch_call/custom_tool_call shapes.
+  - Changed both stream emitters to restore the proven contract:
+    - type=function_call
+    - name=apply_patch
+    - arguments={input,operation}
+    - response.function_call_arguments.* emitted for apply_patch again
+  - Focused gate passed again before live retest.
+
+## 2026-05-05 19:46:00 +0200
+- Third T11 repair iteration:
+  - Remaining true-local bug after tool-shape fix: first apply_patch execution duplicated BASE_A because the bridge synthesized weak @@ +... patch text from full desired file content for a path it could not inspect locally.
+  - Cause: Windows Codex workspace path was outside the proxy workspace, so heuristic contextual patch rebuilding could not read the target file.
+  - Fix: for content-only update_file operations on non-local paths, omit synthetic patch text and let structured operation.content drive the update instead.
+  - Added regression: external-workspace content-only update payload should omit generated input patch text.
+
+## 2026-05-05 20:05:00 +0200
+- Forensic reset after all-502 / zero-token localhost runs:
+  - Latest `/api/metrics` rows 0..3 all show status 502 with input_tokens=0 and output_tokens=0.
+  - Failing capture 0 proves the original Codex `/v1/responses` request is normal (`stream=true`, `tool_choice=auto`, full tool catalog present), but the stored response body is only: `unable to start process: upstream command exited prematurely but successfully`.
+  - `/tmp/llama-swap.log` shows repeated `EnsureStarted` retries and `exit status 1` before any real upstream output is produced.
+  - First wrong stage is therefore upstream runtime startup / model process initialization, not later tool parsing, stream reconstruction, or Codex continuation routing.
+  - Next safe action is runtime recovery / model-start investigation, not more bridge-contract edits until the upstream process is stable again.
+
+## 2026-05-05 20:32:00 +0200
+- Patch intent:
+  - Target the persistent startup/state-machine race instead of more retry timing tweaks.
+  - Latest logs show overlapping EnsureStarted() loops repeatedly colliding on the same Process while one start attempt is still in flight, producing process was already starting but wound up in state stopped and ailed to set Process state to ready churn.
+  - Minimal fix hypothesis: serialize Process.start() so only one goroutine can run the startup/health/ready handoff at a time, and make concurrent callers observe the settled state instead of opening fresh overlapping start attempts.
+  - Validation gate after patch:
+    - focused Go tests for concurrent start behavior
+    - rebuild
+    - repeated localhost smoke pass
+
+
+## 2026-05-05 20:56:00 +0200
+- Patch intent:
+  - Target the remaining localhost T11 timeout after the startup fix.
+  - Latest live evidence: T20 and T22 pass again, but T11 times out after Codex completes the file_change and waits for the forced shell verification continuation.
+  - Capture 9 shows the bridge forces shell correctly after completed pply_patch, but still injects the Qwen close-think logit_bias on that post-tool verification turn.
+  - Minimal fix hypothesis: keep thinking enabled and preserve parallel support, but suppress the close-think bias on the specific pply_patch -> forced shell verification continuation shape.
+  - Validation gate after patch:
+    - focused translation tests for shell-verification continuations
+    - rebuild
+    - localhost smoke + T20 + T22 + T11
+
+
+## 2026-05-05 21:12:00 +0200
+- Patch outcome:
+  - Serialized Process.start() with a dedicated mutex and early eady return, which stopped overlapping EnsureStarted() callers from dogpiling the same startup handoff.
+  - Focused startup tests passed:
+    - TestProcess_WaitOnMultipleStarts
+    - TestProcess_StartConcurrentCallsSettleCleanly
+    - TestProcess_ExitInterruptsHealthCheck
+    - TestIsTransientStartError
+  - Live direct smoke improved materially on the fresh workspace binary: 5/5 repeated /v1/responses runs returned 200 PORT8080_OK.
+  - After that, the real Windows Codex localhost gate moved from broad startup failure to a narrower post-tool continuation bug:
+    - T20 PASS
+    - T22 PASS
+    - T11 FAILING by timeout after completed file_change
+- Second patch outcome:
+  - Suppressed the Qwen close-think logit_bias only on the specific pply_patch -> forced shell verification continuation shape.
+  - Focused translation/compatibility tests passed:
+    - TestTranslateResponsesToChatCompletionsRequest_ContinuationAfterApplyPatchForcesShellVerification
+    - TestTranslateResponsesToChatCompletionsRequest_ExplicitNoMutationPlanDisablesTools
+    - TestProxyCompatibilitySuite
+  - Live Windows Codex localhost gate on the fresh workspace binary now passes structurally:
+    - T20 PASS
+    - T22 PASS
+    - T11 PASS (no timeout; shell -> apply_patch -> shell -> final answer completed)
+  - Remaining known quality issue:
+    - T11 final file still duplicates BASE_A on the first patch result (BASE_A, BASE_A, ORDERED_T11) before the session finishes successfully.
+    - So the timeout/regression is fixed, but the content-quality duplication issue remains the next repair target.
+
+## 2026-05-05 18:40:00 +0200
+- Apply-patch repair follow-up:
+  - Confirmed the duplication entry point from the latest T11 artifacts:
+    - the model returned an `apply_patch` `update_file` operation with full desired `content`
+    - the bridge preserved a weak synthetic diff body like `@@` plus only `+...` lines
+    - that shape can duplicate existing file content during Codex execution
+  - Added a path-hint pre-repair before `selectApplyPatchOperation(...)` so stringified `operation` payloads can inherit the real file path hint earlier.
+  - Added argument repair for two malformed native tool-call shapes:
+    - quoted JSON object arguments
+    - JSON object arguments with literal newlines inside quoted string fields
+  - Added focused regressions for:
+    - quoted-object argument unwrapping
+    - literal-newline JSON repair
+    - translate-time `apply_patch` path-hint replacement patch building
+  - Focused proxy tests and build passed after the repair slice.
+- Runtime verification note:
+  - After the code fix, I discovered `:8080` was still serving `/home/admmin/bin/llama-swap`, not the fresh workspace binary.
+  - I removed that listener and replaced it with `/home/admmin/llama-swap/llama-swap-main/llama-swap`.
+  - The workspace binary now binds `:8080`, but the first direct `/v1/responses` smoke on that fresh process timed out and the live log shows:
+    - request translation begins normally
+    - then the upstream `Qwen3.6-35B-A3B-UD-Q8_K_XL` process exits with `exit status 1` while the process state is already `ready`
+  - So the latest localhost runtime blocker is again the harness/upstream lifecycle path on the fresh workspace binary, not the old deployed binary.
+
+## 2026-05-06 13:55:00 +0200
+- Streaming recovery / plan-finalization pass:
+  - Broadened structured plan continuation so completed `request_user_input` clarification can force a real `<proposed_plan>` return outside strict plan-mode only flows.
+  - Added `requestStillWantsStructuredPlan(...)` and `structuredPlanOutputRequiredFromRequestBody(...)` so the stream bridge can recognize:
+    - formal plan mode
+    - default-mode “write/return/finalize a plan” turns
+    - post-clarification plan continuations that still need a structured plan block
+  - Tightened plan-preface recovery:
+    - `looksLikePlanAcknowledgementWithoutPlan(...)` now catches “I have everything I need / here's the plan” style acknowledgements that stop before a real plan body
+    - those now rewrite to a real `<proposed_plan>` output instead of completing as conversational prose
+  - Refactored `writeResponsesStreamFromChatSSEWithWorkflow(...)` into a more explicit presentation model:
+    - `reasoning_summary` lane uses incremental synthesized preview text from visible reasoning instead of blindly forwarding raw `reasoning_content`
+    - commentary and final text are routed separately
+    - plan-output turns buffer raw model text until the bridge decides whether it is a valid plan or a weak preface
+    - verification-in-progress and final-answer-safe turns buffer raw content so weak “Now verifying...” / “I'll create...” prose can be rewritten before it leaks as the final user-facing output
+  - Added bridge-side workflow progress commentary:
+    - generating the requested plan
+    - working on the request
+    - applying the requested file update
+    - verification in progress
+    - finalizing the response
+  - Added weak-finalization rewrite for completed workflows:
+    - final-answer-safe implementation turns now rewrite future-tense verification/setup prose to a short completion summary like:
+      - `The requested file changes were applied and verified successfully.`
+  - Added direct upstream measurement tooling:
+    - new script: `scripts/qwen_stream_probe.py`
+    - new doc: `docs/qwen-stream-probe.md`
+    - probe cases:
+      - `reasoning_only`
+      - `plan_only`
+      - `tool_reasoning`
+      - `tool_then_final`
+    - outputs:
+      - raw SSE transcript
+      - compact JSON summary with content/reasoning/tool delta counts and previews
+  - Ran the new direct upstream probe against `http://localhost:10008/v1` for `Qwen3.6-35B-A3B-UD-Q8_K_XL`:
+    - `reasoning_only`:
+      - `reasoning_delta_count=1509`
+      - `content_delta_count=48`
+      - final one-sentence visible content arrived separately from a large reasoning stream
+    - `plan_only`:
+      - `reasoning_delta_count=1519`
+      - `content_delta_count=990`
+      - model produced a real `<proposed_plan>` content stream with separate reasoning deltas
+    - `tool_reasoning`:
+      - `reasoning_delta_count=95`
+      - `tool_call_delta_count=7`
+      - `finish_reason=tool_calls`
+      - native `shell` tool deltas were present while visible `content` stayed empty
+    - artifacts saved under `tmp/qwen_stream_probe_20260506`
+  - Added/updated focused regressions for:
+    - default-mode post-clarification plan forcing
+    - plan-preface rewrite to structured `<proposed_plan>`
+    - tool-turn commentary/progress streaming
+    - synthesized reasoning-summary deltas
+    - weak final workflow text rewrite after verification
+  - Verification:
+    - focused proxy stream + compatibility + plan-matrix tests passed
+    - `go build -o llama-swap .` passed
+    - probe script syntax check passed (`py -3 -m py_compile scripts/qwen_stream_probe.py`)
+  - Deployment note:
+    - rebuilt workspace binary was copied to `/home/admmin/bin/llama-swap`
+    - live server restart initially failed when launched from the repo root because `config.yaml` lives in `/home/admmin/llama-swap`
+    - corrected restart now runs from `/home/admmin/llama-swap`, and `:8080` is serving the updated deployed binary again
+
+2026-05-06 stream regression repair follow-up:
+  - Repaired the streamed native-question path after the stream-lane refactor:
+    - broadened native-question intent detection
+    - passed `nativeQuestionRequired` into the chat-SSE reconstruction path
+    - added streamed fallback recovery for empty `request_user_input` arguments using:
+      - visible reasoning/text recovery first
+      - request-intent synthesis second
+    - fixed the mixed SSE case where `reasoning_content`, `tool_calls`, and `finish_reason:"tool_calls"` arrive in the same chunk so tool finalization now still happens
+    - commentary for native question turns now says `Preparing the clarification question.` instead of plan-generation text
+  - Added focused regression:
+    - `TestWriteResponsesStreamFromChatSSEWithWorkflow_RecoversRequestUserInputArgsAndUsesQuestionCommentary`
+  - Focused verification:
+    - `go test ./proxy -run "TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix|TestWriteResponsesStreamFromChatSSE|TestWriteResponsesStreamFromChatSSEWithWorkflow_RecoversRequestUserInputArgsAndUsesQuestionCommentary|TestWriteResponsesStreamFromChatSSE_PlanModeStripsFollowupQuestionsAndMalformedCloser|TestProxyCompatibilitySuite" -count=1`
+    - `go build -o llama-swap .`
+  - Live stream validation artifacts:
+    - `C:\Users\YLAB-Partner\Downloads\llama_swap_stream_repair_question_live.txt`
+    - `C:\Users\YLAB-Partner\Downloads\llama_swap_stream_repair_plan_live.txt`
+  - Live result:
+    - question turn now emits native `request_user_input` with recovered `questions` in the final `response.function_call_arguments.done`
+    - plan turn again emits a final `<proposed_plan>...</proposed_plan>` block
+  - Remaining stream presentation wart:
+    - the question turn still forwards ugly early partial arg deltas from upstream before the corrected final `arguments.done`
+    - the plan turn commentary is semantically valid but still generic (`Continuing from the latest tool results.` / `Finalizing the response.`) rather than ideal plan-specific phrasing
+
+## 2026-05-07 09:35:00 +0200
+- Non-stream repair loop:
+  - Localized live regression after restart to the non-stream chat->responses path.
+  - Streamed path already recovers native `request_user_input` and emits `requires_action`.
+  - Non-stream path still had two mismatches:
+    - tool-bearing outputs were serialized with top-level `status:"completed"`
+    - native-question-required turns could still collapse to plain assistant text when upstream answered with text/reasoning instead of a native question tool
+  - Next minimal fix:
+    - make normalized non-stream tool responses force `requires_action`
+    - add a request-gated native-question recovery rewrite for non-stream responses using upstream content/reasoning plus existing recovery helpers
+- Patch applied:
+  - `normalizeTranslatedResponsesOutput(...)` now marks any pending tool-bearing non-stream response as `requires_action`.
+  - Added `recoverNativeQuestionResponseIfRequired(...)` and wired it into the non-stream bridge path after payload rewrite, so explicit native-question requests can be rewritten from plain assistant question text into a native `request_user_input` call using native artifacts first and existing text/request recovery second.
+  - Added focused regressions for:
+    - tool-only non-stream responses becoming `requires_action`
+    - non-stream native-question recovery from plain assistant text
+- Verification note:
+  - `gofmt` passed on the touched Go files.
+  - I could not run `go test` / `go build` from this session because:
+    - the explicit local `Ubuntu` WSL distro does not have `go` installed
+    - Windows `go` against `\\wsl$\Ubuntu\...` still fails with `go: RLock ... go.mod: Incorrect function`
+    - direct SSH to `tbwork` is still refusing port 22
+  - So the next step is a rebuild/copy/restart from the actual Linux build host, then live re-check T20 + tool-only non-stream behavior.
+## 2026-05-07 10:00:00 +0200
+- Workflow correction note:
+  - The only accepted rebuild/deploy path for this project is:
+    - `wsl -d Ubuntu -u admmin`
+    - `cd /home/admmin/llama-swap/llama-swap-main`
+    - `go build -o llama-swap .`
+    - `cp ./llama-swap /home/admmin/bin/llama-swap`
+    - restart with `C:\Users\YLAB-Partner\Desktop\start-tbg-services-wsl.ps1`
+  - If `go` is not on PATH in that exact environment, stop immediately and report the environment mismatch.
+  - Do not retry Windows `go`, UNC `\\wsl$...` builds, mapped-drive workarounds, or generic fallback loops.
+- Skill correction:
+  - root cause was non-login shell PATH mismatch, not missing Go.
+  - verified working probe:
+    - `wsl -d Ubuntu -u admmin bash -lic 'command -v go; go version'`
+    - resolves to `/usr/local/go/bin/go`
+  - workflow note updated to always use `bash -lic` for build/copy on the Ubuntu host.
+- Restart workflow correction:
+  - proved working path:
+    - if the script does not replace the `llama-swap` PID, kill the live PID directly
+    - verify `:8080` closes
+    - rerun `C:\Users\YLAB-Partner\Desktop\start-tbg-services-wsl.ps1`
+    - verify a new PID is listening on `:8080`
+  - `health` alone is not enough; PID change is the restart proof.
+  - a true cold restart can reset `/api/metrics` to an empty array; that is normal and not itself a regression.
+
+## 2026-05-07 10:35:00 +0200
+- Native-question upstream lifecycle repair intent:
+  - Fresh cold-restart live evidence narrowed the remaining failure to the upstream non-stream chat-completions request shape for forced `request_user_input`.
+  - Non-stream tool-only path is already fixed and returns `status:"requires_action"`.
+  - Native-question non-stream requests still die at `upstream_process_lifecycle` with bridge retries and final `502`, but direct upstream probing showed the same request shape streams successfully.
+  - Next minimal fix:
+    - for explicit native-question non-stream bridge turns only, send the upstream chat request as `stream:true`
+    - accumulate the upstream chat SSE into a synthetic final chat-completions response body
+    - run the existing non-stream chat->responses translation and native-question recovery on that synthetic body
+  - Goal:
+    - preserve the external non-stream `/v1/responses` contract
+    - avoid the exact upstream non-stream mode that is crashing on `request_user_input`
+
+## 2026-05-07 10:50:00 +0200
+- Restart script repair:
+  - A failed relaunch showed the backend `llama-server` on `:10008` was still alive, so the new process exited with:
+    - `couldn't bind HTTP server socket, hostname: 0.0.0.0, port: 10008`
+  - This is a stale-port operational failure, not a model-load regression.
+  - Updated the standard restart path so it also kills any process still listening on `:10008` before relaunch, waits for `:10008` to close, and includes `:10008` in the post-restart listener verification.
+  - Follow-up correction:
+    - the first PID-extraction attempt around `ss` was too fragile under PowerShell/WSL quoting
+    - simplified the kill step to `fuser -k 10008/tcp` so the backend port is freed directly before relaunch
+
+## 2026-05-07 11:20:00 +0200
+- Qwen stream-translation continuation:
+  - The repair loop that unblocked native question and plan behavior is complete.
+  - Next architectural slice for the larger Qwen stream plan:
+    - stop having stream and non-stream paths manually walk normalized artifact arrays in separate ad hoc ways
+    - introduce one reusable normalized-artifact view/selection layer
+    - make stream and native-question recovery consume the same view so native-vs-recovered precedence is centralized
+  - Goal:
+    - continue the Qwen interpretation-layer migration incrementally
+    - reduce the chance of stream/non-stream semantic drift without reopening the live plan/question fixes
+
+## 2026-05-07 11:45:00 +0200
+- Normalized streamed-event validation:
+  - Added a minimal Qwen normalized stream-event helper and reusable normalized-artifact view selection layer.
+  - First validation target was safety, not new UX behavior:
+    - confirm native question recovery still works
+    - confirm structured plan streaming still works
+    - confirm empty-stop fallback still works
+    - confirm the new stream chunk normalization emits the expected semantic event kinds
+- Verification:
+  - focused normalization/question/stream tests: pass
+  - wider stream compatibility tests: pass
+  - `go build -o llama-swap .`: pass
+- Next step:
+  - deploy/restart and confirm live T20/T22/tool controls still behave correctly before continuing the larger SSE event-layer migration
+
+## 2026-05-07 11:58:00 +0200
+- Live regression after architectural-slice deploy:
+  - T22 stayed green.
+  - Tool-only non-stream stayed green.
+  - T20 regressed again, but in a narrower way:
+    - upstream streamed turn returned plain assistant content
+    - content was imperative (`Please provide the unique marker T20_SENTINEL.`), not a literal question
+    - existing fallback question recovery did not fire because it prefers question-shaped text or explicit `questions` payloads
+- Minimal repair:
+  - extend request-based native-question synthesis for the explicit T20-style prompt:
+    - detect the exact “ask one native Codex question before planning” request intent
+    - preserve `T##_SENTINEL` when present
+    - synthesize one stable native question instead of allowing imperative assistant prose to escape
+- Verification:
+  - focused native-question recovery tests: pass
+  - `go build -o llama-swap .`: pass
+- Next step:
+  - redeploy and re-check live T20/T22/tool controls
+
+## 2026-05-07 12:12:00 +0200
+- Qwen stream normalization progression:
+  - Continued the live SSE-path migration without changing external wire behavior.
+  - Added `QwenNormalizedStreamFrame` as a per-chunk semantic fold over normalized Qwen stream events.
+  - `writeResponsesStreamFromChatSSEWithWorkflow(...)` now consumes:
+    - chunk id / model / created / usage / timings
+    - assistant delta text
+    - reasoning delta text
+    - tool call deltas
+    - finish reason
+    through the normalized frame instead of rebuilding these fields ad hoc from raw event iteration variables.
+- Verification:
+  - focused stream-normalization and bridge tests: pass
+  - wider stream compatibility tests: pass
+  - `go build -o llama-swap .`: pass
+- Architectural effect:
+  - stream interpretation and stream presentation are a little more separated now
+  - the SSE loop is closer to consuming a stable semantic object per chunk
+  - remaining work is still to move more routing/output decisions out of the monolithic stream writer
+
+## 2026-05-07 12:28:00 +0200
+- Qwen stream interpretation/presentation split:
+  - Added `QwenStreamFrameDecision` and `decideQwenStreamFramePresentation(...)`.
+  - The live SSE writer no longer decides inline whether each accumulated chunk becomes:
+    - reasoning
+    - commentary
+    - final buffered assistant text
+    - pure tool-phase finalization
+  - That routing now comes from the normalization layer using:
+    - normalized chunk frame
+    - workflow state
+    - plan-mode state
+    - observed tool presence
+- Verification:
+  - focused routing + stream tests: pass
+  - wider bridge compatibility tests: pass
+  - `go build -o llama-swap .`: pass
+- Architectural effect:
+  - the monolithic SSE writer is thinner
+  - Qwen semantic interpretation now owns both:
+    - chunk folding
+    - first-pass presentation routing
+  - next remaining step is to extract more tool-lifecycle/progress emission out of the writer and into reusable normalized stream interpretation helpers
+
+## 2026-05-07 12:42:00 +0200
+- Qwen tool-lifecycle extraction:
+  - Moved streamed tool delta application into `applyNormalizedToolCallDelta(...)`.
+  - Moved tool-phase closeout into `finalizeNormalizedToolCallPhase(...)`.
+  - These helpers now own:
+    - tool state creation / reuse by index
+    - tool name / call id updates
+    - args accumulation
+    - tool-args delta emission
+    - tool-start progress commentary triggering
+    - request-user-input arg recovery on closeout
+    - shell empty-args validation fallback
+    - plan-mode apply_patch suppression / plan text extraction
+    - tool args done / item done emission
+- Verification:
+  - focused stream/bridge/native-question tests: pass
+  - `go build -o llama-swap .`: pass
+- Architectural effect:
+  - the main SSE loop is now much closer to:
+    - normalize frame
+    - apply tool semantics
+    - get frame routing decision
+    - render events
+  - remaining work is mostly higher-level cleanup and optional forensics/debug exposure, not the core semantic split anymore
+
+## 2026-05-08 13:05:00 +0200
+- Bridge semantic narrowing repair:
+  - Fixed `deriveContinuationAllowedToolNames(...)` so a previously completed `apply_patch` no longer forces the next turn into patch-family narrowing by itself.
+  - Patch-family narrowing now stays limited to turns whose current user intent still explicitly asks for `apply_patch` sequencing or shell-before-patch ordering.
+  - This addresses the manual CLI failure where a post-create verification/browser turn was translated upstream with only `apply_patch` exposed.
+- Regression coverage:
+  - `TestDefaultContinuationController_DeriveAllowedToolNames_UsesWorkflowState`
+  - `TestTranslateResponsesToChatCompletionsRequest_PostPatchContinuationKeepsBroadTools`
+
+## 2026-05-08 13:32:00 +0200
+- Apply-patch transcript and recovery-finalization repair:
+  - Normalized replayed `apply_patch` tool output before feeding it back into the chat transcript.
+  - Rewrites terse patch status markers like `A path`, `M path`, `D path` into explicit forms:
+    - `created: path`
+    - `modified: path`
+    - `deleted: path`
+  - Unwraps serialized `apply_patch_call_output` payloads before normalization when needed.
+  - Repeated completed `apply_patch` fingerprints no longer trigger the generic final-answer-required loop guard by themselves.
+  - This keeps failed patch recovery tool-capable instead of prematurely disabling tools.
+- Regression coverage:
+  - `TestResponsesRequestToChatMessages_NormalizesApplyPatchToolOutputTranscript`
+  - `TestBuildLoopGuardDecision_CentralizesLoopProtections`
+
+## 2026-05-08 14:05:00 +0200
+- Built-in browser/search delegation clarification:
+  - Direct Codex CLI testing against local `llama-swap` confirmed that built-in tool families like:
+    - `web_search`
+    - `file_search`
+    - `computer_use_preview`
+    are not being executed as local native CLI tools in this backend setup.
+  - In the direct Codex test, the visible Codex event stream did not show a local/native search execution item.
+  - Matching `llama-swap` forensics showed the search flow was handled server-side through the bridge:
+    - upstream emitted a `web_search` tool phase
+    - the bridge executed/continued the search flow
+    - Codex received the final answer after the server-side continuation
+  - This confirms why `llama-swap` implements delegated wrapper tools for these families:
+    - `__llamaswap_web_search_preview`
+    - `__llamaswap_file_search`
+    - `__llamaswap_computer`
+  - These wrappers exist because OpenAI built-in Responses tools need backend/runtime support when the backend is local Qwen via `llama-swap`; they are not the same as MCP tools like `mcp__playwright__browser_*`.
+  - The real bridge bug in this area was not the existence of wrappers, but mismatched tool-name guidance. Qwen must be instructed to call the exact wrapper names actually exposed in translated `tools[]`.
+- Regression coverage:
+  - `TestBuildQwenResponsesToolPolicy_UsesExactWrapperNamesForBuiltInTools`
+
+## 2026-05-08 15:02:00 +0200
+- Native-question misclassification repair:
+  - Root cause of the fresh "hi"/simple search failures was `requestExplicitlyWantsNativeCodexQuestion(...)` scanning trusted developer/system instruction text from `input[]` together with the current user text.
+  - That let global boilerplate mentioning `request_user_input` poison ordinary default-mode turns and collapse translated chat requests to:
+    - `tool_choice: function:request_user_input`
+    - `tools_count: 1`
+  - The detector now uses only current-turn intent sources:
+    - top-level `instructions`
+    - current user input text
+  - It no longer treats developer/system boilerplate inside `input[]` as an explicit native-question request.
+  - `synthesizeRequestUserInputArgumentsFromRequest(...)` now uses the same narrowed intent text so recovered question text is derived from the current turn only.
+- Live validation after rebuild/copy/restart:
+  - `hi` on `localhost:8080/v1/responses`:
+    - `bridge.chat_completions_request.tool_choice = "auto"`
+    - tools remained `["shell","request_user_input"]`
+    - upstream answered normally with no tool call
+  - `search the web for YLAB` on `localhost:8080/v1/responses`:
+    - `bridge.chat_completions_request.tool_choice = "auto"`
+    - tools remained `["web_search","shell","request_user_input"]`
+    - upstream emitted native `web_search`
+    - bridge returned `web_search_call`, `web_search_call_output`, and final assistant text with overall `status:"completed"`
+- Regression coverage:
+  - `TestTranslateResponsesToChatCompletionsRequest_ContinuationToolChoiceBehavior/default_mode_simple_hello_does_not_force_request_user_input_from_boilerplate`
+  - `TestTranslateResponsesToChatCompletionsRequest_ContinuationToolChoiceBehavior/default_mode_web_search_does_not_force_request_user_input_from_boilerplate`
+
+## 2026-05-08 15:12:00 +0200
+- Manual multi-turn web-search regression forensic snapshot:
+  - Session anchor:
+    - `C:\Users\YLAB-Partner\.codex\sessions\2026\05\08\rollout-2026-05-08T14-00-32-019e0775-f832-7e83-b065-bd77c07f7edb.jsonl`
+  - `/api/forensics/6`:
+    - first upstream turn correctly used native `web_search`
+    - follow-up continuation was then wrongly narrowed to `tool_choice:function:request_user_input`
+  - `/api/forensics/7`:
+    - after answered clarification plus “write a native plan and do web research before”
+    - translated chat request became `tool_choice:none`
+    - upstream fell back to literal `<websearch>` prompt text
+  - `/api/forensics/15`:
+    - later explicit Reddit search still had original Responses `tool_choice:auto`
+    - translated chat request became `tool_choice:none`
+    - upstream emitted literal `<web_search>...</tool_call>` text
+  - Stage trace showed stale `tool_completed_awaiting_followup` continuing to win over fresh search intent.
+- Patch:
+  - `extractResponsesNativeQuestionIntentText(...)` now reads only current user text, removing top-level instruction boilerplate from native-question forcing.
+  - `requestExplicitlyWantsExplorationFollowup(...)` now recognizes broader search/research intent:
+    - `web research`
+    - `research before`
+    - search verbs paired with `web`, `browser`, `reddit`, or `site:`
+  - This is intended to keep tools alive for fresh exploration/search turns in plan, act, and default conversations instead of forcing stale plan/question follow-up behavior.
+- Focused regression coverage:
+  - `TestRequestStillWantsStructuredPlan_FalseForWebResearchBeforePlanFollowup`
+  - `TestRequestExplicitlyWantsNativeCodexQuestion_IgnoresInstructionBoilerplate`
+  - continuation/translation focused subset: pass
+
+## 2026-05-08 16:32:00 +0200
+- Follow-up repair on stale search-intent suppression:
+  - Added an explicit current-turn search intent detector separate from the older follow-up helper.
+  - `ContinuationContext` now carries `SearchIntent`.
+  - Search intent now overrides stale post-question plan suppression in three places:
+    - plan-follow-up loop guard no longer forces `tool_choice:none`
+    - continuation state stays `tool_running` instead of `tool_completed_awaiting_followup`
+    - forced `request_user_input` continuation no longer wins on fresh search turns
+  - `requestStillWantsStructuredPlan(...)` now exits early when the current user turn explicitly asks for fresh search/research.
+- Operational note:
+  - an earlier deploy was still running the older `/home/admmin/bin/llama-swap`; verified by mismatched SHA256 between the built binary and the installed binary.
+  - corrected by stopping `:8080`, copying again, and confirming matching SHA256 before restart.
+- Regression coverage:
+  - `TestTranslateResponsesToChatCompletionsRequest_TopLevelPlanInstructions_WebResearchBeforePlanKeepsTools`
+  - `TestTranslateResponsesToChatCompletionsRequest_TopLevelPlanInstructions_LaterRedditSearchKeepsTools`
+  - focused continuation/tool-choice subset: pass
+
+## 2026-05-08 15:00:00 +0200
+- Search retry follow-up repair:
+  - The remaining manual failure shape was shorter retry text like `try again` after a previous `web_search` attempt or pseudo-search assistant output.
+  - `requestExplicitlyWantsSearchIntent(...)` is now workflow-state aware and can inherit recent search context from:
+    - completed `web_search` / `web_search_preview`
+    - prior search tool calls in `input[]`
+    - pseudo-search assistant text such as `print(websearch(...))`
+  - This keeps the continuation state in `tool_running` instead of letting stale post-`request_user_input` follow-up logic fall back to `tool_completed_awaiting_followup`.
+- New regression coverage:
+  - `TestRequestStillWantsStructuredPlan_FalseForSearchRetryAfterPseudoSearchOutput`
+  - `TestTranslateResponsesToChatCompletionsRequest_SearchRetryAfterPseudoSearchOutputKeepsTools`
+- Live localhost validation after proper redeploy:
+  - verified the installed `/home/admmin/bin/llama-swap` SHA matched the rebuilt workspace binary before restart
+  - stage trace now shows the repaired retry path:
+    - `translation.responses_to_chat.done`
+    - `state=tool_running`
+    - `tools_count=3`
+  - `/api/forensics/2` confirms:
+    - translated chat request kept `request_user_input`, `web_search`, and `shell`
+    - upstream emitted a native `web_search` tool call
+  - remaining failure on that probe was `upstream_process_lifecycle` after translation, not the earlier bridge-side tool stripping bug
+
+## 2026-05-08 16:10:00 +0200
+- General continuation-state forensic conclusion:
+  - The broader instability is not just "search retry" or one broken prompt variant.
+  - The real structural weakness is that `llama-swap` has been deciding turn intent from multiple overlapping booleans:
+    - `PlanModeRequested`
+    - `PlanOutputRequested`
+    - `SearchIntent`
+    - `ExplorationFollowupIntent`
+    - `ImplementationRetryIntent`
+  - In long mixed chats this allowed the bridge to derive slightly different answers in:
+    - `translateResponsesToChatCompletionsRequest(...)`
+    - `defaultContinuationController.BuildDecision(...)`
+    - `buildLoopGuardDecision(...)`
+  - That mismatch is why manual runs could still regress after:
+    - default -> plan -> search
+    - question -> research -> return plan
+    - plan -> default -> retry
+- Local software comparison:
+  - Qwen Companion docs and stream-json/dual-output design reinforce a typed runtime/event model instead of texty intent recovery.
+  - Cline separates Plan and Act much more explicitly and uses dedicated control/tool lanes instead of relying on raw assistant prose for mode transitions.
+  - `llama-swap` should not copy those wire contracts, but it should centralize continuation phase decisions the same way.
+- Patch:
+  - Introduced shared `ContinuationTurnPhase` with phases:
+    - `general`
+    - `question`
+    - `plan_gather`
+    - `plan_finalize`
+    - `research`
+    - `implementation_retry`
+  - `BuildDecision(...)` and `buildLoopGuardDecision(...)` now reason through the same phase classifier instead of recomputing plan/search/followup behavior ad hoc.
+  - Live translation trace now records `turn_phase` in `continuation.responses_to_chat`.
+- Regression coverage:
+  - `TestClassifyContinuationTurnPhase`
+  - plan/question/search continuation subset
+  - top-level plan-instructions web-research/search-retry subset
+- Verification before redeploy:
+  - focused continuation tests: pass
+  - `go build -o llama-swap .`: pass
+
+## 2026-05-08 18:05:00 +0200
+- New forensic anchor for the latest manual failure:
+  - `id=8`:
+    - chat request still had `web_search`
+    - upstream returned `finish_reason=stop`
+    - visible content only `Working on the request.`
+    - reasoning still clearly wanted web research
+    - bridge incorrectly accepted that as a completed final answer instead of retrying/recovering the missing tool call
+  - `id=9`:
+    - chat request had `tool_choice:none`
+    - upstream returned literal empty `<tool_code></tool_code>`
+    - bridge leaked that pseudo-tool wrapper into final output
+- Minimal fix hypothesis:
+  - parser cleanup from Qwen XML/tag stripping is being ignored when no parsed tool call is recovered
+  - bridge needs a generic web-search retry path when:
+    - `web_search` is available upstream
+    - upstream emits only placeholder/progress text or pseudo-tool search text
+    - no real tool call was returned
+  - web search recovery should prefer native `web_search` and explicitly avoid Playwright for this path
+
+## 2026-05-08 19:55:00 +0200
+- Implemented in this loop:
+  - preserve parser cleanup even when Qwen XML/tag parsing recovers zero tool calls
+    - empty `<tool_code></tool_code>` no longer survives as final output text in the translator test path
+  - add generic missing-web-search retry in the bridge
+    - if `web_search` is available upstream
+    - and upstream returns only placeholder/progress text or pseudo-search text without a real tool call
+    - retry with an explicit native `web_search` instruction instead of finalizing
+  - widen search-intent text detection for:
+    - `current`
+    - `latest`
+    - `external`
+    - `news`
+  - add an extra continuation-controller guard so explicit research text should not be hijacked back into `request_user_input`
+- Regression coverage added:
+  - missing web-search retry bridge test
+  - empty tool_code stripping test
+  - plan-mode research-before-plan translation test
+- Current live status after redeploy:
+  - retry-after-pseudo-search path keeps `web_search` alive and reaches real native `web_search`, but the continuation can still end in upstream `502` after translation
+  - a narrower live failure still remains for this exact non-stream request shape:
+    - prior `request_user_input` answered
+    - plan mode
+    - user says `research current ... before writing the plan`
+  - despite unit coverage for that shape, the live bridge still translated it to:
+    - `tool_choice=function:request_user_input`
+    - tools only `request_user_input`
+  - this means the remaining bug is still in live continuation-state handling before upstream model execution

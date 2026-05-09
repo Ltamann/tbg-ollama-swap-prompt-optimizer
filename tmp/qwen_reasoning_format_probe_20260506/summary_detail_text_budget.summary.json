@@ -1,0 +1,12 @@
+{
+  "case": "summary_detail_text_budget",
+  "duration_ms": 29205,
+  "finish_reasons": [
+    "stop"
+  ],
+  "reasoning_preview": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Request:** Design a reasoning format for a coding agent that gives short user-facing progress plus full detailed reasoning. Then answer briefly.\n   - **Key Requirements:**\n     - Design a reasoning format\n     - Must include: short user-facing progress + full detailed reasoning\n     - Answer briefly after designing it\n   - **Implicit Constraint:** The prompt itself gives a specific structure for my own thinking: `[SUMMARY]... [DETAIL]...`. I should follow that for my internal reasoning, but the output should be the designed format + a brief answer.\n\n2.  **Deconstruct the Requested Format:**\n   - Need a template/structure for a coding agent's output.\n   - Should separate \"user-facing progress\" (concise, actionable, status-oriented) from \"full detailed reasoning\" (technical, step-by-step, debugging, architecture decisions).\n   - Common patterns: `[PROGRESS]` / `[REASONING]`, `### Status` / `### Internals`, etc.\n   - I'll design a clear, structured format with markdown tags or headers.\n\n3.  **Design the Format:**\n   Let's",
+  "content_preview": "**Agent Reasoning Format**\n\n```markdown\n[PROGRESS]\n- **Status:** <idle|analyzing|implementing|testing|complete|error>\n- **Action:** <1-sentence user-facing summary of what's happening>\n- **ETA/Next:** <optional brief next step or completion note>\n\n[REASONING]\n<Full technical breakdown: architecture decisions, code diffs, edge-case analysis, debugging steps, and internal state. Hidden from end-users in production UIs.>\n```\n\n**Brief Answer:**  \nThis structure decouples operational transparency from technical depth. The `[PROGRESS]` block keeps users informed without cognitive overload, while `[R",
+  "has_summary_tag": true,
+  "has_detail_tag": true,
+  "starts_with_json": false
+}

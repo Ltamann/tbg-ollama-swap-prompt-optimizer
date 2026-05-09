@@ -1,0 +1,1305 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_GgS6GGYuYQ14oWmS5b5yazwXv6LEINcz","object":"response","status":"in_progress"}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_GgS6GGYuYQ14oWmS5b5yazwXv6LEINcz","object":"response","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G","summary":[],"type":"reasoning","content":[],"encrypted_content":"","status":"in_progress"}}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"The","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" user","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" wants","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" me","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" use","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nI","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" see","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" there","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" is","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" one","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" available","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":":","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" `","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"_tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"`.","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nThe","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" user","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" prompt","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Use","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" answer","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" If","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" you","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" can","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" call","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" it","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" do","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" so","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" is","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" bit","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" vague","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" about","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" *","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"what","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"*","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nHowever","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" usually","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" when","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" asked","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" use","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" without","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" specific","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" instructions","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" on","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" content","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echoing","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" user","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" prompt","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" or","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" confirmation","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" is","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" standard","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" behavior","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nLet","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" check","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" parameters","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" for","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" `","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"_tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"`.","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" It","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" requires","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" `","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"value","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"`","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" (","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"string","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":").","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nI","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" will","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" use","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" user","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" request","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" or","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" simple","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" confirmation","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" message","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" demonstrate","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" usage","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Hello","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" or","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" user","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" text","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Use","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" answer","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" If","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" you","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" can","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" call","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" it","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" do","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" so","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" seems","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" appropriate","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" I","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'ll","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" stick","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" simple","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" confirmation","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\n","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nActually","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" looking","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" at","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" prompt","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Use","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" answer","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"...\",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" it","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" implies","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" I","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" should","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" perform","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" an","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" action","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" Since","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" is","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" just","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" an","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" I","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" will","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" text","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" provided","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" in","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" prompt","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" or","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" simple","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Hello","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" Let","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Hello","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" be","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" safe","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" and","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" clear","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" Or","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" better","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" user","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" prompt","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" itself","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" show","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" I","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" processed","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" it","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" Let","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" go","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" with","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echoing","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Hello","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\n","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nWait","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" often","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" in","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" these","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tests","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" instruction","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" is","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" simply","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" demonstrate","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" works","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" I","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" will","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" simple","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" string","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" like","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Hello","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\n","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nRef","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"ining","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" plan","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":":","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\n1","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" ","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" Call","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" `","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"_tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"`","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" with","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" `","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"value","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"=\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Hello","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"`.","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\n2","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" ","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" Present","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" result","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\n","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nLet","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" re","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"-read","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" carefully","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":":","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Use","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" answer","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nMaybe","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" I","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" should","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" text","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"I","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" can","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" call","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" it","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"?","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nLet","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" just","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" use","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" generic","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" string","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Hello","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" satisfy","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" requirement","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" of","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" calling","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\n","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nActually","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" looking","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" at","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" user","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" input","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Use","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" answer","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" If","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" you","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" can","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" call","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" it","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" do","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" so","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".\",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" most","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" logical","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"answer","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" using","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" an","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" is","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" prompt","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" itself","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" or","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" a","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" confirmation","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" I","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'ll","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" echo","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Hello","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" as","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" it","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"'s","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" standard","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" greeting","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\n","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\nOn","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" second","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" thought","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" usually","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":",","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" user","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" wants","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" to","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" see","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" output","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" I","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" will","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" call","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" the","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" tool","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" with","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":" \"","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"Hello","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","delta":"\".","item_id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G"}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"arguments":"","call_id":"fc_VTj4T6t51MogVNL5X4AVRZsgC3wpqF9l","name":"echo_tool","type":"function_call","status":"in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"{","item_id":"fc_VTj4T6t51MogVNL5X4AVRZsgC3wpqF9l"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"\"value\":\"","item_id":"fc_VTj4T6t51MogVNL5X4AVRZsgC3wpqF9l"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"Hello","item_id":"fc_VTj4T6t51MogVNL5X4AVRZsgC3wpqF9l"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"\"","item_id":"fc_VTj4T6t51MogVNL5X4AVRZsgC3wpqF9l"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","delta":"}","item_id":"fc_VTj4T6t51MogVNL5X4AVRZsgC3wpqF9l"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G","summary":[],"type":"reasoning","content":[{"text":"The user wants me to use a tool.\nI see there is one tool available: `echo_tool`.\nThe user's prompt \"Use the tool to answer. If you can call it, do so.\" is a bit vague about *what* to echo.\nHowever, usually, when asked to use a tool without specific instructions on the content, echoing the user's prompt or a confirmation is a standard behavior.\nLet's check the parameters for `echo_tool`. It requires a `value` (string).\nI will use the tool to echo the user's request or a simple confirmation message to demonstrate tool usage. \"Hello\" or the user's text \"Use the tool to answer. If you can call it, do so.\" seems appropriate. I'll stick to a simple confirmation.\n\nActually, looking at the prompt \"Use the tool to answer...\", it implies I should perform an action. Since the tool is just an echo tool, I will echo the text provided in the prompt or a simple \"Hello\". Let's echo \"Hello\" to be safe and clear. Or better, echo the user's prompt itself to show I processed it. Let's go with echoing \"Hello\".\n\nWait, often in these tests, the instruction is simply to demonstrate the tool works. I will echo a simple string like \"Hello\".\n\nRefining the plan:\n1.  Call `echo_tool` with `value=\"Hello\"`.\n2.  Present the result.\n\nLet's re-read carefully: \"Use the tool to answer.\"\nMaybe I should echo the text \"I can call it.\"?\nLet's just use a generic string \"Hello\" to satisfy the requirement of calling the tool.\n\nActually, looking at the user's input \"Use the tool to answer. If you can call it, do so.\", the most logical \"answer\" using an echo tool is to echo the prompt itself or a confirmation. I'll echo \"Hello\" as it's the standard greeting.\n\nOn second thought, usually, the user wants to see the tool output. I will call the tool with \"Hello\".","type":"reasoning_text"}],"encrypted_content":""}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"function_call","status":"completed","arguments":"{\"value\":\"Hello\"}","call_id":"fc_VTj4T6t51MogVNL5X4AVRZsgC3wpqF9l","name":"echo_tool"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_GgS6GGYuYQ14oWmS5b5yazwXv6LEINcz","object":"response","created_at":1778313000,"status":"completed","model":"Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf","output":[{"id":"rs_LClYlaEsJ8boyYErynzOYtHT55l1Xb6G","summary":[],"type":"reasoning","content":[{"text":"The user wants me to use a tool.\nI see there is one tool available: `echo_tool`.\nThe user's prompt \"Use the tool to answer. If you can call it, do so.\" is a bit vague about *what* to echo.\nHowever, usually, when asked to use a tool without specific instructions on the content, echoing the user's prompt or a confirmation is a standard behavior.\nLet's check the parameters for `echo_tool`. It requires a `value` (string).\nI will use the tool to echo the user's request or a simple confirmation message to demonstrate tool usage. \"Hello\" or the user's text \"Use the tool to answer. If you can call it, do so.\" seems appropriate. I'll stick to a simple confirmation.\n\nActually, looking at the prompt \"Use the tool to answer...\", it implies I should perform an action. Since the tool is just an echo tool, I will echo the text provided in the prompt or a simple \"Hello\". Let's echo \"Hello\" to be safe and clear. Or better, echo the user's prompt itself to show I processed it. Let's go with echoing \"Hello\".\n\nWait, often in these tests, the instruction is simply to demonstrate the tool works. I will echo a simple string like \"Hello\".\n\nRefining the plan:\n1.  Call `echo_tool` with `value=\"Hello\"`.\n2.  Present the result.\n\nLet's re-read carefully: \"Use the tool to answer.\"\nMaybe I should echo the text \"I can call it.\"?\nLet's just use a generic string \"Hello\" to satisfy the requirement of calling the tool.\n\nActually, looking at the user's input \"Use the tool to answer. If you can call it, do so.\", the most logical \"answer\" using an echo tool is to echo the prompt itself or a confirmation. I'll echo \"Hello\" as it's the standard greeting.\n\nOn second thought, usually, the user wants to see the tool output. I will call the tool with \"Hello\".","type":"reasoning_text"}],"encrypted_content":""},{"type":"function_call","status":"completed","arguments":"{\"value\":\"Hello\"}","call_id":"fc_VTj4T6t51MogVNL5X4AVRZsgC3wpqF9l","name":"echo_tool"}],"usage":{"input_tokens":281,"output_tokens":461,"total_tokens":742,"input_tokens_details":{"cached_tokens":0}}}}
+

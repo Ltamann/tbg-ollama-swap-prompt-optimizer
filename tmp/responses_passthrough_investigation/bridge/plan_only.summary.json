@@ -1,0 +1,27 @@
+{
+  "http_status": 200,
+  "duration_ms": 25219,
+  "error_text": "",
+  "stream": false,
+  "response_summary": {
+    "response_id": "resp_chatcmpl-bxPdhEuEyuZ9ao7eHiaxa9P3chiqKOnK",
+    "response_status": "completed",
+    "object": "response",
+    "output_types": [
+      "reasoning",
+      "message"
+    ],
+    "tool_item_count": 0,
+    "message_item_count": 1,
+    "reasoning_item_count": 1,
+    "mixed_message_tool": false,
+    "top_level_output_text_present": true,
+    "usage_present": false,
+    "timings_present": false,
+    "plan_wrapper_present": true,
+    "first_message_text": "<proposed_plan>\n1. Acknowledge receipt of the system instructions defining Default mode behavior.\n2. Confirm readiness to execute the specified format (Assistant text wrapped in `<proposed_plan>...</proposed_plan>`).\n3. Stand by for the specific user task to begin planning.\n</proposed_plan>",
+    "final_message_text": "<proposed_plan>\n1. Acknowledge receipt of the system instructions defining Default mode behavior.\n2. Confirm readiness to execute the specified format (Assistant text wrapped in `<proposed_plan>...</proposed_plan>`).\n3. Stand by for the specific user task to begin planning.\n</proposed_plan>",
+    "tool_item_statuses": [],
+    "tool_item_names": []
+  }
+}

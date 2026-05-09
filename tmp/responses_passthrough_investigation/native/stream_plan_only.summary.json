@@ -1,0 +1,66 @@
+{
+  "http_status": 200,
+  "duration_ms": 85492,
+  "error_text": "",
+  "stream": true,
+  "stream_summary": {
+    "raw_event_count": 2304,
+    "event_order": [
+      "response.created",
+      "response.in_progress",
+      "response.output_item.added",
+      "response.reasoning_text.delta",
+      "response.content_part.added",
+      "response.output_text.delta",
+      "response.output_item.done",
+      "response.output_text.done",
+      "response.content_part.done",
+      "response.completed"
+    ],
+    "event_counts": {
+      "response.created": 1,
+      "response.in_progress": 1,
+      "response.output_item.added": 2,
+      "response.reasoning_text.delta": 1484,
+      "response.content_part.added": 1,
+      "response.output_text.delta": 810,
+      "response.output_item.done": 2,
+      "response.output_text.done": 1,
+      "response.content_part.done": 1,
+      "response.completed": 1
+    },
+    "reasoning_event_names": [
+      "response.reasoning_text.delta"
+    ],
+    "has_created": true,
+    "has_in_progress": true,
+    "has_output_text_done": true,
+    "has_function_arguments_done": false,
+    "has_completed": true,
+    "output_item_done_types": [
+      "reasoning",
+      "message"
+    ],
+    "completed_response": {
+      "response_id": "resp_tovHbPrJsNALFGcpOPyNTComaOwxcu2k",
+      "response_status": "completed",
+      "object": "response",
+      "output_types": [
+        "reasoning",
+        "message"
+      ],
+      "tool_item_count": 0,
+      "message_item_count": 1,
+      "reasoning_item_count": 1,
+      "mixed_message_tool": false,
+      "top_level_output_text_present": false,
+      "usage_present": true,
+      "timings_present": false,
+      "plan_wrapper_present": true,
+      "first_message_text": "<proposed_plan>\n  <game_title>LexiLoop</game_title>\n  <overview>A lightweight, mobile-first language-learning game designed for beginners to build vocabulary and basic conversational skills through bite-sized, gamified mini-challenges and adaptive spaced repetition.</overview>\n  <target_audience>Casual learners ages 16+, zero to intermediate proficiency, targeting Spanish, French, Japanese, and German as initial release languages.</target_audience>\n  <core_mechanics>\n    <mechanic name=\"Swipe Vocab\">Users swipe right for correct word-image/audio matches and left for incorrect ones. Speed and accuracy determine score multipliers.</mechanic>\n    <mechanic name=\"Sentence Builder\">Drag-and-drop word tiles to complete contextual phrases. Hints unlock after failed attempts, teaching grammar patterns naturally.</mechanic>\n    <mechanic name=\"Streak & Energy\">Daily login streaks grant bonus XP. Energy system limits play sessions to 15 minutes, encouraging consistent daily practice.</mechanic>\n    <mechanic name=\"Adaptive Review Engine\">Backend algorithm tracks error patterns and schedules review sessions at optimal intervals to maximize long-term retention.</mechanic>\n  </core_mechanics>\n  <tech_stack>\n    <engine>Unity 2022 LTS</engine>\n    <language>C#</language>\n    <backend>Firebase (Authentication, Firestore, Cloud Functions, Remote Config)</backend>\n    <audio>Platform-native TTS for pronunciation; compressed OGGS for SFX</audio>\n    <platform>iOS, Android, WebGL (browser)</platform>\n  </tech_stack>\n  <development_phases>\n    <phase id=\"1\" duration=\"Weeks 1-3\">Prototype core swipe mechanic, basic UI framework, placeholder art, and 100-word starter database. Internal playtesting.</phase>\n    <phase id=\"2\" duration=\"Weeks 4-6\">Implement spaced repetition logic, sentence builder, scoring/streak systems, and Firebase integration. Alpha build with 1 language.</phase>\n    <phase id=\"3\" duration=\"Weeks 7-9\">Add 2nd and 3rd languages, polish animations, integrate analytics (Mixpanel), and run closed beta with 500 users.</phase>\n    <phase id=\"4\" duration=\"Weeks 10-12\">App store optimization, localization, bug fixing, live-ops framework setup, and public launch across platforms.</phase>\n  </development_phases>\n  <monetization>Free-to-play with rewarded ads for extra hints. Optional $3.99 one-time ad removal. Premium tier at $4.99/month unlocks offline mode, advanced progress stats, and 4th language.</monetization>\n  <success_metrics>\n    <metric>Day-1 Retention: ≥45%</metric>\n    <metric>Day-7 Retention: ≥20%</metric>\n    <metric>Average Session Duration: 8-10 minutes</metric>\n    <metric>Lesson Completion Rate: ≥70%</metric>\n    <metric>CAC Payback Period: ≤45 days</metric>\n  </success_metrics>\n  <risk_mitigation>\n    <risk>Content bottleneck for accurate translations and audio</risk>\n    <mitigation>Use vetted AI-assisted drafting pipeline with native speaker review; prioritize high-frequency vocabulary first; batch content updates monthly.</mitigation>\n    <risk>Player churn after novelty wears off</risk>\n    <mitigation>Implement weekly themed challenges, shareable progress cards, and seasonal events; A/B test onboarding to reduce early friction.</mitigation>\n  </risk_mitigation>\n</proposed_plan>",
+      "final_message_text": "<proposed_plan>\n  <game_title>LexiLoop</game_title>\n  <overview>A lightweight, mobile-first language-learning game designed for beginners to build vocabulary and basic conversational skills through bite-sized, gamified mini-challenges and adaptive spaced repetition.</overview>\n  <target_audience>Casual learners ages 16+, zero to intermediate proficiency, targeting Spanish, French, Japanese, and German as initial release languages.</target_audience>\n  <core_mechanics>\n    <mechanic name=\"Swipe Vocab\">Users swipe right for correct word-image/audio matches and left for incorrect ones. Speed and accuracy determine score multipliers.</mechanic>\n    <mechanic name=\"Sentence Builder\">Drag-and-drop word tiles to complete contextual phrases. Hints unlock after failed attempts, teaching grammar patterns naturally.</mechanic>\n    <mechanic name=\"Streak & Energy\">Daily login streaks grant bonus XP. Energy system limits play sessions to 15 minutes, encouraging consistent daily practice.</mechanic>\n    <mechanic name=\"Adaptive Review Engine\">Backend algorithm tracks error patterns and schedules review sessions at optimal intervals to maximize long-term retention.</mechanic>\n  </core_mechanics>\n  <tech_stack>\n    <engine>Unity 2022 LTS</engine>\n    <language>C#</language>\n    <backend>Firebase (Authentication, Firestore, Cloud Functions, Remote Config)</backend>\n    <audio>Platform-native TTS for pronunciation; compressed OGGS for SFX</audio>\n    <platform>iOS, Android, WebGL (browser)</platform>\n  </tech_stack>\n  <development_phases>\n    <phase id=\"1\" duration=\"Weeks 1-3\">Prototype core swipe mechanic, basic UI framework, placeholder art, and 100-word starter database. Internal playtesting.</phase>\n    <phase id=\"2\" duration=\"Weeks 4-6\">Implement spaced repetition logic, sentence builder, scoring/streak systems, and Firebase integration. Alpha build with 1 language.</phase>\n    <phase id=\"3\" duration=\"Weeks 7-9\">Add 2nd and 3rd languages, polish animations, integrate analytics (Mixpanel), and run closed beta with 500 users.</phase>\n    <phase id=\"4\" duration=\"Weeks 10-12\">App store optimization, localization, bug fixing, live-ops framework setup, and public launch across platforms.</phase>\n  </development_phases>\n  <monetization>Free-to-play with rewarded ads for extra hints. Optional $3.99 one-time ad removal. Premium tier at $4.99/month unlocks offline mode, advanced progress stats, and 4th language.</monetization>\n  <success_metrics>\n    <metric>Day-1 Retention: ≥45%</metric>\n    <metric>Day-7 Retention: ≥20%</metric>\n    <metric>Average Session Duration: 8-10 minutes</metric>\n    <metric>Lesson Completion Rate: ≥70%</metric>\n    <metric>CAC Payback Period: ≤45 days</metric>\n  </success_metrics>\n  <risk_mitigation>\n    <risk>Content bottleneck for accurate translations and audio</risk>\n    <mitigation>Use vetted AI-assisted drafting pipeline with native speaker review; prioritize high-frequency vocabulary first; batch content updates monthly.</mitigation>\n    <risk>Player churn after novelty wears off</risk>\n    <mitigation>Implement weekly themed challenges, shareable progress cards, and seasonal events; A/B test onboarding to reduce early friction.</mitigation>\n  </risk_mitigation>\n</proposed_plan>",
+      "tool_item_statuses": [],
+      "tool_item_names": []
+    }
+  }
+}

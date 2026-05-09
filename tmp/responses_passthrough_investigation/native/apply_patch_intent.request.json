@@ -1,0 +1,46 @@
+{
+  "method": "POST",
+  "path_template": "/responses",
+  "target_model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+  "body": {
+    "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+    "input": "Use apply_patch to create hello.txt containing HELLO.",
+    "tools": [
+      {
+        "type": "function",
+        "name": "apply_patch",
+        "description": "Apply a structured file patch.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string"
+                },
+                "diff": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "path"
+              ]
+            }
+          },
+          "required": [
+            "operation"
+          ]
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  }
+}

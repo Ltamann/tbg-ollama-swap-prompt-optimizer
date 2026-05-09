@@ -1,0 +1,29 @@
+{
+  "method": "POST",
+  "path_template": "/responses",
+  "target_model": "GLM-4.7-Flash-UD-Q8_K_XL",
+  "body": {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "input": "Use the tool to answer. If you can call it, do so.",
+    "stream": true,
+    "tools": [
+      {
+        "type": "function",
+        "name": "echo_tool",
+        "description": "echo_tool test tool",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "value"
+          ]
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  }
+}

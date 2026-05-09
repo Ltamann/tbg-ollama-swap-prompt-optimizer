@@ -65,6 +65,7 @@ const (
 
 var applyPatchTraceMu sync.Mutex
 var bridgeHTMLTagRegexp = regexp.MustCompile(`(?s)<[^>]+>`)
+var planModeQuestionCountRegexp = regexp.MustCompile(`(?i)\b(\d+)\s+(?:[a-z-]+\s+){0,3}questions\b`)
 
 // stripTopLevelParam removes a top-level parameter from JSON body without affecting nested fields.
 // This prevents accidentally removing nested fields like tools[].type when stripping "type".
@@ -293,8 +294,16 @@ func buildQwenResponsesToolPolicy(adaptedTools []string) string {
 			lines = append(lines, "Tool policy:")
 		}
 		lines = append(lines,
-			"- Use web_search for current or external information.",
-			"- Do not answer current-events or live-information questions from memory when web_search is available.",
+			fmt.Sprintf("- Use %s for current or external information.", llamaSwapWebSearchFunctionName),
+			fmt.Sprintf("- Do not answer current-events or live-information questions from memory when %s is available.", llamaSwapWebSearchFunctionName),
+		)
+	}
+	if hasAnyTool(toolSet, "file_search") {
+		if len(lines) == 0 {
+			lines = append(lines, "Tool policy:")
+		}
+		lines = append(lines,
+			fmt.Sprintf("- Use %s for indexed or local document search requests.", llamaSwapFileSearchFunctionName),
 		)
 	}
 	if hasAnyTool(toolSet, "computer") {
@@ -302,8 +311,8 @@ func buildQwenResponsesToolPolicy(adaptedTools []string) string {
 			lines = append(lines, "Tool policy:")
 		}
 		lines = append(lines,
-			"- Use computer actions for UI automation requests.",
-			"- If a request mentions computer_use_preview, emit computer actions with action plus optional x/y/text/button fields.",
+			fmt.Sprintf("- Use %s for UI automation requests.", llamaSwapComputerFunctionName),
+			fmt.Sprintf("- If a request mentions computer_use_preview, emit %s with action plus optional x/y/text/button fields.", llamaSwapComputerFunctionName),
 		)
 	}
 
@@ -904,6 +913,32 @@ func requestIncludesWebSearchTool(req map[string]any) bool {
 		for _, name := range names {
 			switch name {
 			case "web_search", "web_search_preview", "websearch", "websearchpreview", llamaSwapWebSearchFunctionName:
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func chatRequestIncludesToolName(body []byte, names ...string) bool {
+	if len(body) == 0 || !gjson.ValidBytes(body) || len(names) == 0 {
+		return false
+	}
+	want := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(strings.ToLower(name))
+		if name != "" {
+			want[name] = struct{}{}
+		}
+	}
+	for _, tool := range gjson.GetBytes(body, "tools").Array() {
+		candidates := []string{
+			strings.TrimSpace(strings.ToLower(tool.Get("type").String())),
+			strings.TrimSpace(strings.ToLower(tool.Get("name").String())),
+			strings.TrimSpace(strings.ToLower(tool.Get("function.name").String())),
+		}
+		for _, candidate := range candidates {
+			if _, ok := want[candidate]; ok {
 				return true
 			}
 		}
@@ -1657,10 +1692,17 @@ func extractResponsesRequestMode(req map[string]any) string {
 	if mode == "" {
 		mode = extractSlashDirectiveFromResponsesInput(req, "mode")
 	}
-	if mode == "" && requestLooksLikePlanMode(req) {
-		mode = "plan"
-	}
 	return strings.ToLower(strings.TrimSpace(mode))
+}
+
+func responsesRequestContractMode(req map[string]any) string {
+	if req == nil {
+		return "default"
+	}
+	if extractResponsesRequestMode(req) == "plan" || isCodexManagedPlanModeFromResponsesRequest(req) {
+		return "plan"
+	}
+	return "default"
 }
 
 func requestLooksLikePlanMode(req map[string]any) bool {
@@ -1668,40 +1710,15 @@ func requestLooksLikePlanMode(req map[string]any) bool {
 		return false
 	}
 
-	// Collaboration-mode tags must be read only from trusted roles (system/developer),
-	// and when multiple blocks exist the most recent block must win.
-	if mode := extractEffectiveCollaborationModeFromResponsesRequest(req); mode != "" {
-		return mode == "plan"
-	}
-
 	safeCombined := strings.ToLower(strings.TrimSpace(extractTrustedResponsesInstructionText(req)))
 	if safeCombined == "" {
 		return false
-	}
-
-	// Fallback only for explicit, non-tagged collaboration headers in trusted roles.
-	defaultIdx := strings.LastIndex(safeCombined, "collaboration mode: default")
-	planIdx := strings.LastIndex(safeCombined, "collaboration mode: plan")
-	if defaultIdx > planIdx && defaultIdx >= 0 {
-		return false
-	}
-	if planIdx > defaultIdx && planIdx >= 0 {
-		return true
 	}
 
 	if strings.Contains(safeCombined, "/mode plan") || strings.Contains(safeCombined, "mode: plan") {
 		return true
 	}
 	if strings.Contains(safeCombined, " --plan") || strings.HasPrefix(strings.TrimSpace(safeCombined), "--plan") {
-		return true
-	}
-	if strings.Contains(safeCombined, "plan mode only") {
-		return true
-	}
-	if strings.Contains(safeCombined, "return only the plan") {
-		return true
-	}
-	if strings.Contains(safeCombined, "do not execute tools") && strings.Contains(safeCombined, "plan") {
 		return true
 	}
 	return false
@@ -1711,26 +1728,24 @@ func rawResponsesBodyLooksLikePlanMode(body []byte) bool {
 	if gjson.ValidBytes(body) {
 		var req map[string]any
 		if err := json.Unmarshal(body, &req); err == nil {
-			return requestLooksLikePlanMode(req)
+			return responsesRequestContractMode(req) == "plan" || requestLooksLikePlanMode(req)
 		}
 	}
 	lower := strings.ToLower(strings.TrimSpace(string(body)))
 	if lower == "" {
 		return false
 	}
-	if strings.Contains(lower, "plan mode only") {
+	if strings.Contains(lower, `"mode":"plan"`) || strings.Contains(lower, `"mode": "plan"`) {
 		return true
 	}
-	if strings.Contains(lower, "return only the plan") {
-		return true
-	}
-	if strings.Contains(lower, "do not execute tools") && strings.Contains(lower, "plan") {
-		return true
+	if strings.Contains(lower, "<collaboration_mode>") || strings.Contains(lower, `\u003ccollaboration_mode\u003e`) ||
+		strings.Contains(lower, "<collaborationmode>") || strings.Contains(lower, `\u003ccollaborationmode\u003e`) {
+		return strings.Contains(lower, "plan mode")
 	}
 	if strings.Contains(lower, "/mode plan") || strings.Contains(lower, "mode: plan") {
 		return true
 	}
-	if strings.Contains(lower, " --plan") {
+	if strings.Contains(lower, " --plan") || strings.HasPrefix(lower, "--plan") {
 		return true
 	}
 	return false
@@ -2157,7 +2172,7 @@ func shouldUseNativeResponsesBridgeStream(req map[string]any) bool {
 	if req == nil {
 		return false
 	}
-	if extractResponsesRequestMode(req) == "plan" {
+	if responsesRequestContractMode(req) == "plan" {
 		return false
 	}
 	// Native stream-forward mode strips tools and forces tool_choice=none.
@@ -2168,7 +2183,7 @@ func shouldUseNativeResponsesBridgeStream(req map[string]any) bool {
 	}
 	// Keep tool-phase recovery for apply_patch-heavy turns. For normal descriptive
 	// prompts, native upstream SSE forwarding provides true live tokens.
-	if requestMapContainsAnyToolOutput(req) {
+	if proxyCompatibilityAdapters.Continuation.BuildWorkflowState(req).HasToolOutput {
 		return false
 	}
 	if requestInputMentionsApplyPatch(req) {
@@ -2241,7 +2256,44 @@ func summarizeBridgeSamplingControls(chatReq []byte) string {
 	)
 }
 
+func removeQwenCloseThinkControls(out map[string]any) {
+	if out == nil {
+		return
+	}
+	if existing, ok := out["logit_bias"].(map[string]any); ok {
+		updated := cloneMap(existing)
+		delete(updated, qwenCloseThinkTokenID)
+		if len(updated) == 0 {
+			delete(out, "logit_bias")
+		} else {
+			out["logit_bias"] = updated
+		}
+	}
+	delete(out, "grammar")
+}
+
+func forceQwenThinkingDisabled(out map[string]any) {
+	if out == nil {
+		return
+	}
+	removeQwenCloseThinkControls(out)
+	delete(out, "reasoning_budget")
+	delete(out, "reasoning_budget_message")
+	if existing, ok := out["chat_template_kwargs"].(map[string]any); ok {
+		updated := cloneMap(existing)
+		updated["enable_thinking"] = false
+		out["chat_template_kwargs"] = updated
+		return
+	}
+	out["chat_template_kwargs"] = map[string]any{
+		"enable_thinking": false,
+	}
+}
+
 func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
+	appendProxyStageTrace("translation.responses_to_chat.start", map[string]any{
+		"body_len": len(body),
+	})
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, err
@@ -2251,6 +2303,7 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	_ = normalizeResponsesInputMap(req)
 	mode := extractResponsesRequestMode(req)
 	codexManagedPlanMode := isCodexManagedPlanModeFromResponsesRequest(req)
+	explicitNoMutationPlan := requestExplicitlyWantsNoMutationPlan(req)
 	planModeRequested := mode == "plan" || codexManagedPlanMode
 	proxyPlanEnforcement := mode == "plan" && !codexManagedPlanMode
 	reasoningEffort := extractResponsesRequestReasoningEffort(req)
@@ -2258,11 +2311,17 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	stripUnsupportedResponsesInclude(req)
 	stripSlashDirectivesFromResponsesInput(req)
 	sanitizeResponsesInputToolArguments(req)
+	workflowState := proxyCompatibilityAdapters.Continuation.BuildWorkflowState(req)
+	if explicitNoMutationPlan && !workflowState.HasToolOutput {
+		planModeRequested = true
+		proxyPlanEnforcement = true
+	}
 
 	if proxyPlanEnforcement {
 		prependSystemInstructionOnce(req, "Planning mode is active. Do NOT execute tasks, claim execution, or start implementing changes.")
 		prependSystemInstructionOnce(req, "Return only a structured plan: numbered phases, assumptions, risks, and validation steps.")
 		prependSystemInstructionOnce(req, "Wrap the final answer in <proposed_plan>...</proposed_plan> tags exactly.")
+		prependSystemInstructionOnce(req, "Do not ask follow-up questions, preference questions, or how-to-proceed questions in the plan response. Return only the plan for the current user task.")
 		prependSystemInstructionOnce(req, "Do not execute tools, mutate files, apply patches, or claim completed execution in planning mode. You may reference available tools only as part of the plan.")
 	}
 	if proxyPlanEnforcement {
@@ -2280,7 +2339,7 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	if requestMentionsAgentOrchestration(req) {
 		keepOnlyNamedTools(req, "spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent")
 	}
-	if !planModeRequested && !requestMapContainsAnyToolOutput(req) {
+	if !planModeRequested && !workflowState.HasToolOutput {
 		if body, err := json.Marshal(req); err == nil &&
 			shouldEnableStrictApplyPatchIntent(req, body) &&
 			!requestWantsShellInspectionBeforeApplyPatch(req) {
@@ -2305,14 +2364,9 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 		prependSystemInstructionOnce(req,
 			"When the user asks for a plan in Default mode, return the plan directly as assistant text wrapped in <proposed_plan>...</proposed_plan>. "+
 				"Do not call update_plan to present the user-facing plan.")
-		normalizedTools = removeNamedToolFromList(normalizedTools, "update_plan")
-	}
-	if planModeRequested && !proxyPlanEnforcement && bridgeToolListHasFunction(normalizedTools, "request_user_input") {
 		prependSystemInstructionOnce(req,
-			"In native Codex plan turns, when clarification is needed and request_user_input is available, "+
-				"use the request_user_input tool instead of writing the questions as plain assistant text. "+
-				"Return a native function call named request_user_input. Do not describe the question in prose. "+
-				"Do not explain your reasoning. Arguments must contain a questions array with exactly one short question when the prompt asks for exactly one question.")
+			"In plan-return turns, keep the output focused on the current user task only. Do not ask follow-up questions, preference questions, or how-to-proceed questions in the plan response.")
+		normalizedTools = removeNamedToolFromList(normalizedTools, "update_plan")
 	}
 	// Ensure apply_patch remains callable when request intent clearly asks for it,
 	// even if upstream client omitted that tool from the translated set.
@@ -2366,7 +2420,12 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 				}
 			}
 		}
-		if profile.hasCloseThinkBias {
+		translatedToolChoice := strings.TrimSpace(fmt.Sprintf("%v", out["tool_choice"]))
+		if translatedToolChoice == "" {
+			translatedToolChoice = strings.TrimSpace(fmt.Sprintf("%v", req["tool_choice"]))
+		}
+		suppressCloseThinkGuard := !hasToolRequests && strings.EqualFold(translatedToolChoice, "none")
+		if profile.hasCloseThinkBias && !suppressCloseThinkGuard {
 			if existing, hasExisting := out["logit_bias"].(map[string]any); hasExisting {
 				if _, hasCloseTokenBias := existing[qwenCloseThinkTokenID]; !hasCloseTokenBias {
 					updated := cloneMap(existing)
@@ -2379,7 +2438,7 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 				}
 			}
 		}
-		if profile.hasCloseThinkGuardRule {
+		if profile.hasCloseThinkGuardRule && !suppressCloseThinkGuard {
 			if _, hasGrammar := out["grammar"]; !hasGrammar && !hasToolRequests {
 				out["grammar"] = profile.closeThinkGuardRule
 			}
@@ -2396,68 +2455,83 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 		out["parallel_tool_calls"] = v
 	}
 
-	hasPriorToolOutput := requestMapContainsAnyToolOutput(req)
-	hasCompletedRequestUserInputOutput := requestHasCompletedToolOutputForName(req, "request_user_input")
-	forceFinalAfterSatisfiedApplyPatch := shouldForceFinalAnswerAfterSatisfiedApplyPatch(req)
-	if hasPriorToolOutput {
-		if exactReply := extractExactFinalReplyHintFromRequest(req); exactReply != "" {
-			prependSystemInstructionOnce(req,
-				"Continuation mode: if the task is already complete from prior tool results, do not call more tools. "+
-					"Provide the final answer immediately and reply with exactly: "+strconv.Quote(exactReply))
-		}
+	hasCompletedRequestUserInputOutput := completedToolNamesContain(workflowState.CompletedToolNames, "request_user_input")
+	searchIntent := requestExplicitlyWantsSearchIntent(req, workflowState)
+	explorationFollowupIntent := requestExplicitlyWantsExplorationFollowup(req, workflowState)
+	implementationRetryIntent := requestExplicitlyWantsImplementationRetry(req, workflowState)
+	nativeQuestionRequested := requestExplicitlyWantsNativeCodexQuestion(req)
+	planOutputRequested := requestStillWantsStructuredPlan(req, workflowState)
+	if codexManagedPlanMode && planOutputRequested {
+		prependSystemInstructionOnce(req, "Codex Plan Mode is still active. Do not begin implementation, do not claim file changes, and do not switch to execution prose.")
+		prependSystemInstructionOnce(req, "If the gathered research and user answers are sufficient, return exactly one <proposed_plan>...</proposed_plan> block now.")
 	}
-	if forceFinalAfterSatisfiedApplyPatch {
-		prependSystemInstructionOnce(req,
-			"Continuation mode: the previous apply_patch already produced the requested file change. "+
-				"Do not call any more tools or modify files again. Provide the final answer immediately.")
+	continuationPhase := classifyContinuationTurnPhase(ContinuationContext{
+		PlanModeRequested:         planModeRequested,
+		PlanOutputRequested:       planOutputRequested,
+		RequestUserInputAvailable: bridgeToolListHasFunction(normalizedTools, "request_user_input"),
+		NativeQuestionRequested:   nativeQuestionRequested,
+		ImplementationRetryIntent: implementationRetryIntent,
+		SearchIntent:              searchIntent,
+		ExplorationFollowupIntent: explorationFollowupIntent,
+	})
+	continuationDecision := proxyCompatibilityAdapters.Continuation.BuildDecision(req, ContinuationContext{
+		PlanModeRequested:         planModeRequested,
+		PlanOutputRequested:       planOutputRequested,
+		ProxyPlanEnforcement:      proxyPlanEnforcement,
+		RequestUserInputAvailable: bridgeToolListHasFunction(normalizedTools, "request_user_input"),
+		NativeQuestionRequested:   nativeQuestionRequested,
+		ImplementationRetryIntent: implementationRetryIntent,
+		SearchIntent:              searchIntent,
+		ExplorationFollowupIntent: explorationFollowupIntent,
+		RequestedToolChoice:       normalizeBridgeToolChoice(req["tool_choice"]),
+		ActiveToolChoice:          out["tool_choice"],
+		TurnPhase:                 continuationPhase,
+	})
+	appendProxyStageTrace("continuation.responses_to_chat", map[string]any{
+		"summary": summarizeContinuationState(
+			continuationDecision.State,
+			workflowState,
+			continuationDecision.State == ContinuationStateFinalAnswerRequired,
+			hasCompletedRequestUserInputOutput,
+			workflowState.HasToolOutput,
+		),
+		"turn_phase": continuationPhase,
+	})
+	for _, instruction := range continuationDecision.Instructions {
+		prependSystemInstructionOnce(req, instruction)
 	}
-	if !proxyPlanEnforcement && !forceFinalAfterSatisfiedApplyPatch {
-		requestedToolChoice := normalizeBridgeToolChoice(req["tool_choice"])
-		activeToolChoice := out["tool_choice"]
-		if requestedToolChoice != nil {
-			activeToolChoice = requestedToolChoice
-		}
-		forcePlanQuestionContinuation := planModeRequested &&
-			bridgeToolListHasFunction(normalizedTools, "request_user_input") &&
-			(requestExplicitlyWantsNativeCodexQuestion(req) || (hasPriorToolOutput && !hasCompletedRequestUserInputOutput)) &&
-			!toolChoiceTargetsSpecificTool(activeToolChoice)
-		forcePlanReturnAfterQuestions := planModeRequested &&
-			hasCompletedRequestUserInputOutput &&
-			!toolChoiceTargetsSpecificTool(activeToolChoice)
-
-		if requestedToolChoice != nil {
+	if continuationDecision.DisableTools {
+		out["tool_choice"] = "none"
+	} else {
+		if requestedToolChoice := normalizeBridgeToolChoice(req["tool_choice"]); requestedToolChoice != nil {
 			out["tool_choice"] = requestedToolChoice
 		}
-		if forcePlanQuestionContinuation {
-			out["tool_choice"] = map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name": "request_user_input",
-				},
-			}
+		if continuationDecision.ForceToolChoice != nil {
+			out["tool_choice"] = continuationDecision.ForceToolChoice
 		}
-		if forcePlanReturnAfterQuestions {
-			prependSystemInstructionOnce(req,
-				"Continuation mode: the required clarifying questions have already been asked and answered. "+
-					"Do not call request_user_input again. Do not call more tools. "+
-					"Return exactly one complete <proposed_plan> block now.")
-			out["tool_choice"] = "none"
+		if !toolChoiceTargetsSpecificTool(out["tool_choice"]) && len(continuationDecision.AllowedToolNames) > 0 {
+			normalizedTools = filterBridgeToolsToAllowedNames(normalizedTools, continuationDecision.AllowedToolNames...)
 		}
-		if !toolChoiceTargetsSpecificTool(out["tool_choice"]) {
-			if allowedTools := deriveContinuationAllowedToolNames(req); len(allowedTools) > 0 {
-				normalizedTools = filterBridgeToolsToAllowedNames(normalizedTools, allowedTools...)
-			}
-		}
-	} else {
-		out["tool_choice"] = "none"
 	}
 	if forcedToolName := specificToolChoiceFunctionName(out["tool_choice"]); forcedToolName != "" {
 		normalizedTools = filterBridgeToolsToFunctionName(normalizedTools, forcedToolName)
 	}
+	if workflowState.VerificationExpected &&
+		!workflowState.VerificationCompleted &&
+		workflowState.LatestCompletedToolName == "apply_patch" &&
+		specificToolChoiceFunctionName(out["tool_choice"]) == "shell" {
+		removeQwenCloseThinkControls(out)
+	}
+	if requestExplicitlyWantsNativeCodexQuestion(req) &&
+		specificToolChoiceFunctionName(out["tool_choice"]) == "request_user_input" {
+		forceQwenThinkingDisabled(out)
+	}
 	if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", out["tool_choice"])), "none") {
 		normalizedTools = nil
+		out["parallel_tool_calls"] = false
+		removeQwenCloseThinkControls(out)
 	}
-	if len(normalizedTools) > 0 && !forceFinalAfterSatisfiedApplyPatch {
+	if len(normalizedTools) > 0 && continuationDecision.State != ContinuationStateFinalAnswerRequired {
 		out["tools"] = normalizedTools
 	} else {
 		delete(out, "tools")
@@ -2491,6 +2565,7 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	if len(messages) == 0 {
 		messages = []map[string]any{{"role": "user", "content": " "}}
 	}
+	messages = filterEmptyAssistantChatMessages(messages)
 	messages = normalizeChatMessagesForStrictTemplates(messages)
 	for _, message := range messages {
 		content, _ := message["content"].(string)
@@ -2507,6 +2582,14 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 		streamRequested = strings.EqualFold(strings.TrimSpace(typed), "true")
 	}
 	out["stream"] = streamRequested
+	appendProxyStageTrace("translation.responses_to_chat.done", map[string]any{
+		"mode":                   mode,
+		"plan_mode_requested":    planModeRequested,
+		"proxy_plan_enforcement": proxyPlanEnforcement,
+		"tools_count":            len(normalizedTools),
+		"stream":                 streamRequested,
+		"force_final":            continuationDecision.State == ContinuationStateFinalAnswerRequired,
+	})
 	return json.Marshal(out)
 }
 
@@ -2567,6 +2650,22 @@ func specificToolChoiceFunctionName(raw any) string {
 		return ""
 	}
 	return strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
+}
+
+func filterEmptyAssistantChatMessages(messages []map[string]any) []map[string]any {
+	if len(messages) == 0 {
+		return messages
+	}
+	filtered := make([]map[string]any, 0, len(messages))
+	for _, message := range messages {
+		role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", message["role"])))
+		content, _ := message["content"].(string)
+		if role == "assistant" && strings.TrimSpace(content) == "" {
+			continue
+		}
+		filtered = append(filtered, message)
+	}
+	return filtered
 }
 
 func filterBridgeToolsToFunctionName(tools []any, name string) []any {
@@ -3023,6 +3122,100 @@ func stripLeadingReasoningDirective(text string) string {
 	return stripped
 }
 
+func normalizeAssistantReasoningFields(content string, reasoning string) (string, string) {
+	content = strings.TrimSpace(content)
+	reasoning = strings.TrimSpace(reasoning)
+	if reasoning == "" {
+		return content, reasoning
+	}
+
+	if extractedContent, extractedReasoning := extractContentAndReasoning(reasoning); strings.TrimSpace(extractedReasoning) != "" {
+		reasoning = strings.TrimSpace(extractedReasoning)
+		extractedContent = strings.TrimSpace(extractedContent)
+		if extractedContent != "" {
+			if content == "" {
+				content = extractedContent
+			} else if !strings.EqualFold(content, extractedContent) {
+				content = strings.TrimSpace(extractedContent + "\n" + content)
+			}
+		}
+		return content, reasoning
+	}
+
+	if leadingOrphanThinkCloseRegex.MatchString(reasoning) {
+		leakedContent := stripLeadingReasoningDirective(reasoning)
+		if leakedContent != "" {
+			if content == "" {
+				content = leakedContent
+			} else if !strings.EqualFold(content, leakedContent) {
+				content = strings.TrimSpace(leakedContent + "\n" + content)
+			}
+		}
+		return content, ""
+	}
+
+	return content, reasoning
+}
+
+const emptyAssistantOutputFallbackText = "[proxy] upstream returned no usable assistant content; retry the request."
+
+func chatCompletionLooksLikeEmptyVisibleOutput(content string, reasoning string) bool {
+	if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoning) == "" {
+		return false
+	}
+	normalizedContent, normalizedReasoning := normalizeAssistantReasoningFields(content, reasoning)
+	normalizedContent = strings.TrimSpace(stripLeadingReasoningDirective(normalizedContent))
+	normalizedReasoning = strings.TrimSpace(stripLeadingReasoningDirective(normalizedReasoning))
+	return normalizedContent == "" && normalizedReasoning == ""
+}
+
+func normalizeChatCompletionReasoningBoundary(body []byte) []byte {
+	var envelope map[string]any
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return body
+	}
+	choices, ok := envelope["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return body
+	}
+
+	changed := false
+	for _, rawChoice := range choices {
+		choice, ok := rawChoice.(map[string]any)
+		if !ok {
+			continue
+		}
+		message, ok := choice["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		content := strings.TrimSpace(fmt.Sprintf("%v", message["content"]))
+		reasoning := strings.TrimSpace(fmt.Sprintf("%v", message["reasoning_content"]))
+		normalizedContent, normalizedReasoning := normalizeAssistantReasoningFields(content, reasoning)
+		if normalizedContent != content {
+			message["content"] = normalizedContent
+			changed = true
+		}
+		if normalizedReasoning != reasoning {
+			if normalizedReasoning == "" {
+				delete(message, "reasoning_content")
+			} else {
+				message["reasoning_content"] = normalizedReasoning
+			}
+			changed = true
+		}
+	}
+
+	if !changed {
+		return body
+	}
+	normalized, err := json.Marshal(envelope)
+	if err != nil {
+		return body
+	}
+	return normalized
+}
+
 func extractContentAndReasoning(raw string) (content string, reasoning string) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -3101,6 +3294,7 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 		})
 	}
 	pendingReasoningText := ""
+	toolNameByCallID := map[string]string{}
 	disableReasoningHistoryReplay := false
 	switch value := strings.TrimSpace(strings.ToLower(os.Getenv("LLAMASWAP_DISABLE_REASONING_HISTORY_REPLAY"))); value {
 	case "1", "true", "yes", "on":
@@ -3155,6 +3349,9 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 		if callID == "" {
 			callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(out))
 		}
+		if normalizedName := normalizeToolTierName(name); normalizedName != "" {
+			toolNameByCallID[callID] = normalizedName
+		}
 
 		message := map[string]any{
 			"role":    "assistant",
@@ -3177,10 +3374,13 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 		out = append(out, message)
 	}
 
-	appendToolResult := func(callID string, output any) {
+	appendToolResult := func(callID string, toolName string, output any) {
 		callID = strings.TrimSpace(callID)
 		if callID == "" {
 			return
+		}
+		if strings.TrimSpace(toolName) == "" {
+			toolName = toolNameByCallID[callID]
 		}
 		text := extractResponsesInputText(output)
 		text = strings.TrimSpace(text)
@@ -3188,6 +3388,9 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 			text = encodeAnyAsJSONString(output)
 		}
 		text = strings.TrimSpace(cleanFallbackInput(output, text))
+		if normalizeToolTierName(toolName) == "apply_patch" {
+			text = normalizeApplyPatchToolOutputText(text)
+		}
 		if text == "" {
 			text = " "
 		}
@@ -3244,11 +3447,11 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 			case "function_call":
 				appendAssistantToolCall(fmt.Sprintf("%v", item["name"]), item["arguments"], fmt.Sprintf("%v", item["call_id"]))
 			case "function_call_output":
-				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), "", item["output"])
 			case "shell_call":
 				appendAssistantToolCall("shell", item["action"], fmt.Sprintf("%v", item["call_id"]))
 			case "shell_call_output":
-				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), "shell", item["output"])
 			case "apply_patch_call":
 				payload := map[string]any{}
 				if operation, ok := item["operation"]; ok && hasNonEmptyApplyPatchOperation(operation) {
@@ -3296,29 +3499,29 @@ func responsesRequestToChatMessages(req map[string]any) []map[string]any {
 				}
 				appendAssistantToolCall(callName, payload, fmt.Sprintf("%v", item["call_id"]))
 			case "apply_patch_call_output":
-				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), "apply_patch", item["output"])
 			case "custom_tool_call_output":
-				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), fmt.Sprintf("%v", item["name"]), item["output"])
 			case "web_search_call":
 				appendAssistantToolCall("web_search", item["action"], fmt.Sprintf("%v", item["call_id"]))
 			case "web_search_call_output":
-				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), "web_search", item["output"])
 			case "file_search_call":
 				appendAssistantToolCall("file_search", item["action"], fmt.Sprintf("%v", item["call_id"]))
 			case "file_search_call_output":
-				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), "file_search", item["output"])
 			case "code_interpreter_call":
 				appendAssistantToolCall("code_interpreter", item["action"], fmt.Sprintf("%v", item["call_id"]))
 			case "code_interpreter_call_output":
-				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), "code_interpreter", item["output"])
 			case "image_generation_call":
 				appendAssistantToolCall("image_generation", item["action"], fmt.Sprintf("%v", item["call_id"]))
 			case "image_generation_call_output":
-				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), "image_generation", item["output"])
 			case "computer_call":
 				appendAssistantToolCall("computer", item["action"], fmt.Sprintf("%v", item["call_id"]))
 			case "computer_call_output":
-				appendToolResult(fmt.Sprintf("%v", item["call_id"]), item["output"])
+				appendToolResult(fmt.Sprintf("%v", item["call_id"]), "computer", item["output"])
 			default:
 				convertOne("user", item)
 			}
@@ -3695,10 +3898,24 @@ func normalizePossiblyMixedToolArguments(raw string) string {
 		return "{}"
 	}
 	if json.Valid([]byte(raw)) {
+		if strings.HasPrefix(raw, `"`) {
+			var inner string
+			if err := json.Unmarshal([]byte(raw), &inner); err == nil {
+				inner = strings.TrimSpace(inner)
+				if inner != "" && json.Valid([]byte(inner)) {
+					return inner
+				}
+			}
+		}
 		return raw
 	}
 	if repaired := extractJSONObject(raw); repaired != "" && json.Valid([]byte(repaired)) {
 		return repaired
+	}
+	if repaired := extractJSONObject(raw); repaired != "" {
+		if escaped := escapeLiteralNewlinesInJSONObjectStrings(repaired); escaped != "" && json.Valid([]byte(escaped)) {
+			return escaped
+		}
 	}
 	if repaired := extractQwenXMLToolArguments(raw); repaired != "" && json.Valid([]byte(repaired)) {
 		return repaired
@@ -3716,6 +3933,36 @@ func extractJSONObject(s string) string {
 		return strings.TrimSpace(s[start : end+1])
 	}
 	return ""
+}
+
+func escapeLiteralNewlinesInJSONObjectStrings(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	inString := false
+	escaped := false
+	for _, r := range s {
+		switch {
+		case escaped:
+			b.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			b.WriteRune(r)
+			escaped = true
+		case r == '"':
+			b.WriteRune(r)
+			inString = !inString
+		case inString && r == '\n':
+			b.WriteString(`\n`)
+		case inString && r == '\r':
+			// Drop CR and let LF branch handle newline normalization.
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func extractQwenXMLToolArguments(s string) string {
@@ -3862,6 +4109,13 @@ func recoverRequestUserInputArgumentsFromTextSources(texts ...string) (string, b
 						return mustJSONString(map[string]any{"questions": []string{decoded}}), true
 					}
 				}
+			}
+		}
+		if strings.Contains(text, "?") {
+			candidate := strings.TrimSpace(text)
+			candidate = strings.Trim(candidate, "\"'`")
+			if strings.Count(candidate, "?") == 1 && strings.HasSuffix(candidate, "?") {
+				return mustJSONString(map[string]any{"questions": []string{candidate}}), true
 			}
 		}
 	}
@@ -4122,6 +4376,58 @@ func recoverApplyPatchOperationFromArgs(args map[string]any) (map[string]any, bo
 	return recovered, true
 }
 
+func repairApplyPatchArgsOperationPathWithHint(args map[string]any, applyPatchPathHint string) map[string]any {
+	if len(args) == 0 {
+		return args
+	}
+	rawOp, ok := args["operation"].(map[string]any)
+	rewrittenArgs := cloneMap(args)
+	if !ok {
+		for _, key := range []string{"raw", "input", "patch"} {
+			raw, _ := args[key].(string)
+			decoded, decodedOK := parseJSONStringMap(raw)
+			if !decodedOK {
+				continue
+			}
+			nestedOp, nestedOK := decoded["operation"].(map[string]any)
+			if !nestedOK {
+				continue
+			}
+			rawOp = nestedOp
+			rewrittenArgs = decoded
+			ok = true
+			break
+		}
+		if !ok {
+			return args
+		}
+	}
+	pathHint := strings.TrimSpace(normalizeApplyPatchPathForWorkspace(applyPatchPathHint))
+	if pathHint == "" || !applyPatchPathExistsLocally(pathHint) {
+		return args
+	}
+	opType := normalizeApplyPatchTypeHint(cleanFallbackInput(rawOp["type"], ""))
+	if opType != "create_file" && opType != "update_file" && opType != "delete_file" {
+		return args
+	}
+	opPath := strings.TrimSpace(cleanFallbackInput(rawOp["path"], ""))
+	if opPath != "" {
+		normalizedPath := normalizeApplyPatchPathForWorkspace(opPath)
+		if applyPatchPathExistsLocally(normalizedPath) || strings.EqualFold(filepath.ToSlash(normalizedPath), filepath.ToSlash(pathHint)) {
+			return args
+		}
+	}
+	rewrittenOp := cloneMap(rawOp)
+	rewrittenOp["path"] = pathHint
+	if (opType == "create_file" || opType == "update_file") &&
+		(strings.TrimSpace(cleanFallbackInput(rewrittenOp["content"], "")) != "" ||
+			strings.TrimSpace(cleanFallbackInput(rewrittenOp["input"], "")) != "") {
+		delete(rewrittenOp, "diff")
+	}
+	rewrittenArgs["operation"] = rewrittenOp
+	return rewrittenArgs
+}
+
 func recoverApplyPatchOperationFromStringifiedArgs(args map[string]any) (map[string]any, bool) {
 	for _, key := range []string{"input", "patch", "raw"} {
 		raw, ok := args[key].(string)
@@ -4154,6 +4460,18 @@ func selectApplyPatchOperation(args map[string]any) any {
 		return recovered
 	}
 	if operation, ok := args["operation"]; ok {
+		if rawOperation, ok := operation.(string); ok && strings.TrimSpace(rawOperation) != "" {
+			if decoded, decodedOK := parseJSONStringMap(rawOperation); decodedOK {
+				normalized := normalizeApplyPatchOperation(decoded)
+				if applyPatchOperationPayloadValid(normalized) {
+					return normalized
+				}
+				return normalized
+			}
+			if converted, convertedOK := convertApplyPatchTextToOperation(rawOperation); convertedOK {
+				return converted
+			}
+		}
 		if hasNonEmptyApplyPatchOperation(operation) {
 			normalized := normalizeApplyPatchOperation(operation)
 			if applyPatchOperationPayloadValid(normalized) {
@@ -4247,6 +4565,8 @@ func normalizeApplyPatchPathForWorkspace(path string) string {
 	if path == "" {
 		return ""
 	}
+	path = strings.ReplaceAll(path, `\/`, `/`)
+	path = strings.ReplaceAll(path, `\\`, `\`)
 
 	// Preserve absolute Windows/UNC paths as provided by the model. The test
 	// harness may execute apply_patch against a workspace outside llama-swap.
@@ -4274,6 +4594,53 @@ func normalizeApplyPatchPathForWorkspace(path string) string {
 	}
 
 	return path
+}
+
+func extractWorkspaceRootHintFromResponsesText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	matchers := []*regexp.Regexp{
+		regexp.MustCompile(`(?is)<cwd>\s*([^<\r\n]+?)\s*</cwd>`),
+		regexp.MustCompile("(?im)^\\s*cwd\\s*[:=]\\s*([^\\r\\n]+)\\s*$"),
+	}
+	for _, re := range matchers {
+		match := re.FindStringSubmatch(text)
+		if len(match) < 2 {
+			continue
+		}
+		candidate := strings.TrimSpace(match[1])
+		candidate = strings.Trim(candidate, "\"'`")
+		if candidate == "" {
+			continue
+		}
+		return normalizeApplyPatchPathForWorkspace(candidate)
+	}
+	return ""
+}
+
+func resolveApplyPatchPathHintCandidate(candidate string, requestText string) string {
+	candidate = strings.TrimSpace(candidate)
+	candidate = strings.Trim(candidate, ".,;:!?)(")
+	if candidate == "" {
+		return ""
+	}
+	normalizedCandidate := normalizeApplyPatchPathForWorkspace(candidate)
+	if isLikelyAbsoluteApplyPatchPath(normalizedCandidate) || applyPatchPathExistsLocally(normalizedCandidate) {
+		return normalizedCandidate
+	}
+	workspaceRoot := strings.TrimSpace(extractWorkspaceRootHintFromResponsesText(requestText))
+	if workspaceRoot == "" {
+		return normalizedCandidate
+	}
+	joinedRoot := strings.TrimRight(strings.ReplaceAll(workspaceRoot, "\\", "/"), "/")
+	joinedCandidate := strings.TrimLeft(strings.ReplaceAll(candidate, "\\", "/"), "/")
+	joined := normalizeApplyPatchPathForWorkspace(joinedRoot + "/" + joinedCandidate)
+	if applyPatchPathExistsLocally(joined) {
+		return joined
+	}
+	return normalizedCandidate
 }
 
 func isLikelyAbsoluteApplyPatchPath(path string) bool {
@@ -4558,6 +4925,27 @@ func shouldRebuildWeakApplyPatchDiff(path string, diff string, content string) b
 	}
 	existingLines := strings.Split(strings.TrimRight(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n"), "\n")
 	contentLines := strings.Split(content, "\n")
+	if len(existingLines) > 0 && len(contentLines) > len(existingLines) {
+		prefixMatch := true
+		for i := range existingLines {
+			if i >= len(contentLines) || existingLines[i] != contentLines[i] {
+				prefixMatch = false
+				break
+			}
+		}
+		if prefixMatch {
+			appendApplyPatchTrace("weak_diff_rebuild_probe", map[string]any{
+				"path":           path,
+				"result":         true,
+				"reason":         "existing_prefix_of_content",
+				"content_len":    len(content),
+				"existing_lines": len(existingLines),
+				"content_lines":  len(contentLines),
+				"diff_excerpt":   truncateBridgeDebugText(diff, 180),
+			})
+			return true
+		}
+	}
 	if len(contentLines) < max(2, len(existingLines)/2) {
 		appendApplyPatchTrace("weak_diff_rebuild_probe", map[string]any{
 			"path":           path,
@@ -4669,7 +5057,12 @@ func normalizeApplyPatchOperation(operation any) any {
 			}
 		}
 		if opType == "create_file" || opType == "update_file" {
-			if rebuiltDiff := strings.TrimSpace(buildApplyPatchDiffFromOperation(out)); rebuiltDiff != "" {
+			if strings.TrimSpace(cleanFallbackInput(out["content"], "")) != "" {
+				// Content-first operations are safer for Codex-facing clients than
+				// synthetic diff reconstruction, which can re-expand a full-file
+				// rewrite into a weak append-only diff.
+				delete(out, "diff")
+			} else if rebuiltDiff := strings.TrimSpace(buildApplyPatchDiffFromOperation(out)); rebuiltDiff != "" {
 				out["diff"] = rebuiltDiff
 			}
 		}
@@ -4904,6 +5297,9 @@ func buildApplyPatchInputFromOperation(operation any) string {
 			if patch := buildHeuristicUpdatePatchFromExistingFile(path, content); patch != "" {
 				return patch
 			}
+			if patch := buildHeuristicUpdatePatchFromContentOnly(path, content); patch != "" {
+				return patch
+			}
 			lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
 			var b strings.Builder
 			b.WriteString("*** Begin Patch\n")
@@ -4939,6 +5335,11 @@ func buildHeuristicUpdatePatchFromExistingFile(path string, fragment string) str
 	}
 	existing := strings.ReplaceAll(string(raw), "\r\n", "\n")
 	appendMode := shouldTreatUpdateFragmentAsAppend(existing, fragment)
+	addedFragment := fragment
+	existingTrimmed := strings.TrimRight(existing, "\n")
+	if appendMode && existingTrimmed != "" && strings.HasPrefix(fragment, existingTrimmed+"\n") {
+		addedFragment = strings.TrimPrefix(fragment, existingTrimmed+"\n")
+	}
 	var b strings.Builder
 	b.WriteString("*** Begin Patch\n")
 	b.WriteString("*** Update File: ")
@@ -4955,7 +5356,33 @@ func buildHeuristicUpdatePatchFromExistingFile(path string, fragment string) str
 			b.WriteString("\n")
 		}
 	}
-	for _, line := range strings.Split(fragment, "\n") {
+	for _, line := range strings.Split(addedFragment, "\n") {
+		b.WriteString("+")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("*** End Patch\n")
+	return b.String()
+}
+
+func buildHeuristicUpdatePatchFromContentOnly(path string, content string) string {
+	content = strings.ReplaceAll(strings.TrimSpace(content), "\r\n", "\n")
+	if path == "" || content == "" {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	if len(lines) < 2 || strings.TrimSpace(lines[0]) == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("*** Begin Patch\n")
+	b.WriteString("*** Update File: ")
+	b.WriteString(path)
+	b.WriteString("\n@@\n")
+	b.WriteString("-")
+	b.WriteString(lines[0])
+	b.WriteString("\n")
+	for _, line := range lines {
 		b.WriteString("+")
 		b.WriteString(line)
 		b.WriteString("\n")
@@ -5127,7 +5554,15 @@ func recoverContentFromWeakApplyPatchUpdate(path string, diff string) (string, b
 			}
 			return out, true
 		}
-		return "", false
+		out := existing
+		if out != "" && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		out += addedText
+		if strings.HasSuffix(existing, "\n") && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		return out, true
 	}
 
 	if len(removed) == 0 && shouldTreatUpdateFragmentAsAppend(existing, addedText) {
@@ -5325,69 +5760,13 @@ func looksLikePatchText(text string) bool {
 	return false
 }
 
+func validateBridgeToolCallItemResult(item map[string]any) ToolValidationResult {
+	return proxyCompatibilityAdapters.ToolRepair.ValidateToolCallItem(item)
+}
+
 func validateBridgeToolCallItem(item map[string]any) (bool, string) {
-	itemType := strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
-	switch itemType {
-	case "apply_patch_call":
-		hasOperation := hasNonEmptyApplyPatchOperation(item["operation"])
-		hasInput := hasNonEmptyApplyPatchOperation(item["input"])
-		hasPatch := hasNonEmptyApplyPatchOperation(item["patch"])
-		hasDiff := hasNonEmptyApplyPatchOperation(item["diff"])
-		if !(hasOperation || hasInput || hasPatch || hasDiff) {
-			diagnostic := strings.TrimSpace(fmt.Sprintf("%v", item["_bridge_diagnostic"]))
-			if diagnostic != "" {
-				return false, applyPatchValidationWarningPrefix + " arguments were empty. Provide a non-empty operation with target path and diff/content. Observed arguments: " + diagnostic
-			}
-			return false, applyPatchValidationWarningPrefix + " arguments were empty. Provide a non-empty operation with target path and diff/content."
-		}
-		if hasOperation && !applyPatchOperationPayloadValid(item["operation"]) {
-			return false, applyPatchValidationWarningPrefix + " operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
-		}
-		if hasInput && !applyPatchOperationPayloadValid(item["input"]) {
-			return false, applyPatchValidationWarningPrefix + " input operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
-		}
-		if hasPatch && !applyPatchOperationPayloadValid(item["patch"]) {
-			return false, applyPatchValidationWarningPrefix + " patch operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
-		}
-		if hasDiff && !applyPatchOperationPayloadValid(item["diff"]) {
-			return false, applyPatchValidationWarningPrefix + " diff operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update."
-		}
-	case "custom_tool_call":
-		if strings.TrimSpace(fmt.Sprintf("%v", item["name"])) == "" {
-			return false, "custom tool call was not executed because tool name was empty."
-		}
-		if strings.TrimSpace(cleanFallbackInput(item["input"], "")) == "" {
-			return false, "custom tool call was not executed because input was empty."
-		}
-	case "mcp_tool_call":
-		if strings.TrimSpace(fmt.Sprintf("%v", item["server"])) == "" || strings.TrimSpace(fmt.Sprintf("%v", item["tool"])) == "" {
-			return false, "mcp tool call was not executed because server or tool name was empty."
-		}
-	case "shell_call", "web_search_call", "file_search_call", "code_interpreter_call", "image_generation_call", "computer_call":
-		action, _ := item["action"].(map[string]any)
-		if itemType == "shell_call" {
-			if !shellToolArgumentsValid(action) {
-				return false, shellValidationWarningPrefix + " arguments were empty. Provide a non-empty `command` string or `commands` array and retry."
-			}
-			break
-		}
-		if len(action) == 0 || !hasAnyNonEmptyValue(action) {
-			toolName := strings.TrimSuffix(itemType, "_call")
-			return false, fmt.Sprintf("%s call was not executed because arguments were empty. Provide concrete action arguments and retry.", toolName)
-		}
-	case "function_call":
-		name := strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
-		if name == "" {
-			return false, "function call was not executed because function name was empty."
-		}
-		if strings.EqualFold(name, "shell") || strings.EqualFold(name, "shell_command") {
-			args := parseToolArgsMapString(fmt.Sprintf("%v", item["arguments"]))
-			if !shellToolArgumentsValid(args) {
-				return false, shellValidationWarningPrefix + " arguments were empty. Provide a non-empty `command` string or `commands` array and retry."
-			}
-		}
-	}
-	return true, ""
+	result := validateBridgeToolCallItemResult(item)
+	return result.Valid, result.Warning
 }
 
 func shellToolArgumentsValid(raw map[string]any) bool {
@@ -5402,6 +5781,41 @@ func shellToolArgumentsValid(raw map[string]any) bool {
 		return true
 	}
 	return false
+}
+
+func shellToolArgumentsLookLikePlainQuestion(raw map[string]any) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	normalized := normalizeShellArgumentMap(raw)
+	commands := normalizeShellCommandsValue(normalized["commands"])
+	if len(commands) == 0 {
+		commands = normalizeShellCommandsValue(normalized["command"])
+	}
+	if len(commands) == 0 {
+		return false
+	}
+	joined := strings.TrimSpace(strings.Join(commands, " "))
+	if joined == "" {
+		return false
+	}
+	lower := strings.ToLower(joined)
+	questionLike := strings.HasSuffix(joined, "?") ||
+		strings.HasPrefix(lower, "what ") ||
+		strings.HasPrefix(lower, "why ") ||
+		strings.HasPrefix(lower, "how ") ||
+		strings.HasPrefix(lower, "which ") ||
+		strings.HasPrefix(lower, "when ") ||
+		strings.HasPrefix(lower, "where ")
+	if !questionLike {
+		return false
+	}
+	for _, marker := range []string{"|", ">", "<", ";", "&", "$", "/", "\\", "git ", "rg ", "ls", "pwd", "cat ", "cd ", ".ps1", ".sh"} {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	return len(strings.Fields(joined)) >= 4
 }
 
 func truncateBridgeDebugText(s string, max int) string {
@@ -5435,6 +5849,191 @@ func buildReasoningCommentaryPreview(reasoning string) string {
 		trimmed = strings.TrimSpace(reasoning[:maxLen])
 	}
 	return trimmed + " ..."
+}
+
+func buildIncrementalReasoningSummaryDelta(reasoning string, previousSummary string) (string, string) {
+	summary := buildReasoningCommentaryPreview(reasoning)
+	if strings.TrimSpace(summary) == "" {
+		return strings.TrimSpace(previousSummary), ""
+	}
+	previousSummary = strings.TrimSpace(previousSummary)
+	if summary == previousSummary {
+		return summary, ""
+	}
+	if previousSummary != "" && strings.HasPrefix(summary, previousSummary) {
+		return summary, summary[len(previousSummary):]
+	}
+	if previousSummary != "" {
+		// When the rolling preview gets re-trimmed, avoid replaying the whole
+		// summary as a fresh delta. Keep the canonical final summary updated, but
+		// let response.reasoning_summary_text.done carry the rewritten full text.
+		return summary, ""
+	}
+	return summary, summary
+}
+
+func looksLikePlanAcknowledgementWithoutPlan(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(stripLeadingReasoningDirective(text)))
+	if lower == "" {
+		return false
+	}
+	if strings.Contains(lower, "<proposed_plan>") && strings.Contains(lower, "</proposed_plan>") {
+		return false
+	}
+	return strings.Contains(lower, "i have everything i need") ||
+		strings.Contains(lower, "here's the plan:") ||
+		strings.Contains(lower, "here is the plan:") ||
+		strings.Contains(lower, "great - i have everything i need") ||
+		strings.Contains(lower, "great — i have everything i need")
+}
+
+func buildWorkflowProgressCommentary(planOutputRequired bool, nativeQuestionRequired bool, workflowState ToolWorkflowState, latestToolName string, finalizing bool) string {
+	switch {
+	case nativeQuestionRequired:
+		return "Preparing the clarification question."
+	case planOutputRequired && completedToolNamesContain(workflowState.CompletedToolNames, "request_user_input"):
+		return "Generating the requested plan from the clarification answers."
+	case planOutputRequired && finalizing:
+		return "Finalizing the plan."
+	case planOutputRequired:
+		return "Generating the requested plan."
+	case finalizing && workflowState.FinalAnswerSafe:
+		return "Finalizing the response."
+	case strings.EqualFold(strings.TrimSpace(latestToolName), "apply_patch"):
+		return "Applying the requested file update."
+	case strings.EqualFold(strings.TrimSpace(latestToolName), "shell") && workflowState.VerificationExpected && !workflowState.VerificationCompleted:
+		return "Verifying the updated file."
+	case workflowState.VerificationExpected && !workflowState.VerificationCompleted:
+		return "Verification is in progress."
+	case workflowState.HasToolOutput:
+		return "Continuing from the latest tool results."
+	default:
+		return "Working on the request."
+	}
+}
+
+func toolStartProgressCommentary(toolName string, workflowState ToolWorkflowState) string {
+	switch strings.ToLower(strings.TrimSpace(toolName)) {
+	case "apply_patch":
+		return "Applying the requested file update."
+	case "request_user_input":
+		return "Preparing the clarification question."
+	case "shell":
+		if workflowState.VerificationExpected && !workflowState.VerificationCompleted {
+			return "Verifying the updated file."
+		}
+	}
+	return ""
+}
+
+func replayToolProgressCommentary(toolName string) string {
+	switch strings.ToLower(strings.TrimSpace(proxyCompatibilityAdapters.Stream.CanonicalToolName(toolName))) {
+	case "apply_patch":
+		return "Applying the requested file update."
+	case "shell":
+		return "Running tool..."
+	default:
+		return "Working on the request."
+	}
+}
+
+func shouldRewriteWeakFinalWorkflowText(workflowState ToolWorkflowState, text string) bool {
+	if !workflowState.FinalAnswerSafe || len(workflowState.PendingToolNames) > 0 {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(stripLeadingReasoningDirective(text)))
+	if lower == "" {
+		return false
+	}
+	weakPrefixes := []string{
+		"i'll ",
+		"i will ",
+		"let me ",
+		"now verifying",
+		"verifying the final",
+		"i'm going to ",
+		"i am going to ",
+	}
+	for _, prefix := range weakPrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildWorkflowFinalExplanation(workflowState ToolWorkflowState, fallback string) string {
+	switch {
+	case workflowState.VerificationExpected && workflowState.VerificationCompleted:
+		return "The requested file changes were applied and verified successfully."
+	case workflowState.ApplyPatchSatisfied:
+		return "The requested file changes were applied successfully."
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func buildResponsesUsageFromChatUsage(usage gjson.Result) map[string]any {
+	if !usage.Exists() {
+		return nil
+	}
+	usageMap := map[string]any{
+		"input_tokens":  usage.Get("prompt_tokens").Int(),
+		"output_tokens": usage.Get("completion_tokens").Int(),
+		"total_tokens":  usage.Get("total_tokens").Int(),
+	}
+	reasoningTokens := usage.Get("completion_tokens_details.reasoning_tokens").Int()
+	if reasoningTokens > 0 {
+		usageMap["output_tokens_details"] = map[string]any{
+			"reasoning_tokens": reasoningTokens,
+		}
+	}
+	cachedTokens := usage.Get("prompt_tokens_details.cached_tokens").Int()
+	if cachedTokens > 0 {
+		usageMap["input_tokens_details"] = map[string]any{
+			"cached_tokens": cachedTokens,
+		}
+	}
+	return usageMap
+}
+
+func buildResponsesTimingFromChatTiming(timings gjson.Result) map[string]any {
+	if !timings.Exists() {
+		return nil
+	}
+	timingMap := map[string]any{
+		"prompt_n":             timings.Get("prompt_n").Int(),
+		"predicted_n":          timings.Get("predicted_n").Int(),
+		"prompt_per_second":    timings.Get("prompt_per_second").Float(),
+		"predicted_per_second": timings.Get("predicted_per_second").Float(),
+		"prompt_ms":            timings.Get("prompt_ms").Float(),
+		"predicted_ms":         timings.Get("predicted_ms").Float(),
+	}
+	if cacheN := timings.Get("cache_n"); cacheN.Exists() {
+		timingMap["cache_n"] = cacheN.Int()
+	}
+	return timingMap
+}
+
+func buildResponsesUsageFromTimingMap(timingMap map[string]any) map[string]any {
+	if len(timingMap) == 0 {
+		return nil
+	}
+	inputTokens, _ := timingMap["prompt_n"].(int64)
+	outputTokens, _ := timingMap["predicted_n"].(int64)
+	if inputTokens <= 0 && outputTokens <= 0 {
+		return nil
+	}
+	usageMap := map[string]any{
+		"input_tokens":  inputTokens,
+		"output_tokens": outputTokens,
+		"total_tokens":  inputTokens + outputTokens,
+	}
+	if cacheN, ok := timingMap["cache_n"].(int64); ok && cacheN > 0 {
+		usageMap["input_tokens_details"] = map[string]any{
+			"cached_tokens": cacheN,
+		}
+	}
+	return usageMap
 }
 
 func summarizeChatCompletionToolCalls(body []byte) string {
@@ -5631,8 +6230,8 @@ func summarizeApplyPatchBridgeForensics(body []byte) string {
 		fmt.Sprintf("reasoning_mentions_apply_patch=%t", strings.Contains(strings.ToLower(reasoning), "apply_patch")),
 	}
 
-	parsedTextCalls, _ := parseModelSpecificToolCalls(model, content)
-	parsedReasoningCalls, _ := parseModelSpecificToolCalls(model, reasoning)
+	parsedTextCalls, _ := proxyCompatibilityAdapters.ToolRepair.ParseAssistantOutput(model, content)
+	parsedReasoningCalls, _ := proxyCompatibilityAdapters.ToolRepair.ParseAssistantOutput(model, reasoning)
 	parts = append(parts, summarizeParsedToolCallForensics("parsed_text_calls", parsedTextCalls))
 	parts = append(parts, summarizeParsedToolCallForensics("parsed_reasoning_calls", parsedReasoningCalls))
 
@@ -5667,6 +6266,33 @@ func normalizeApplyPatchTypeHint(hint string) string {
 	default:
 		return ""
 	}
+}
+
+func enrichApplyPatchOperationWithHints(operation any, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string) any {
+	op, ok := normalizeApplyPatchOperation(operation).(map[string]any)
+	if !ok {
+		return operation
+	}
+	rewritten := cloneMap(op)
+	if strings.TrimSpace(cleanFallbackInput(rewritten["path"], "")) == "" {
+		if pathHint := strings.TrimSpace(normalizeApplyPatchPathForWorkspace(applyPatchPathHint)); pathHint != "" {
+			rewritten["path"] = pathHint
+		}
+	}
+	if normalizeApplyPatchTypeHint(cleanFallbackInput(rewritten["type"], "")) == "" {
+		if typeHint := normalizeApplyPatchTypeHint(applyPatchTypeHint); typeHint != "" {
+			rewritten["type"] = typeHint
+		}
+	}
+	opType := normalizeApplyPatchTypeHint(cleanFallbackInput(rewritten["type"], ""))
+	if (opType == "create_file" || opType == "update_file") &&
+		strings.TrimSpace(cleanFallbackInput(rewritten["content"], "")) == "" &&
+		strings.TrimSpace(cleanFallbackInput(rewritten["diff"], "")) == "" {
+		if contentHint := strings.TrimSpace(applyPatchContentHint); contentHint != "" {
+			rewritten["content"] = contentHint
+		}
+	}
+	return normalizeApplyPatchOperation(rewritten)
 }
 
 func extractLikelyFinalFileContentBlock(text string) string {
@@ -5747,6 +6373,114 @@ func preferContentDrivenApplyPatchOperation(operation any) any {
 }
 
 func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string) ([]byte, error) {
+	return translateChatCompletionToResponsesResponseWithWorkflow(body, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint, ToolWorkflowState{}, "")
+}
+
+func recoverNativeQuestionResponseIfRequired(responseBody []byte, upstreamBody []byte, requestBody []byte) []byte {
+	if !nativeQuestionOutputRequiredFromRequestBody(requestBody) || !gjson.ValidBytes(responseBody) || !gjson.ValidBytes(upstreamBody) {
+		return responseBody
+	}
+	if responseContainsNamedFunctionCall(responseBody, "request_user_input") {
+		return forceResponseStatus(responseBody, "requires_action")
+	}
+
+	message := gjson.GetBytes(upstreamBody, "choices.0.message")
+	if !message.Exists() {
+		return responseBody
+	}
+	contentText := strings.TrimSpace(message.Get("content").String())
+	reasoningText := strings.TrimSpace(message.Get("reasoning_content").String())
+	contentText, extractedReasoning := extractContentAndReasoning(contentText)
+	contentText = strings.TrimSpace(stripLeadingReasoningDirective(contentText))
+	if strings.TrimSpace(reasoningText) == "" {
+		reasoningText = strings.TrimSpace(extractedReasoning)
+	}
+
+	normalizedArtifacts, _ := normalizeQwenAssistantMessageFromBody(upstreamBody, false, true)
+	normalizedView := buildNormalizedArtifactView(normalizedArtifacts)
+	recoveredArgs := ""
+	if normalizedView.PreferredQuestion != nil {
+		parsedArgs, _ := normalizedView.PreferredQuestion.Payload["parsed_args"].(map[string]any)
+		if hasNonEmptyQuestionList(parsedArgs["questions"]) {
+			recoveredArgs = mustJSONString(parsedArgs)
+		}
+		rawArgs := strings.TrimSpace(cleanFallbackInput(normalizedView.PreferredQuestion.Payload["raw_args"], ""))
+		if strings.TrimSpace(recoveredArgs) == "" && rawArgs != "" {
+			recoveredArgs = rawArgs
+		}
+	}
+	if strings.TrimSpace(recoveredArgs) == "" {
+		if recovered, ok := recoverRequestUserInputArgumentsFromTextSources(reasoningText, contentText); ok {
+			recoveredArgs = recovered
+		}
+	}
+	if strings.TrimSpace(recoveredArgs) == "" {
+		var req map[string]any
+		if err := json.Unmarshal(requestBody, &req); err == nil {
+			if synthesized, ok := synthesizeRequestUserInputArgumentsFromRequest(req); ok {
+				recoveredArgs = synthesized
+			}
+		}
+	}
+	if strings.TrimSpace(recoveredArgs) == "" {
+		return responseBody
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(responseBody, &resp); err != nil {
+		return responseBody
+	}
+	respID := strings.TrimSpace(fmt.Sprintf("%v", resp["id"]))
+	if respID == "" {
+		respID = fmt.Sprintf("resp_%d", time.Now().UnixNano())
+		resp["id"] = respID
+	}
+
+	output := make([]any, 0, 2)
+	if normalizedView.PreferredThinking != nil {
+		text := strings.TrimSpace(cleanFallbackInput(normalizedView.PreferredThinking.Payload["text"], ""))
+		if text == "" {
+			goto doneReasoning
+		}
+		if wellFormed, _ := normalizedView.PreferredThinking.Payload["well_formed"].(bool); !wellFormed {
+			goto doneReasoning
+		}
+		output = append(output, map[string]any{
+			"id":   fmt.Sprintf("rs_%s_native_question", respID),
+			"type": "reasoning",
+			"summary": []any{
+				map[string]any{
+					"type": "summary_text",
+					"text": text,
+				},
+			},
+		})
+	}
+doneReasoning:
+	output = append(output, map[string]any{
+		"id":        fmt.Sprintf("fc_%s_native_question", respID),
+		"type":      "function_call",
+		"call_id":   fmt.Sprintf("call_%s_native_question", respID),
+		"name":      "request_user_input",
+		"arguments": normalizePossiblyMixedToolArguments(recoveredArgs),
+		"status":    "in_progress",
+	})
+	resp["output"] = output
+	resp["output_text"] = ""
+	resp["status"] = "requires_action"
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return responseBody
+	}
+	return out
+}
+
+func translateChatCompletionToResponsesResponseWithWorkflow(body []byte, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string, workflowState ToolWorkflowState, verificationShellArgs string) ([]byte, error) {
+	body = normalizeChatCompletionReasoningBoundary(body)
+	appendProxyStageTrace("translation.chat_to_responses.start", map[string]any{
+		"body_len":         len(body),
+		"apply_patch_hint": strings.TrimSpace(applyPatchPathHint) != "",
+	})
 	message := gjson.GetBytes(body, "choices.0.message")
 	if !message.Exists() || strings.TrimSpace(message.Raw) == "" || message.Type == gjson.Null {
 		return nil, fmt.Errorf("chat completion missing choices[0].message")
@@ -5757,8 +6491,10 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	}
 	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
-	text := message.Get("content").String()
-	reasoningText := message.Get("reasoning_content").String()
+	rawContent := message.Get("content").String()
+	rawReasoningText := message.Get("reasoning_content").String()
+	text := rawContent
+	reasoningText := rawReasoningText
 	text, extractedReasoning := extractContentAndReasoning(text)
 	text = stripLeadingReasoningDirective(text)
 	if strings.TrimSpace(reasoningText) == "" {
@@ -5791,7 +6527,26 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 			if len(unpacked) == 0 {
 				item["type"] = "function_call"
 				item["name"] = "multi_tool_use.parallel"
-				item["arguments"] = normalizePossiblyMixedToolArguments(arguments)
+				item["arguments"] = mustJSONString(parseToolArgsMapString(arguments))
+				result := validateBridgeToolCallItemResult(item)
+				if !result.Valid {
+					warning := result.Warning
+					output = append(output, map[string]any{
+						"id":   fmt.Sprintf("msg_%s_tool_validation_%d", id, index),
+						"type": "message",
+						"role": "assistant",
+						"content": []any{
+							map[string]any{
+								"type": "output_text",
+								"text": warning,
+							},
+						},
+					})
+					return
+				}
+				if result.NormalizedItem != nil {
+					item = result.NormalizedItem
+				}
 				output = append(output, item)
 				return
 			}
@@ -5803,21 +6558,18 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 			item["type"] = "apply_patch_call"
 			item["status"] = "in_progress"
 			args := parseToolArgsMapString(arguments)
+			args = repairApplyPatchArgsOperationPathWithHint(args, applyPatchPathHint)
 			operation := selectApplyPatchOperation(args)
-			if opMap, ok := operation.(map[string]any); ok && strings.TrimSpace(applyPatchPathHint) != "" {
-				opType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", opMap["type"])))
-				opPath := strings.TrimSpace(fmt.Sprintf("%v", opMap["path"]))
-				if (opType == "create_file" || opType == "update_file" || opType == "delete_file") &&
-					looksLikeAbsoluteWindowsOrUNCPath(opPath) {
-					opMap["path"] = normalizeApplyPatchPathForWorkspace(applyPatchPathHint)
-					operation = opMap
-				}
+			operation = enrichApplyPatchOperationWithHints(operation, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint)
+			if repaired, repairedOK := repairApplyPatchOperationPathWithHint(operation, applyPatchPathHint); repairedOK {
+				operation = repaired
 			}
 			if !applyPatchOperationPayloadValid(operation) {
 				if recovered, ok := recoverApplyPatchOperationFromArgs(args); ok && applyPatchOperationPayloadValid(recovered) {
 					operation = recovered
 				}
 			}
+			operation = enrichApplyPatchOperationWithHints(operation, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint)
 			if !applyPatchOperationPayloadValid(operation) && strings.TrimSpace(applyPatchPathHint) != "" {
 				fallbackType := normalizeApplyPatchTypeHint(applyPatchTypeHint)
 				if fallbackType == "" {
@@ -5839,8 +6591,15 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 				}
 			}
 			operation = normalizeApplyPatchOperation(operation)
+			if repaired, repairedOK := repairApplyPatchOperationPathWithHint(operation, applyPatchPathHint); repairedOK {
+				operation = repaired
+			}
 			operation = repairApplyPatchOperationFromReasoningBlock(operation, text, reasoningText)
+			if repaired, repairedOK := repairApplyPatchOperationPathWithHint(operation, applyPatchPathHint); repairedOK {
+				operation = repaired
+			}
 			operation = preferContentDrivenApplyPatchOperation(operation)
+			operation = normalizeApplyPatchOperation(operation)
 			if !hasNonEmptyApplyPatchOperation(operation) {
 				if extracted := extractApplyPatchFromFragmentedText(text); extracted != "" {
 					operation = map[string]any{"patch": extracted}
@@ -5904,7 +6663,9 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 				item["arguments"] = mustJSONString(cleanArgs)
 			}
 		}
-		if ok, warning := validateBridgeToolCallItem(item); !ok {
+		result := validateBridgeToolCallItemResult(item)
+		if !result.Valid {
+			warning := result.Warning
 			sanitized := false
 			switch strings.TrimSpace(fmt.Sprintf("%v", item["type"])) {
 			case "apply_patch_call":
@@ -5938,6 +6699,9 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 			})
 			return
 		}
+		if result.NormalizedItem != nil {
+			item = result.NormalizedItem
+		}
 		output = append(output, item)
 	}
 
@@ -5945,11 +6709,11 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 	functionCall := message.Get("function_call")
 	hasToolCalls := toolCalls.IsArray() && len(toolCalls.Array()) > 0
 	hasFunctionCall := functionCall.Exists() && strings.TrimSpace(functionCall.Get("name").String()) != ""
-	parsedToolCalls, cleanedText := parseModelSpecificToolCalls(model, text)
+	parsedToolCalls, cleanedText := proxyCompatibilityAdapters.ToolRepair.ParseAssistantOutput(model, text)
 	parsedReasoningToolCalls := []ParsedToolCall{}
 	cleanedReasoningText := ""
 	if len(parsedToolCalls) == 0 && strings.TrimSpace(reasoningText) != "" {
-		parsedReasoningToolCalls, cleanedReasoningText = parseModelSpecificToolCalls(model, reasoningText)
+		parsedReasoningToolCalls, cleanedReasoningText = proxyCompatibilityAdapters.ToolRepair.ParseAssistantOutput(model, reasoningText)
 		if len(parsedReasoningToolCalls) > 0 && !shouldAllowReasoningDerivedToolRecovery(reasoningText, parsedReasoningToolCalls) {
 			appendApplyPatchTrace("translate.reasoning_recovery_rejected", map[string]any{
 				"model":          model,
@@ -5970,14 +6734,33 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 		"text_len":               len(strings.TrimSpace(text)),
 		"reasoning_len":          len(strings.TrimSpace(reasoningText)),
 	})
+	appendProxyStageTrace("repair.chat_to_responses.tool_parse", map[string]any{
+		"model":                  model,
+		"native_tool_calls":      hasToolCalls,
+		"native_function_call":   hasFunctionCall,
+		"parsed_text_calls":      len(parsedToolCalls),
+		"parsed_reasoning_calls": len(parsedReasoningToolCalls),
+	})
 	if len(parsedToolCalls) > 0 {
+		text = cleanedText
+	}
+	if len(parsedToolCalls) == 0 && strings.TrimSpace(cleanedText) != strings.TrimSpace(text) {
 		text = cleanedText
 	}
 	if len(parsedReasoningToolCalls) > 0 {
 		reasoningText = cleanedReasoningText
 	}
+	if len(parsedReasoningToolCalls) == 0 && strings.TrimSpace(cleanedReasoningText) != strings.TrimSpace(reasoningText) {
+		reasoningText = cleanedReasoningText
+	}
 	text = strings.TrimSpace(stripLeadingReasoningDirective(text))
 	reasoningText = strings.TrimSpace(stripLeadingReasoningDirective(reasoningText))
+	if textLooksLikeEmptyToolArtifact(text) {
+		text = ""
+	}
+	if textLooksLikeEmptyToolArtifact(reasoningText) {
+		reasoningText = ""
+	}
 	// Completion-style outputs may include a valid patch block in plain text
 	// without emitting a native tool call. Synthesize an apply_patch tool call
 	// so the Responses API client can execute it.
@@ -6048,11 +6831,26 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 		appendApplyPatchTrace("translate.promote_reasoning_to_text", map[string]any{
 			"model": model,
 		})
-		text = buildReasoningCommentaryPreview(reasoningText)
+		text = proxyCompatibilityAdapters.Reasoning.BuildCommentaryPreview(reasoningText)
 		if strings.TrimSpace(text) == "" {
 			text = reasoningText
 		}
 		reasoningText = ""
+	}
+	if !hasToolCalls && !hasFunctionCall && len(parsedToolCalls) == 0 && len(parsedReasoningToolCalls) == 0 &&
+		shouldRecoverVerificationShellCall(workflowState, verificationShellArgs, text, reasoningText) {
+		parsedToolCalls = []ParsedToolCall{
+			{
+				Name:      "shell",
+				Arguments: parseToolArgsMapString(verificationShellArgs),
+			},
+		}
+		text = ""
+		reasoningText = ""
+	}
+	if !hasToolCalls && !hasFunctionCall && len(parsedToolCalls) == 0 && len(parsedReasoningToolCalls) == 0 &&
+		shouldRewriteWeakFinalWorkflowText(workflowState, text) {
+		text = buildWorkflowFinalExplanation(workflowState, text)
 	}
 
 	parsedByName := map[string][]ParsedToolCall{}
@@ -6170,31 +6968,38 @@ func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint 
 		"output":      output,
 		"output_text": stripLeadingReasoningDirective(text),
 	}
+	if len(output) == 0 &&
+		strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "choices.0.finish_reason").String()), "stop") &&
+		chatCompletionLooksLikeEmptyVisibleOutput(rawContent, rawReasoningText) {
+		fallback := emptyAssistantOutputFallbackText
+		resp["output"] = []any{
+			map[string]any{
+				"id":   fmt.Sprintf("msg_%s_empty_visible_output", id),
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{
+						"type": "output_text",
+						"text": fallback,
+					},
+				},
+			},
+		}
+		resp["output_text"] = fallback
+	}
 	if created := gjson.GetBytes(body, "created").Int(); created > 0 {
 		resp["created_at"] = created
 	}
-	if usage := gjson.GetBytes(body, "usage"); usage.Exists() {
-		usageMap := map[string]any{
-			"input_tokens":  usage.Get("prompt_tokens").Int(),
-			"output_tokens": usage.Get("completion_tokens").Int(),
-			"total_tokens":  usage.Get("total_tokens").Int(),
-		}
-		reasoningTokens := usage.Get("completion_tokens_details.reasoning_tokens").Int()
-		if reasoningTokens > 0 {
-			usageMap["output_tokens_details"] = map[string]any{
-				"reasoning_tokens": reasoningTokens,
-			}
-		}
-		cachedTokens := usage.Get("prompt_tokens_details.cached_tokens").Int()
-		if cachedTokens > 0 {
-			usageMap["input_tokens_details"] = map[string]any{
-				"cached_tokens": cachedTokens,
-			}
-		}
+	if usageMap := buildResponsesUsageFromChatUsage(gjson.GetBytes(body, "usage")); usageMap != nil {
 		resp["usage"] = usageMap
 	}
 	normalizeTranslatedResponsesOutput(resp)
 	appendApplyPatchTrace("translate.tool_response_summary", map[string]any{
+		"model":           model,
+		"output_items":    len(output),
+		"response_status": strings.TrimSpace(fmt.Sprintf("%v", resp["status"])),
+	})
+	appendProxyStageTrace("translation.chat_to_responses.done", map[string]any{
 		"model":           model,
 		"output_items":    len(output),
 		"response_status": strings.TrimSpace(fmt.Sprintf("%v", resp["status"])),
@@ -6225,6 +7030,7 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 
 	hasMessageText := false
 	hasToolCall := false
+	hasPendingToolCall := false
 	normalizedOutput := make([]any, 0, len(output))
 	for idx, raw := range output {
 		item, ok := raw.(map[string]any)
@@ -6316,6 +7122,9 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 				args = mustJSONString(normalizeShellArgumentMapForResponse(parsed))
 				item["arguments"] = args
 				hasToolCall = true
+				if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["status"])), "completed") {
+					hasPendingToolCall = true
+				}
 			case func() bool {
 				_, _, ok := parseMCPToolName(name)
 				return ok
@@ -6328,6 +7137,9 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 					item["status"] = "in_progress"
 				}
 				hasToolCall = true
+				if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["status"])), "completed") {
+					hasPendingToolCall = true
+				}
 			case strings.EqualFold(name, "apply_patch"), strings.EqualFold(name, llamaSwapApplyPatchFunctionName):
 				parsed := parseToolArgsMapString(args)
 				op := selectApplyPatchOperation(parsed)
@@ -6340,15 +7152,24 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 					item["bridgevalidationwarning"] = applyPatchValidationWarningPrefix + " operation was invalid; emitting sanitized apply_patch_call payload."
 					item["_bridge_validation_warning"] = item["bridgevalidationwarning"]
 					hasToolCall = true
+					if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["status"])), "completed") {
+						hasPendingToolCall = true
+					}
 					break
 				}
 				item["operation"] = op
 				delete(item, "name")
 				delete(item, "arguments")
 				hasToolCall = true
+				if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["status"])), "completed") {
+					hasPendingToolCall = true
+				}
 			default:
 				item["arguments"] = args
 				hasToolCall = true
+				if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["status"])), "completed") {
+					hasPendingToolCall = true
+				}
 			}
 		case "apply_patch_call":
 			op := normalizeApplyPatchOperation(item["operation"])
@@ -6360,6 +7181,9 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 				item["bridgevalidationwarning"] = applyPatchValidationWarningPrefix + " operation was invalid; emitting sanitized apply_patch_call payload."
 				item["_bridge_validation_warning"] = item["bridgevalidationwarning"]
 				hasToolCall = true
+				if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["status"])), "completed") {
+					hasPendingToolCall = true
+				}
 				break
 			}
 			hasToolCall = true
@@ -6372,6 +7196,9 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 			}
 			if strings.TrimSpace(fmt.Sprintf("%v", item["status"])) == "" {
 				item["status"] = "in_progress"
+			}
+			if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["status"])), "completed") {
+				hasPendingToolCall = true
 			}
 		case "mcp_tool_call":
 			hasToolCall = true
@@ -6394,6 +7221,9 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 			if cleanFallbackInput(item["status"], "") == "" {
 				item["status"] = "in_progress"
 			}
+			if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["status"])), "completed") {
+				hasPendingToolCall = true
+			}
 		case "shell_call", "web_search_call", "file_search_call", "code_interpreter_call", "image_generation_call", "computer_call":
 			hasToolCall = true
 			if strings.TrimSpace(fmt.Sprintf("%v", item["call_id"])) == "" {
@@ -6404,7 +7234,7 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 				item["type"] = "function_call"
 				item["name"] = "shell"
 				if actionMap, ok := item["action"].(map[string]any); ok {
-					item["arguments"] = mustJSONString(normalizeShellArgumentMap(actionMap))
+					item["arguments"] = mustJSONString(normalizeShellArgumentMapForResponse(actionMap))
 				} else {
 					item["arguments"] = mustJSONString(map[string]any{})
 				}
@@ -6412,11 +7242,19 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 				item["name"] = name
 				item["arguments"] = mustJSONString(item["action"])
 			}
+			if !strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["status"])), "completed") {
+				hasPendingToolCall = true
+			}
 		}
 		output[idx] = item
 		normalizedOutput = append(normalizedOutput, item)
 	}
 	resp["output"] = normalizedOutput
+	if hasPendingToolCall {
+		resp["status"] = "requires_action"
+	} else if hasToolCall {
+		resp["status"] = "completed"
+	}
 	if hasToolCall && !hasMessageText {
 		resp["output_text"] = ""
 		return
@@ -6428,7 +7266,7 @@ func normalizeTranslatedResponsesOutput(resp map[string]any) {
 	resp["output_text"] = strings.TrimSpace(stripLeadingReasoningDirective(fmt.Sprintf("%v", resp["output_text"])))
 }
 
-func enforceExactFinalReplyHint(responseBody []byte, hint string) []byte {
+func enforceExactFinalReplyHint(responseBody []byte, hint string, force bool) []byte {
 	hint = strings.TrimSpace(hint)
 	if hint == "" || !gjson.ValidBytes(responseBody) || responseContainsToolCall(responseBody) {
 		return responseBody
@@ -6460,7 +7298,7 @@ func enforceExactFinalReplyHint(responseBody []byte, hint string) []byte {
 			break
 		}
 	}
-	if !found {
+	if !found && !force {
 		return responseBody
 	}
 	respID := strings.TrimSpace(fmt.Sprintf("%v", resp["id"]))
@@ -6648,82 +7486,121 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 			},
 		}
 	}
-	isShellLikeToolItem := func(item map[string]any) bool {
-		itemType := strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
-		if strings.EqualFold(itemType, "shell_call") {
-			return true
-		}
-		if !strings.EqualFold(itemType, "function_call") {
-			return false
-		}
-		name := strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
-		return strings.EqualFold(name, "shell") || strings.EqualFold(name, "shell_command")
-	}
 	output := gjson.GetBytes(responseJSON, "output").Array()
 	normalizedOutput := make([]any, 0, len(output))
 	hasValidToolCall := false
+	streamAdapter := proxyCompatibilityAdapters.Stream
+	emitReasoningCommentary := true
+	toolProgressCommentary := ""
+	commentaryAlreadyPresent := false
 	for _, itemResult := range output {
 		item := map[string]any{}
 		if err := json.Unmarshal([]byte(itemResult.Raw), &item); err != nil {
 			continue
 		}
-		outputIndex := len(normalizedOutput)
-		// Final guardrail: never emit generic function_call for apply_patch in SSE output.
-		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["type"])), "function_call") &&
-			strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["name"])), "apply_patch") {
-			args := parseToolArgsMapString(fmt.Sprintf("%v", item["arguments"]))
-			op := normalizeApplyPatchOperation(selectApplyPatchOperation(args))
-			item["type"] = "apply_patch_call"
-			item["operation"] = op
-			if input := strings.TrimSpace(buildApplyPatchInputFromOperation(op)); input != "" {
-				item["input"] = input
-			}
-			delete(item, "name")
-			delete(item, "arguments")
+		item = streamAdapter.NormalizeResponseOutputItem(item)
+		itemType := strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
+		if itemType == "message" && strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["channel"])), "commentary") {
+			commentaryAlreadyPresent = true
 		}
-		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["type"])), "apply_patch_call") {
-			op := preferContentDrivenApplyPatchOperation(item["operation"])
-			input := strings.TrimSpace(buildApplyPatchInputFromOperation(op))
-			if input == "" {
-				input = strings.TrimSpace(cleanFallbackInput(item["input"], ""))
-			}
-			if input == "" {
-				input = strings.TrimSpace(buildApplyPatchInputFromOperation(op))
-			}
-			item["type"] = "custom_tool_call"
-			item["name"] = "apply_patch"
-			item["input"] = input
-			item["operation"] = op
-		}
-		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["type"])), "custom_tool_call") &&
-			strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["name"])), "apply_patch") {
-			op := preferContentDrivenApplyPatchOperation(item["operation"])
-			input := strings.TrimSpace(buildApplyPatchInputFromOperation(op))
-			if input == "" {
-				input = strings.TrimSpace(cleanFallbackInput(item["input"], ""))
-			}
-			item["operation"] = op
-			if input != "" {
-				item["input"] = input
+		if toolView, isToolItem := streamAdapter.BuildResponseToolItemView(item); isToolItem {
+			if ok, _ := validateBridgeToolCallItem(item); ok && strings.TrimSpace(toolView.ToolName) != "" {
+				emitReasoningCommentary = false
+				if toolProgressCommentary == "" {
+					toolProgressCommentary = replayToolProgressCommentary(toolView.ToolName)
+				}
+				break
 			}
 		}
-		if isShellLikeToolItem(item) {
-			if ok, warning := validateBridgeToolCallItem(item); !ok {
-				item = buildToolValidationMessageItem(outputIndex, warning)
+	}
+	emitCommentaryReplayItem := func(outputIndex int, commentaryText string) map[string]any {
+		commentaryItemID := fmt.Sprintf("msg_%s_%d", respID, outputIndex)
+		commentaryItem := map[string]any{
+			"id":      commentaryItemID,
+			"type":    "message",
+			"role":    "assistant",
+			"channel": "commentary",
+			"content": []any{
+				map[string]any{"type": "output_text", "text": commentaryText},
+			},
+		}
+		writeEvent("response.output_item.added", map[string]any{
+			"response_id":  respID,
+			"output_index": outputIndex,
+			"item": map[string]any{
+				"id":      commentaryItemID,
+				"type":    "message",
+				"role":    "assistant",
+				"channel": "commentary",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": ""},
+				},
+			},
+		})
+		writeEvent("response.content_part.added", map[string]any{
+			"response_id":   respID,
+			"item_id":       commentaryItemID,
+			"output_index":  outputIndex,
+			"content_index": 0,
+			"part":          map[string]any{"type": "output_text", "text": ""},
+		})
+		writeEvent("response.output_text.delta", map[string]any{
+			"response_id":   respID,
+			"item_id":       commentaryItemID,
+			"output_index":  outputIndex,
+			"content_index": 0,
+			"delta":         commentaryText,
+		})
+		writeEvent("response.output_text.done", map[string]any{
+			"response_id":   respID,
+			"item_id":       commentaryItemID,
+			"output_index":  outputIndex,
+			"content_index": 0,
+			"text":          commentaryText,
+		})
+		writeEvent("response.content_part.done", map[string]any{
+			"response_id":   respID,
+			"item_id":       commentaryItemID,
+			"output_index":  outputIndex,
+			"content_index": 0,
+			"part":          map[string]any{"type": "output_text", "text": commentaryText},
+		})
+		writeEvent("response.output_item.done", map[string]any{
+			"response_id":  respID,
+			"output_index": outputIndex,
+			"item":         commentaryItem,
+		})
+		return commentaryItem
+	}
+	for _, itemResult := range output {
+		item := map[string]any{}
+		if err := json.Unmarshal([]byte(itemResult.Raw), &item); err != nil {
+			continue
+		}
+		item = streamAdapter.NormalizeResponseOutputItem(item)
+		itemType := strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
+		toolView, isToolItem := streamAdapter.BuildResponseToolItemView(item)
+		if isToolItem {
+			result := validateBridgeToolCallItemResult(item)
+			if !result.Valid {
+				warning := result.Warning
+				item = buildToolValidationMessageItem(len(normalizedOutput), warning)
+				toolView = ResponseToolItemView{}
+				isToolItem = false
+			} else if result.NormalizedItem != nil {
+				item = result.NormalizedItem
+				itemType = strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
+				toolView, _ = streamAdapter.BuildResponseToolItemView(item)
 			}
 		}
 		addedItem := item
-		itemType := strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
-		if itemType == "function_call" ||
-			itemType == "shell_call" ||
-			itemType == "apply_patch_call" ||
-			itemType == "mcp_tool_call" ||
-			itemType == "custom_tool_call" ||
-			itemType == "web_search_call" ||
-			itemType == "file_search_call" ||
-			itemType == "code_interpreter_call" ||
-			itemType == "image_generation_call" ||
-			itemType == "computer_call" {
+		itemType = strings.TrimSpace(fmt.Sprintf("%v", item["type"]))
+		if isToolItem {
+			if !commentaryAlreadyPresent && strings.TrimSpace(toolProgressCommentary) != "" {
+				commentaryItem := emitCommentaryReplayItem(len(normalizedOutput), toolProgressCommentary)
+				normalizedOutput = append(normalizedOutput, commentaryItem)
+				commentaryAlreadyPresent = true
+			}
 			hasValidToolCall = true
 			if _, ok := addedItem["id"]; !ok {
 				addedItem = cloneMap(item)
@@ -6735,57 +7612,32 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 			}
 			addedItem["status"] = "in_progress"
 		}
+		outputIndex := len(normalizedOutput)
 		writeEvent("response.output_item.added", map[string]any{
 			"response_id":  respID,
 			"output_index": outputIndex,
 			"item":         addedItem,
 		})
-		if itemType == "function_call" ||
-			itemType == "shell_call" ||
-			itemType == "apply_patch_call" ||
-			itemType == "mcp_tool_call" ||
-			itemType == "custom_tool_call" ||
-			itemType == "web_search_call" ||
-			itemType == "file_search_call" ||
-			itemType == "code_interpreter_call" ||
-			itemType == "image_generation_call" ||
-			itemType == "computer_call" {
-			itemID := strings.TrimSpace(fmt.Sprintf("%v", item["id"]))
-			callID := strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))
-			name := strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
-			arguments := fmt.Sprintf("%v", item["arguments"])
-			if itemType != "function_call" {
-				name = strings.TrimSuffix(itemType, "_call")
-				switch itemType {
-				case "mcp_tool_call":
-					name = strings.TrimSpace(fmt.Sprintf("%v", item["tool"]))
-					arguments = mustJSONString(normalizeMapValue(item["arguments"]))
-				case "custom_tool_call":
-					name = strings.TrimSpace(fmt.Sprintf("%v", item["name"]))
-					arguments = strings.TrimSpace(cleanFallbackInput(item["input"], ""))
-					if arguments == "" {
-						op := normalizeApplyPatchOperation(item["operation"])
-						arguments = strings.TrimSpace(buildApplyPatchInputFromOperation(op))
-					}
-				default:
-					arguments = mustJSONString(item["action"])
+		if isToolItem {
+			for _, event := range streamAdapter.BuildResponseToolArgumentEvents(toolView, respID, outputIndex) {
+				switch event.Kind {
+				case StreamEventToolArgsDelta:
+					writeEvent("response.function_call_arguments.delta", map[string]any{
+						"response_id":  respID,
+						"item_id":      event.ItemID,
+						"output_index": event.OutputIndex,
+						"delta":        event.Payload["delta"],
+					})
+				case StreamEventToolArgsDone:
+					writeEvent("response.function_call_arguments.done", map[string]any{
+						"response_id":  respID,
+						"item_id":      event.ItemID,
+						"output_index": event.OutputIndex,
+						"name":         event.ToolName,
+						"call_id":      event.CallID,
+						"arguments":    event.Payload["arguments"],
+					})
 				}
-			}
-			if itemType != "custom_tool_call" && itemType != "mcp_tool_call" {
-				writeEvent("response.function_call_arguments.delta", map[string]any{
-					"response_id":  respID,
-					"item_id":      itemID,
-					"output_index": outputIndex,
-					"delta":        arguments,
-				})
-				writeEvent("response.function_call_arguments.done", map[string]any{
-					"response_id":  respID,
-					"item_id":      itemID,
-					"output_index": outputIndex,
-					"name":         name,
-					"call_id":      callID,
-					"arguments":    arguments,
-				})
 			}
 		}
 		if itemType == "message" {
@@ -6848,16 +7700,7 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 			}
 		}
 		doneItem := item
-		if itemType == "function_call" ||
-			itemType == "shell_call" ||
-			itemType == "apply_patch_call" ||
-			itemType == "mcp_tool_call" ||
-			itemType == "custom_tool_call" ||
-			itemType == "web_search_call" ||
-			itemType == "file_search_call" ||
-			itemType == "code_interpreter_call" ||
-			itemType == "image_generation_call" ||
-			itemType == "computer_call" {
+		if isToolItem {
 			if _, ok := doneItem["id"]; !ok {
 				doneItem = cloneMap(item)
 			}
@@ -6881,68 +7724,13 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 			"item":         doneItem,
 		})
 		normalizedOutput = append(normalizedOutput, doneItem)
-		if itemType == "reasoning" {
+		if itemType == "reasoning" && emitReasoningCommentary {
 			reasoningText := strings.TrimSpace(extractResponsesInputText(item["summary"]))
-			commentaryText := buildReasoningCommentaryPreview(reasoningText)
+			commentaryText := proxyCompatibilityAdapters.Reasoning.BuildCommentaryPreview(reasoningText)
 			if commentaryText != "" {
-				commentaryOutputIndex := len(normalizedOutput)
-				commentaryItemID := fmt.Sprintf("msg_%s_%d", respID, commentaryOutputIndex)
-				commentaryItem := map[string]any{
-					"id":      commentaryItemID,
-					"type":    "message",
-					"role":    "assistant",
-					"channel": "commentary",
-					"content": []any{
-						map[string]any{"type": "output_text", "text": commentaryText},
-					},
-				}
-				writeEvent("response.output_item.added", map[string]any{
-					"response_id":  respID,
-					"output_index": commentaryOutputIndex,
-					"item": map[string]any{
-						"id":      commentaryItemID,
-						"type":    "message",
-						"role":    "assistant",
-						"channel": "commentary",
-						"content": []any{
-							map[string]any{"type": "output_text", "text": ""},
-						},
-					},
-				})
-				writeEvent("response.content_part.added", map[string]any{
-					"response_id":   respID,
-					"item_id":       commentaryItemID,
-					"output_index":  commentaryOutputIndex,
-					"content_index": 0,
-					"part":          map[string]any{"type": "output_text", "text": ""},
-				})
-				writeEvent("response.output_text.delta", map[string]any{
-					"response_id":   respID,
-					"item_id":       commentaryItemID,
-					"output_index":  commentaryOutputIndex,
-					"content_index": 0,
-					"delta":         commentaryText,
-				})
-				writeEvent("response.output_text.done", map[string]any{
-					"response_id":   respID,
-					"item_id":       commentaryItemID,
-					"output_index":  commentaryOutputIndex,
-					"content_index": 0,
-					"text":          commentaryText,
-				})
-				writeEvent("response.content_part.done", map[string]any{
-					"response_id":   respID,
-					"item_id":       commentaryItemID,
-					"output_index":  commentaryOutputIndex,
-					"content_index": 0,
-					"part":          map[string]any{"type": "output_text", "text": commentaryText},
-				})
-				writeEvent("response.output_item.done", map[string]any{
-					"response_id":  respID,
-					"output_index": commentaryOutputIndex,
-					"item":         commentaryItem,
-				})
+				commentaryItem := emitCommentaryReplayItem(len(normalizedOutput), commentaryText)
 				normalizedOutput = append(normalizedOutput, commentaryItem)
+				commentaryAlreadyPresent = true
 			}
 		}
 	}
@@ -6956,7 +7744,11 @@ func writeResponsesStream(w http.ResponseWriter, responseJSON []byte, requestedR
 
 	// Always finish the SSE stream with a `response.completed` event. If a tool
 	// continuation is required, `response.status` will be `requires_action`.
-	writeEvent("response.completed", map[string]any{"response": full})
+	if event, ok := streamAdapter.BuildResponseCompletedEvent(full); ok {
+		writeCanonicalResponseStreamEvent(writeEvent, event)
+	} else {
+		writeEvent("response.completed", map[string]any{"response": full})
+	}
 	_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	flusher.Flush()
 }
@@ -7011,6 +7803,87 @@ func requestIncludesApplyPatchTool(req map[string]any) bool {
 	return false
 }
 
+func canonicalStreamEventTypeName(kind StreamEventKind) string {
+	switch kind {
+	case StreamEventToolItemAdded:
+		return "response.output_item.added"
+	case StreamEventToolArgsDelta:
+		return "response.function_call_arguments.delta"
+	case StreamEventToolArgsDone:
+		return "response.function_call_arguments.done"
+	case StreamEventToolOutputReturned:
+		return "response.output_item.done"
+	case StreamEventResponseCompleted:
+		return "response.completed"
+	default:
+		return ""
+	}
+}
+
+func writeCanonicalResponseStreamEvent(writeEvent func(string, map[string]any), event StreamEvent) {
+	eventType := canonicalStreamEventTypeName(event.Kind)
+	if eventType == "" {
+		return
+	}
+	payload := map[string]any{}
+	if event.Kind != StreamEventResponseCompleted && event.ResponseID != "" {
+		payload["response_id"] = event.ResponseID
+	}
+	if event.ItemID != "" {
+		payload["item_id"] = event.ItemID
+	}
+	if event.OutputIndex >= 0 {
+		payload["output_index"] = event.OutputIndex
+	}
+	if event.ToolName != "" && event.Kind == StreamEventToolArgsDone {
+		payload["name"] = event.ToolName
+	}
+	if event.CallID != "" && event.Kind == StreamEventToolArgsDone {
+		payload["call_id"] = event.CallID
+	}
+	for k, v := range event.Payload {
+		payload[k] = v
+	}
+	writeEvent(eventType, payload)
+}
+
+func toolDefinitionTargetsNormalizedName(tool map[string]any, want string) bool {
+	if tool == nil {
+		return false
+	}
+	want = normalizeToolTierName(want)
+	if want == "" {
+		return false
+	}
+	if normalizeToolTierName(strings.TrimSpace(fmt.Sprintf("%v", tool["type"]))) == want {
+		return true
+	}
+	if normalizeToolTierName(extractFunctionToolName(tool)) == want {
+		return true
+	}
+	return false
+}
+
+func toolChoiceTargetsNormalizedName(raw any, want string) bool {
+	want = normalizeToolTierName(want)
+	if want == "" {
+		return false
+	}
+	normalized := normalizeBridgeToolChoice(raw)
+	switch typed := normalized.(type) {
+	case string:
+		return normalizeToolTierName(strings.TrimSpace(typed)) == want
+	case map[string]any:
+		if normalizeToolTierName(strings.TrimSpace(fmt.Sprintf("%v", typed["type"]))) == want {
+			return true
+		}
+		if fn, ok := typed["function"].(map[string]any); ok {
+			return normalizeToolTierName(strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))) == want
+		}
+	}
+	return false
+}
+
 func requestHasOnlyApplyPatchTools(req map[string]any) bool {
 	if req == nil {
 		return false
@@ -7025,17 +7898,7 @@ func requestHasOnlyApplyPatchTools(req map[string]any) bool {
 		if !ok {
 			return false
 		}
-		toolType := strings.TrimSpace(fmt.Sprintf("%v", tool["type"]))
-		name := strings.TrimSpace(fmt.Sprintf("%v", tool["name"]))
-		if name == "" {
-			if fn, ok := tool["function"].(map[string]any); ok {
-				name = strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
-			}
-		}
-		isApplyPatch := strings.EqualFold(toolType, "apply_patch") ||
-			strings.EqualFold(name, "apply_patch") ||
-			strings.EqualFold(name, llamaSwapApplyPatchFunctionName)
-		if !isApplyPatch {
+		if !toolDefinitionTargetsNormalizedName(tool, "apply_patch") {
 			return false
 		}
 		sawApplyPatch = true
@@ -7051,29 +7914,14 @@ func requestHasExplicitApplyPatchToolChoice(req map[string]any) bool {
 	if !ok || raw == nil {
 		return false
 	}
-	normalized := normalizeBridgeToolChoice(raw)
-	switch typed := normalized.(type) {
-	case string:
-		return strings.EqualFold(strings.TrimSpace(typed), "apply_patch")
-	case map[string]any:
-		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", typed["type"])), "apply_patch") {
-			return true
-		}
-		if fn, ok := typed["function"].(map[string]any); ok {
-			name := strings.TrimSpace(fmt.Sprintf("%v", fn["name"]))
-			if strings.EqualFold(name, "apply_patch") || strings.EqualFold(name, llamaSwapApplyPatchFunctionName) {
-				return true
-			}
-		}
-	}
-	return false
+	return toolChoiceTargetsNormalizedName(raw, "apply_patch")
 }
 
 func shouldEnableStrictApplyPatchIntent(req map[string]any, requestBody []byte) bool {
 	if req == nil {
 		return false
 	}
-	if requestLooksLikePlanMode(req) {
+	if responsesRequestContractMode(req) == "plan" || requestExplicitlyWantsReturnedPlan(req) || requestExplicitlyWantsNoMutationPlan(req) {
 		return false
 	}
 	// Post-tool continuation turns should not be forced back into initial
@@ -7111,7 +7959,7 @@ func requestExplicitlyWantsNativeCodexQuestion(req map[string]any) bool {
 		return false
 	}
 	lowerText := strings.ToLower(strings.TrimSpace(
-		extractTrustedResponsesInstructionText(req) + "\n" + extractResponsesUserInputText(req),
+		extractResponsesNativeQuestionIntentText(req),
 	))
 	if lowerText == "" {
 		return false
@@ -7122,11 +7970,29 @@ func requestExplicitlyWantsNativeCodexQuestion(req map[string]any) bool {
 	wantsQuestion := strings.Contains(lowerText, "ask exactly one short clarifying question") ||
 		strings.Contains(lowerText, "ask one short clarifying question") ||
 		strings.Contains(lowerText, "ask a short clarifying question") ||
-		strings.Contains(lowerText, "ask exactly one short question")
+		strings.Contains(lowerText, "ask exactly one short question") ||
+		strings.Contains(lowerText, "ask exactly one native codex question") ||
+		strings.Contains(lowerText, "ask me exactly one native codex question") ||
+		strings.Contains(lowerText, "ask one native codex question") ||
+		strings.Contains(lowerText, "ask the user how they would like") ||
+		strings.Contains(lowerText, "ask how they would like") ||
+		strings.Contains(lowerText, "ask how the user would like") ||
+		strings.Contains(lowerText, "ask which approach they prefer") ||
+		strings.Contains(lowerText, "ask which option they prefer") ||
+		strings.Contains(lowerText, "ask which build approach they prefer")
 	wantsNativeFormat := strings.Contains(lowerText, "native codex question format") ||
+		strings.Contains(lowerText, "native codex question") ||
 		strings.Contains(lowerText, "request_user_input") ||
-		strings.Contains(lowerText, "codex question dialog")
+		strings.Contains(lowerText, "codex question dialog") ||
+		strings.Contains(lowerText, "native question")
 	return wantsQuestion && wantsNativeFormat
+}
+
+func extractResponsesNativeQuestionIntentText(req map[string]any) string {
+	if req == nil {
+		return ""
+	}
+	return strings.TrimSpace(extractResponsesUserInputText(req))
 }
 
 func requestExplicitlyWantsReturnedPlan(req map[string]any) bool {
@@ -7146,77 +8012,455 @@ func requestExplicitlyWantsReturnedPlan(req map[string]any) bool {
 	if !hasPlanIntent {
 		return false
 	}
-	hasImplementIntent := strings.Contains(lowerText, "please implement this plan") ||
-		strings.Contains(lowerText, "implement this plan") ||
-		strings.Contains(lowerText, "start implementing") ||
-		strings.Contains(lowerText, "using apply_patch") ||
-		strings.Contains(lowerText, "do not use shell for writing")
-	return !hasImplementIntent
+	return !requestExplicitlyWantsImplementationRetry(req, ToolWorkflowState{})
 }
 
-func requestHasCompletedToolOutputForName(req map[string]any, toolName string) bool {
+func requestHistoryContainsApplyPatchValidationFeedback(req map[string]any) bool {
 	if req == nil {
-		return false
-	}
-	toolName = strings.TrimSpace(strings.ToLower(toolName))
-	if toolName == "" {
 		return false
 	}
 	items, ok := req["input"].([]any)
 	if !ok || len(items) == 0 {
 		return false
 	}
-	callNamesByID := map[string]string{}
-	completedIDs := map[string]bool{}
 	for _, rawItem := range items {
 		item, ok := rawItem.(map[string]any)
 		if !ok {
 			continue
 		}
-		itemType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["type"])))
-		callID := strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))
-		switch itemType {
-		case "function_call":
-			name := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["name"])))
-			if callID != "" && name != "" {
-				callNamesByID[callID] = name
-			}
-		case "function_call_output":
-			if callID != "" {
-				completedIDs[callID] = true
+		if strings.TrimSpace(fmt.Sprintf("%v", item["type"])) != "message" {
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprintf("%v", item["role"])) != "assistant" {
+			continue
+		}
+		for _, text := range extractMessageTextParts(item["content"]) {
+			lower := strings.ToLower(strings.TrimSpace(text))
+			if strings.Contains(lower, strings.ToLower(applyPatchValidationWarningPrefix)) ||
+				strings.Contains(lower, "apply_patch call was not executed because") {
+				return true
 			}
 		}
 	}
-	for callID, name := range callNamesByID {
-		if name == toolName && completedIDs[callID] {
+	return false
+}
+
+func requestExplicitlyWantsImplementationRetry(req map[string]any, workflowState ToolWorkflowState) bool {
+	if req == nil {
+		return false
+	}
+	lowerText := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if lowerText == "" {
+		return false
+	}
+	if strings.Contains(lowerText, "please implement this plan") ||
+		strings.Contains(lowerText, "implement this plan") ||
+		strings.Contains(lowerText, "start implementing") ||
+		strings.Contains(lowerText, "using apply_patch") ||
+		strings.Contains(lowerText, "do not use shell for writing") ||
+		strings.Contains(lowerText, "create the complete quiz file") ||
+		strings.Contains(lowerText, "build this out") {
+		return true
+	}
+	if !(strings.Contains(lowerText, "try again") ||
+		strings.Contains(lowerText, "retry") ||
+		strings.Contains(lowerText, "fix it") ||
+		strings.Contains(lowerText, "try the patch again")) {
+		return false
+	}
+	if requestInputMentionsApplyPatch(req) ||
+		completedToolNamesContain(workflowState.CompletedToolNames, "apply_patch") ||
+		requestHistoryContainsApplyPatchValidationFeedback(req) {
+		return true
+	}
+	return false
+}
+
+func searchToolNameMatches(name string) bool {
+	lowerName := strings.ToLower(strings.TrimSpace(name))
+	switch lowerName {
+	case "web_search", "web_search_preview", "__llamaswap_web_search_preview", "websearch":
+		return true
+	default:
+		return false
+	}
+}
+
+func requestTextLooksLikeRetry(lowerText string) bool {
+	return strings.Contains(lowerText, "try again") ||
+		strings.Contains(lowerText, "retry") ||
+		strings.Contains(lowerText, "fix it") ||
+		strings.Contains(lowerText, "do it again")
+}
+
+func textLooksLikeSearchArtifact(text string) bool {
+	lowerText := strings.ToLower(strings.TrimSpace(text))
+	if lowerText == "" {
+		return false
+	}
+	return strings.Contains(lowerText, "<websearch") ||
+		strings.Contains(lowerText, "<web_search") ||
+		strings.Contains(lowerText, "print(websearch") ||
+		strings.Contains(lowerText, "print(web_search") ||
+		strings.Contains(lowerText, "websearch(") ||
+		strings.Contains(lowerText, "web_search(") ||
+		strings.Contains(lowerText, "search the web") ||
+		strings.Contains(lowerText, "web research") ||
+		(strings.Contains(lowerText, "site:") && strings.Contains(lowerText, "reddit"))
+}
+
+func textLooksLikeEmptyToolArtifact(text string) bool {
+	compact := strings.ToLower(strings.TrimSpace(text))
+	if compact == "" {
+		return false
+	}
+	compact = strings.NewReplacer("\n", "", "\r", "", "\t", "", " ", "").Replace(compact)
+	switch compact {
+	case "<tool_code></tool_code>", "<tool_call></tool_call>", "<tool_use></tool_use>":
+		return true
+	default:
+		return false
+	}
+}
+
+func textLooksLikeWeakProgressPlaceholder(text string) bool {
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "", "working on the request.", "working on the request", "continuing from the latest tool results.", "continuing from the latest tool results", "running tool...", "running tool…":
+		return true
+	default:
+		return false
+	}
+}
+
+func textIndicatesSearchIntent(text string) bool {
+	lowerText := strings.ToLower(strings.TrimSpace(text))
+	if lowerText == "" {
+		return false
+	}
+	hasSearchVerb := strings.Contains(lowerText, "search") ||
+		strings.Contains(lowerText, "research") ||
+		strings.Contains(lowerText, "investigate") ||
+		strings.Contains(lowerText, "explore") ||
+		strings.Contains(lowerText, "browse") ||
+		strings.Contains(lowerText, "look up") ||
+		strings.Contains(lowerText, "find ")
+	hasSearchTarget := strings.Contains(lowerText, "web") ||
+		strings.Contains(lowerText, "browser") ||
+		strings.Contains(lowerText, "reddit") ||
+		strings.Contains(lowerText, "site:") ||
+		strings.Contains(lowerText, "current") ||
+		strings.Contains(lowerText, "latest")
+	return textLooksLikeSearchArtifact(lowerText) ||
+		strings.Contains(lowerText, "search the web") ||
+		strings.Contains(lowerText, "research the web") ||
+		strings.Contains(lowerText, "investigate the web") ||
+		strings.Contains(lowerText, "explore the web") ||
+		strings.Contains(lowerText, "browse the web") ||
+		strings.Contains(lowerText, "web research") ||
+		strings.Contains(lowerText, "do research before") ||
+		strings.Contains(lowerText, "research before") ||
+		(hasSearchVerb && hasSearchTarget)
+}
+
+func requestHistoryContainsSearchArtifacts(req map[string]any, workflowState ToolWorkflowState) bool {
+	if completedToolNamesContain(workflowState.CompletedToolNames, "web_search") ||
+		completedToolNamesContain(workflowState.CompletedToolNames, "web_search_preview") ||
+		completedToolNamesContain(workflowState.CompletedToolNames, "__llamaswap_web_search_preview") ||
+		completedToolNamesContain(workflowState.CompletedToolNames, "websearch") {
+		return true
+	}
+	if req == nil {
+		return false
+	}
+	items, ok := req["input"].([]any)
+	if !ok || len(items) == 0 {
+		return false
+	}
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		if searchToolNameMatches(strings.TrimSpace(fmt.Sprintf("%v", item["name"]))) {
+			return true
+		}
+		switch strings.TrimSpace(fmt.Sprintf("%v", item["type"])) {
+		case "message":
+			role := strings.TrimSpace(fmt.Sprintf("%v", item["role"]))
+			if role != "assistant" && role != "user" && role != "tool" {
+				continue
+			}
+			for _, text := range extractMessageTextParts(item["content"]) {
+				if textLooksLikeSearchArtifact(text) {
+					return true
+				}
+			}
+		case "function_call_output":
+			if textLooksLikeSearchArtifact(fmt.Sprintf("%v", item["output"])) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func requestHistoryContainsResearchArtifacts(req map[string]any, workflowState ToolWorkflowState) bool {
+	if requestHistoryContainsSearchArtifacts(req, workflowState) {
+		return true
+	}
+	for _, name := range workflowState.CompletedToolNames {
+		normalized := normalizeToolTierName(name)
+		if strings.HasPrefix(normalized, "browser_") {
 			return true
 		}
 	}
 	return false
 }
 
-func extractCompletedToolNamesFromRequest(req map[string]any) []string {
+func requestExplicitlyWantsExplorationFollowup(req map[string]any, workflowState ToolWorkflowState) bool {
 	if req == nil {
-		return nil
+		return false
+	}
+	if !(completedToolNamesContain(workflowState.CompletedToolNames, "request_user_input") || workflowState.HasToolOutput) {
+		return false
+	}
+	return requestExplicitlyWantsSearchIntent(req, workflowState)
+}
+
+func requestExplicitlyWantsSearchIntent(req map[string]any, workflowState ToolWorkflowState) bool {
+	if req == nil {
+		return false
+	}
+	if requestHasBoolFlag(req, "llamaswap_force_search_intent") {
+		return true
+	}
+	lowerText := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if lowerText == "" {
+		return false
+	}
+	hasAnsweredRequestUserInput := completedToolNamesContain(workflowState.CompletedToolNames, "request_user_input")
+	hasResearchHistory := requestHistoryContainsResearchArtifacts(req, workflowState)
+	if requestTextLooksLikeRetry(lowerText) && hasResearchHistory {
+		return true
+	}
+	if isCodexManagedPlanModeFromResponsesRequest(req) &&
+		hasAnsweredRequestUserInput &&
+		hasResearchHistory {
+		return false
+	}
+	if textIndicatesSearchIntent(lowerText) {
+		return true
+	}
+	hasSearchVerb := strings.Contains(lowerText, "search") ||
+		strings.Contains(lowerText, "research") ||
+		strings.Contains(lowerText, "look up") ||
+		strings.Contains(lowerText, "find ")
+	hasSearchTarget := strings.Contains(lowerText, "web") ||
+		strings.Contains(lowerText, "browser") ||
+		strings.Contains(lowerText, "reddit") ||
+		strings.Contains(lowerText, "site:") ||
+		strings.Contains(lowerText, "current") ||
+		strings.Contains(lowerText, "latest") ||
+		strings.Contains(lowerText, "external") ||
+		strings.Contains(lowerText, "news")
+	if strings.Contains(lowerText, "do a web_search") ||
+		strings.Contains(lowerText, "web_search") ||
+		strings.Contains(lowerText, "web search") ||
+		strings.Contains(lowerText, "web research") ||
+		strings.Contains(lowerText, "research the web") ||
+		strings.Contains(lowerText, "do research before") ||
+		strings.Contains(lowerText, "research before") ||
+		strings.Contains(lowerText, "search the web") ||
+		strings.Contains(lowerText, "look it up") ||
+		strings.Contains(lowerText, "use the browser") ||
+		strings.Contains(lowerText, "open it in the browser") ||
+		strings.Contains(lowerText, "browser search") ||
+		(hasSearchVerb && hasSearchTarget) {
+		return true
+	}
+	return false
+}
+
+func requestStillWantsStructuredPlan(req map[string]any, workflowState ToolWorkflowState) bool {
+	if req == nil {
+		return false
+	}
+	if requestExplicitlyWantsImplementationRetry(req, workflowState) {
+		return false
+	}
+	if requestExplicitlyWantsSearchIntent(req, workflowState) {
+		return false
+	}
+	if requestExplicitlyWantsExplorationFollowup(req, workflowState) {
+		return false
+	}
+	if requestExplicitlyWantsReturnedPlan(req) {
+		return true
+	}
+	if !completedToolNamesContain(workflowState.CompletedToolNames, "request_user_input") {
+		return false
+	}
+	if isCodexManagedPlanModeFromResponsesRequest(req) {
+		return true
+	}
+	lowerText := strings.ToLower(strings.TrimSpace(
+		extractTrustedResponsesInstructionText(req) + "\n" + extractResponsesUserInputText(req),
+	))
+	if lowerText == "" {
+		return false
+	}
+	return strings.Contains(lowerText, "<proposed_plan>") ||
+		strings.Contains(lowerText, "write a plan") ||
+		strings.Contains(lowerText, "return a plan") ||
+		strings.Contains(lowerText, "finalize the plan") ||
+		strings.Contains(lowerText, "plan directly as assistant text")
+}
+
+func structuredPlanOutputRequiredFromRequestBody(body []byte) bool {
+	if !gjson.ValidBytes(body) {
+		return rawResponsesBodyLooksLikePlanMode(body)
+	}
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return rawResponsesBodyLooksLikePlanMode(body)
+	}
+	if responsesRequestContractMode(req) == "plan" {
+		return true
+	}
+	return requestStillWantsStructuredPlan(req, buildToolWorkflowState(req))
+}
+
+func nativeQuestionOutputRequiredFromRequestBody(body []byte) bool {
+	if !gjson.ValidBytes(body) {
+		return false
+	}
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return false
+	}
+	return requestExplicitlyWantsNativeCodexQuestion(req)
+}
+
+func synthesizeRequestUserInputArgumentsFromRequest(req map[string]any) (string, bool) {
+	if req == nil || !requestExplicitlyWantsNativeCodexQuestion(req) {
+		return "", false
+	}
+	fullText := strings.TrimSpace(
+		extractResponsesNativeQuestionIntentText(req),
+	)
+	lowerText := strings.ToLower(fullText)
+	if lowerText == "" {
+		return "", false
+	}
+	if strings.Contains(lowerText, "ask me exactly one native codex question before planning anything else") ||
+		strings.Contains(lowerText, "ask exactly one native codex question before planning anything else") {
+		marker := ""
+		if match := regexp.MustCompile(`\bT[0-9]+_SENTINEL\b`).FindString(fullText); strings.TrimSpace(match) != "" {
+			marker = strings.TrimSpace(match)
+		}
+		question := "What is the current mission objective?"
+		if marker != "" {
+			question = marker + ": " + question
+		}
+		return mustJSONString(map[string]any{"questions": []string{question}}), true
+	}
+	switch {
+	case strings.Contains(lowerText, "how they would like this built") ||
+		strings.Contains(lowerText, "how you would like this built") ||
+		strings.Contains(lowerText, "how the user would like this built") ||
+		strings.Contains(lowerText, "which build approach they prefer"):
+		return `{"questions":["How would you like this built, and which approach do you prefer?"]}`, true
+	case strings.Contains(lowerText, "which approach they prefer") ||
+		strings.Contains(lowerText, "which option they prefer"):
+		return `{"questions":["Which approach do you prefer?"]}`, true
+	}
+	return "", false
+}
+
+func streamedRequestUserInputArgumentsFallback(reasoningText string, text string, req map[string]any) (string, bool) {
+	if recovered, ok := proxyCompatibilityAdapters.ToolRepair.RecoverRequestUserInputArguments(reasoningText, text); ok {
+		return recovered, true
+	}
+	return synthesizeRequestUserInputArgumentsFromRequest(req)
+}
+
+func requestExplicitlyWantsNoMutationPlan(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	lowerText := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if lowerText == "" {
+		return false
+	}
+	hasPlanIntent := strings.Contains(lowerText, "stay in plan mode") ||
+		strings.Contains(lowerText, "plan mode") ||
+		strings.Contains(lowerText, "hypothetical patch") ||
+		strings.Contains(lowerText, "do not edit anything") ||
+		strings.Contains(lowerText, "do not mutate") ||
+		strings.Contains(lowerText, "do not execute")
+	if !hasPlanIntent {
+		return false
+	}
+	hasNoMutationConstraint := strings.Contains(lowerText, "do not edit") ||
+		strings.Contains(lowerText, "do not mutate") ||
+		strings.Contains(lowerText, "do not execute") ||
+		strings.Contains(lowerText, "not executing")
+	return hasNoMutationConstraint
+}
+
+func buildToolWorkflowState(req map[string]any) ToolWorkflowState {
+	state := ToolWorkflowState{}
+	if req == nil {
+		return state
 	}
 	items, ok := req["input"].([]any)
 	if !ok || len(items) == 0 {
-		return nil
+		return state
 	}
+
 	callNamesByID := map[string]string{}
-	completedOrdered := make([]string, 0, 4)
-	completedSet := map[string]struct{}{}
-	appendCompleted := func(name string) {
+	callFingerprintsByID := map[string]string{}
+	pendingByID := map[string]string{}
+	completedSequence := make([]string, 0, 4)
+	appendCompleted := func(name string, fingerprint string) {
 		name = normalizeToolTierName(name)
 		if name == "" {
 			return
 		}
-		if _, exists := completedSet[name]; exists {
+		state.HasToolOutput = true
+		completedSequence = append(completedSequence, name)
+		state.PreviousCompletedToolFingerprint = state.LatestCompletedToolFingerprint
+		state.LatestCompletedToolName = name
+		state.LatestCompletedToolFingerprint = fingerprint
+		state.RepeatedLatestToolFingerprint = strings.TrimSpace(fingerprint) != "" &&
+			strings.TrimSpace(fingerprint) == strings.TrimSpace(state.PreviousCompletedToolFingerprint)
+	}
+	appendPendingCall := func(callID string, name string, fingerprint string) {
+		callID = strings.TrimSpace(callID)
+		name = normalizeToolTierName(name)
+		if callID == "" || name == "" {
 			return
 		}
-		completedSet[name] = struct{}{}
-		completedOrdered = append(completedOrdered, name)
+		callNamesByID[callID] = name
+		callFingerprintsByID[callID] = strings.TrimSpace(fingerprint)
+		pendingByID[callID] = name
 	}
+	markCompletedCall := func(callID string) {
+		callID = strings.TrimSpace(callID)
+		if callID == "" {
+			return
+		}
+		fingerprint := strings.TrimSpace(callFingerprintsByID[callID])
+		if name := normalizeToolTierName(pendingByID[callID]); name != "" {
+			delete(pendingByID, callID)
+			appendCompleted(name, fingerprint)
+			return
+		}
+		if name := normalizeToolTierName(callNamesByID[callID]); name != "" {
+			appendCompleted(name, fingerprint)
+		}
+	}
+
 	for _, rawItem := range items {
 		item, ok := rawItem.(map[string]any)
 		if !ok {
@@ -7226,29 +8470,215 @@ func extractCompletedToolNamesFromRequest(req map[string]any) []string {
 		callID := strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))
 		switch itemType {
 		case "function_call", "custom_tool_call":
-			name := normalizeToolTierName(strings.TrimSpace(fmt.Sprintf("%v", item["name"])))
-			if callID != "" && name != "" {
-				callNamesByID[callID] = name
-			}
+			appendPendingCall(callID, fmt.Sprintf("%v", item["name"]), buildToolCallFingerprint(fmt.Sprintf("%v", item["name"]), item["arguments"]))
 		case "apply_patch_call":
-			if callID != "" {
-				callNamesByID[callID] = "apply_patch"
-			}
+			appendPendingCall(callID, "apply_patch", buildToolCallFingerprint("apply_patch", item["operation"]))
 		case "shell_call":
-			if callID != "" {
-				callNamesByID[callID] = "shell"
-			}
+			appendPendingCall(callID, "shell", buildToolCallFingerprint("shell", item["action"]))
 		case "function_call_output", "custom_tool_call_output":
-			if callID != "" {
-				appendCompleted(callNamesByID[callID])
-			}
+			state.HasToolOutput = true
+			markCompletedCall(callID)
 		case "apply_patch_call_output":
-			appendCompleted("apply_patch")
+			state.HasToolOutput = true
+			if callID != "" {
+				markCompletedCall(callID)
+			} else {
+				appendCompleted("apply_patch", buildToolCallFingerprint("apply_patch", item["output"]))
+			}
 		case "shell_call_output":
-			appendCompleted("shell")
+			state.HasToolOutput = true
+			if callID != "" {
+				markCompletedCall(callID)
+			} else {
+				appendCompleted("shell", buildToolCallFingerprint("shell", item["output"]))
+			}
 		}
 	}
-	return completedOrdered
+
+	state.CompletedToolNames = completedSequence
+	if len(pendingByID) > 0 {
+		state.PendingToolNames = make([]string, 0, len(pendingByID))
+		for _, name := range pendingByID {
+			if normalized := normalizeToolTierName(name); normalized != "" {
+				state.PendingToolNames = append(state.PendingToolNames, normalized)
+			}
+		}
+		sort.Strings(state.PendingToolNames)
+	}
+
+	state.VerificationExpected = requestExplicitlyWantsShellVerification(req) &&
+		(requestInputMentionsApplyPatch(req) ||
+			requestWantsShellInspectionBeforeApplyPatch(req) ||
+			completedToolNamesContain(completedSequence, "apply_patch"))
+
+	if state.VerificationExpected {
+		seenApplyPatch := false
+		for _, name := range completedSequence {
+			switch normalizeToolTierName(name) {
+			case "apply_patch":
+				seenApplyPatch = true
+			case "shell":
+				if seenApplyPatch {
+					state.VerificationCompleted = true
+				}
+			}
+		}
+	}
+
+	state.ApplyPatchSatisfied = shouldForceFinalAnswerAfterSatisfiedApplyPatch(req)
+	state.FinalAnswerSafe = len(state.PendingToolNames) == 0 && (!state.VerificationExpected || state.VerificationCompleted)
+	return state
+}
+
+func buildToolCallFingerprint(name string, payload any) string {
+	name = normalizeToolTierName(name)
+	if name == "" {
+		return ""
+	}
+	switch typed := payload.(type) {
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if name == "apply_patch" {
+			trimmed = normalizeApplyPatchToolOutputText(trimmed)
+		}
+		if trimmed == "" {
+			return name
+		}
+		return name + "|" + trimmed
+	case map[string]any:
+		normalized, _ := json.Marshal(normalizeMapValue(typed))
+		trimmed := strings.TrimSpace(string(normalized))
+		if trimmed == "" || trimmed == "{}" {
+			return name
+		}
+		return name + "|" + trimmed
+	default:
+		normalized, _ := json.Marshal(normalizeMapValue(payload))
+		trimmed := strings.TrimSpace(string(normalized))
+		if trimmed == "" || trimmed == "null" {
+			return name
+		}
+		return name + "|" + trimmed
+	}
+}
+
+func normalizeApplyPatchToolOutputText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	if gjson.Valid(text) {
+		kind := strings.TrimSpace(gjson.Get(text, "type").String())
+		if strings.EqualFold(kind, "apply_patch_call_output") {
+			payload := gjson.Get(text, "payload")
+			if payload.Exists() {
+				if extracted := strings.TrimSpace(payload.Get("output").String()); extracted != "" {
+					text = extracted
+				}
+			} else if extracted := strings.TrimSpace(gjson.Get(text, "output").String()); extracted != "" {
+				text = extracted
+			}
+		}
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 {
+		return text
+	}
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if len(trimmed) < 3 || trimmed[1] != ' ' {
+			continue
+		}
+		path := strings.TrimSpace(trimmed[2:])
+		if path == "" {
+			continue
+		}
+		switch trimmed[0] {
+		case 'A':
+			lines[i] = "created: " + path
+		case 'M':
+			lines[i] = "modified: " + path
+		case 'D':
+			lines[i] = "deleted: " + path
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func extractLatestCompletedShellArguments(req map[string]any) string {
+	if req == nil {
+		return ""
+	}
+	items, ok := req["input"].([]any)
+	if !ok || len(items) == 0 {
+		return ""
+	}
+	callArgsByID := map[string]string{}
+	latest := ""
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", item["type"])))
+		callID := strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))
+		switch itemType {
+		case "function_call", "custom_tool_call":
+			if normalizeToolTierName(fmt.Sprintf("%v", item["name"])) != "shell" || callID == "" {
+				continue
+			}
+			args := normalizeShellArgumentMapForResponse(parseToolArgsMapString(fmt.Sprintf("%v", item["arguments"])))
+			if shellToolArgumentsValid(args) {
+				callArgsByID[callID] = mustJSONString(args)
+			}
+		case "shell_call":
+			if callID == "" {
+				continue
+			}
+			action := normalizeMapValue(item["action"])
+			if len(action) == 0 {
+				continue
+			}
+			args := normalizeShellArgumentMapForResponse(action)
+			if shellToolArgumentsValid(args) {
+				callArgsByID[callID] = mustJSONString(args)
+			}
+		case "function_call_output", "custom_tool_call_output", "shell_call_output":
+			if callID == "" {
+				continue
+			}
+			if args := strings.TrimSpace(callArgsByID[callID]); args != "" {
+				latest = args
+			}
+		}
+	}
+	return strings.TrimSpace(latest)
+}
+
+func shouldRecoverVerificationShellCall(workflowState ToolWorkflowState, verificationShellArgs string, text string, reasoning string) bool {
+	if !workflowState.VerificationExpected || workflowState.VerificationCompleted {
+		return false
+	}
+	if strings.TrimSpace(verificationShellArgs) == "" {
+		return false
+	}
+	combined := strings.ToLower(strings.TrimSpace(text + "\n" + reasoning))
+	if combined == "" {
+		return false
+	}
+	return strings.Contains(combined, "verify") ||
+		strings.Contains(combined, "verification") ||
+		strings.Contains(combined, "inspect the updated file") ||
+		strings.Contains(combined, "inspect the final file")
+}
+
+func extractWorkflowRecoveryContextFromRequestBody(body []byte) (ToolWorkflowState, string) {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return ToolWorkflowState{}, ""
+	}
+	workflowState := buildToolWorkflowState(req)
+	return workflowState, extractLatestCompletedShellArguments(req)
 }
 
 func completedToolNamesContain(names []string, want string) bool {
@@ -7318,22 +8748,32 @@ func filterBridgeToolsToAllowedNames(tools []any, allowedNames ...string) []any 
 }
 
 func deriveContinuationAllowedToolNames(req map[string]any) []string {
-	if req == nil || !requestMapContainsAnyToolOutput(req) {
+	if req == nil {
 		return nil
 	}
-	completed := extractCompletedToolNamesFromRequest(req)
+	workflowState := buildToolWorkflowState(req)
+	if !workflowState.HasToolOutput {
+		return nil
+	}
+	completed := workflowState.CompletedToolNames
 	if requestMentionsAgentOrchestration(req) || allCompletedToolNamesWithinSet(completed, "spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent") {
 		return []string{"spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent"}
 	}
 	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
 	wantsShell := strings.Contains(text, "shell") || strings.Contains(text, "verify with shell") || strings.Contains(text, "use shell")
-	wantsPatchFamily := requestInputMentionsApplyPatch(req) || requestWantsShellInspectionBeforeApplyPatch(req) || completedToolNamesContain(completed, "apply_patch")
+	// A prior apply_patch completion is workflow history, not proof that the
+	// next turn should be narrowed to patch-only semantics. Keep patch-family
+	// narrowing for turns that still explicitly ask for patch sequencing.
+	wantsPatchFamily := requestInputMentionsApplyPatch(req) || requestWantsShellInspectionBeforeApplyPatch(req)
+	if workflowState.VerificationExpected && completedToolNamesContain(completed, "apply_patch") && !workflowState.VerificationCompleted {
+		return []string{"shell"}
+	}
 	if wantsPatchFamily {
 		allowed := make([]string, 0, 2)
 		if completedToolNamesContain(completed, "shell") || wantsShell || requestWantsShellInspectionBeforeApplyPatch(req) {
 			allowed = append(allowed, "shell")
 		}
-		if requestInputMentionsApplyPatch(req) || completedToolNamesContain(completed, "apply_patch") {
+		if requestInputMentionsApplyPatch(req) {
 			allowed = append(allowed, "apply_patch")
 		}
 		if len(allowed) > 0 {
@@ -7362,7 +8802,7 @@ func toolChoiceTargetsSpecificTool(raw any) bool {
 	}
 }
 
-func shouldForceLocalApplyPatchFallback(req map[string]any) bool {
+func requestHasBoolFlag(req map[string]any, key string) bool {
 	if req == nil {
 		return false
 	}
@@ -7377,15 +8817,49 @@ func shouldForceLocalApplyPatchFallback(req map[string]any) bool {
 			return false
 		}
 	}
-	if parseFlag(req["llamaswap_force_local_apply_patch"]) {
+	if parseFlag(req[key]) {
 		return true
 	}
 	if meta, ok := req["metadata"].(map[string]any); ok {
-		if parseFlag(meta["llamaswap_force_local_apply_patch"]) {
+		if parseFlag(meta[key]) {
 			return true
 		}
 	}
 	return false
+}
+
+func shouldForceLocalApplyPatchFallback(req map[string]any) bool {
+	return requestHasBoolFlag(req, "llamaswap_force_local_apply_patch")
+}
+
+func extractMessageTextParts(content any) []string {
+	switch typed := content.(type) {
+	case string:
+		if text := strings.TrimSpace(typed); text != "" {
+			return []string{text}
+		}
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, partRaw := range typed {
+			part, ok := partRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			partType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", part["type"])))
+			if partType != "input_text" && partType != "output_text" && partType != "text" && partType != "" {
+				continue
+			}
+			if text := strings.TrimSpace(fmt.Sprintf("%v", part["text"])); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return parts
+	default:
+		if text := strings.TrimSpace(extractResponsesInputText(content)); text != "" {
+			return []string{text}
+		}
+	}
+	return nil
 }
 
 func extractResponsesUserInputText(req map[string]any) string {
@@ -7418,33 +8892,68 @@ func extractResponsesUserInputText(req map[string]any) string {
 		if role != "user" {
 			continue
 		}
-		content := item["content"]
-		switch typed := content.(type) {
+		if parts := extractMessageTextParts(item["content"]); len(parts) > 0 {
+			lastUserText = strings.TrimSpace(strings.Join(parts, "\n"))
+		} else {
+			lastUserText = ""
+		}
+	}
+	if strings.TrimSpace(lastUserText) != "" {
+		return lastUserText
+	}
+	return strings.TrimSpace(cleanFallbackInput(req["instructions"], ""))
+}
+
+func extractResponsesAllUserInputText(req map[string]any) string {
+	if req == nil {
+		return ""
+	}
+	if raw, ok := req["input"].(string); ok {
+		return strings.TrimSpace(raw)
+	}
+
+	items, ok := req["input"].([]any)
+	if !ok || len(items) == 0 {
+		return strings.TrimSpace(cleanFallbackInput(req["instructions"], ""))
+	}
+
+	parts := make([]string, 0, len(items))
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprintf("%v", item["type"])) != "message" {
+			continue
+		}
+		if strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["role"]))) != "user" {
+			continue
+		}
+		switch typed := item["content"].(type) {
 		case string:
-			lastUserText = strings.TrimSpace(typed)
+			text := strings.TrimSpace(typed)
+			if text != "" {
+				parts = append(parts, text)
+			}
 		case []any:
-			var parts []string
 			for _, partRaw := range typed {
 				part, ok := partRaw.(map[string]any)
 				if !ok {
 					continue
 				}
 				partType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", part["type"])))
-				if partType != "input_text" && partType != "text" && partType != "" {
+				if partType != "input_text" && partType != "output_text" && partType != "text" {
 					continue
 				}
-				text := strings.TrimSpace(fmt.Sprintf("%v", part["text"]))
+				text := strings.TrimSpace(cleanFallbackInput(part["text"], ""))
 				if text != "" {
 					parts = append(parts, text)
 				}
 			}
-			lastUserText = strings.TrimSpace(strings.Join(parts, "\n"))
-		default:
-			lastUserText = strings.TrimSpace(extractResponsesInputText(content))
 		}
 	}
-	if strings.TrimSpace(lastUserText) != "" {
-		return lastUserText
+	if len(parts) > 0 {
+		return strings.TrimSpace(strings.Join(parts, "\n"))
 	}
 	return strings.TrimSpace(cleanFallbackInput(req["instructions"], ""))
 }
@@ -7469,6 +8978,7 @@ var genericPathCandidateRegexps = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)([A-Za-z]:\\(?:[^\\/:*?"<>\r\n]+\\)*[^\\/:*?"<>\r\n]+\.[A-Za-z0-9]{1,16})`),
 	regexp.MustCompile(`(?i)(/mnt/[A-Za-z]/(?:[^\s"'` + "`" + `]+/)*[^\s"'` + "`" + `]+\.[A-Za-z0-9]{1,16})`),
 	regexp.MustCompile(`(?i)(/(?:[^\s"'` + "`" + `]+/)*[^\s"'` + "`" + `]+\.[A-Za-z0-9]{1,16})`),
+	regexp.MustCompile(`(?i)\b((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,16})\b`),
 	regexp.MustCompile(`(?i)\b([A-Za-z_][A-Za-z0-9_.-]*\.[A-Za-z0-9]{1,16})\b`),
 }
 
@@ -7524,7 +9034,11 @@ func extractApplyPatchPathHintFromResponsesRequestBody(body []byte) string {
 		return ""
 	}
 	text := strings.TrimSpace(extractResponsesUserInputText(req))
-	if text == "" {
+	contextText := strings.TrimSpace(extractResponsesAllUserInputText(req))
+	if contextText == "" {
+		contextText = text
+	}
+	if text == "" && contextText == "" {
 		return ""
 	}
 	for _, re := range applyPatchPathHintRegexps {
@@ -7532,17 +9046,63 @@ func extractApplyPatchPathHintFromResponsesRequestBody(body []byte) string {
 		if len(match) < 2 {
 			continue
 		}
-		candidate := strings.TrimSpace(match[1])
-		candidate = strings.Trim(candidate, ".,;:!?)(")
-		if candidate == "" {
-			continue
+		if candidate := resolveApplyPatchPathHintCandidate(match[1], contextText); candidate != "" {
+			return candidate
 		}
-		return normalizeApplyPatchPathForWorkspace(candidate)
+	}
+	bestCandidate := ""
+	searchText := text
+	if searchText == "" {
+		searchText = contextText
+	}
+	for _, re := range genericPathCandidateRegexps {
+		matches := re.FindAllStringSubmatch(searchText, -1)
+		for _, match := range matches {
+			if len(match) < 2 {
+				continue
+			}
+			candidate := resolveApplyPatchPathHintCandidate(match[1], contextText)
+			if len(candidate) > len(bestCandidate) {
+				bestCandidate = candidate
+			}
+		}
+	}
+	if bestCandidate != "" {
+		return bestCandidate
 	}
 	if fallback := extractApplyPatchPathHintFromToolOutputs(req); fallback != "" {
 		return fallback
 	}
 	return ""
+}
+
+func repairApplyPatchOperationPathWithHint(operation any, applyPatchPathHint string) (any, bool) {
+	op, ok := normalizeApplyPatchOperation(operation).(map[string]any)
+	if !ok {
+		return operation, false
+	}
+	pathHint := strings.TrimSpace(normalizeApplyPatchPathForWorkspace(applyPatchPathHint))
+	if pathHint == "" || !applyPatchPathExistsLocally(pathHint) {
+		return op, false
+	}
+	opType := normalizeApplyPatchTypeHint(cleanFallbackInput(op["type"], ""))
+	if opType != "create_file" && opType != "update_file" && opType != "delete_file" {
+		return op, false
+	}
+	opPath := strings.TrimSpace(cleanFallbackInput(op["path"], ""))
+	if opPath != "" {
+		normalizedPath := normalizeApplyPatchPathForWorkspace(opPath)
+		pathLooksAbsolute := looksLikeAbsoluteWindowsOrUNCPath(opPath) || filepath.IsAbs(opPath)
+		if strings.EqualFold(filepath.ToSlash(normalizedPath), filepath.ToSlash(pathHint)) {
+			return op, false
+		}
+		if pathLooksAbsolute && applyPatchPathExistsLocally(normalizedPath) {
+			return op, false
+		}
+	}
+	rewritten := cloneMap(op)
+	rewritten["path"] = pathHint
+	return rewritten, true
 }
 
 func extractApplyPatchContentHintFromResponsesRequestBody(body []byte) string {
@@ -7753,6 +9313,24 @@ func responseContainsToolCall(responseBody []byte) bool {
 	return false
 }
 
+func responseContainsNamedFunctionCall(responseBody []byte, name string) bool {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if name == "" {
+		return false
+	}
+	output := gjson.GetBytes(responseBody, "output").Array()
+	for _, item := range output {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType != "function_call" {
+			continue
+		}
+		if strings.TrimSpace(strings.ToLower(item.Get("name").String())) == name {
+			return true
+		}
+	}
+	return false
+}
+
 func responseContainsApplyPatchCall(responseBody []byte) bool {
 	output := gjson.GetBytes(responseBody, "output").Array()
 	for _, item := range output {
@@ -7833,24 +9411,7 @@ func requestContainsApplyPatchToolOutput(body []byte) bool {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return false
 	}
-	input, _ := req["input"].([]any)
-	for _, raw := range input {
-		item, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		itemType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", item["type"])))
-		switch itemType {
-		case "apply_patch_call_output":
-			return true
-		case "function_call_output":
-			output := strings.ToLower(strings.TrimSpace(encodeAnyAsJSONString(item["output"])))
-			if strings.Contains(output, "apply_patch_call_output") || strings.Contains(output, "apply_patch") {
-				return true
-			}
-		}
-	}
-	return false
+	return requestMapContainsApplyPatchToolOutput(req)
 }
 
 func requestContainsAnyToolOutput(body []byte) bool {
@@ -7861,18 +9422,7 @@ func requestContainsAnyToolOutput(body []byte) bool {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return false
 	}
-	input, _ := req["input"].([]any)
-	for _, raw := range input {
-		item, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		itemType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", item["type"])))
-		if strings.HasSuffix(itemType, "_call_output") {
-			return true
-		}
-	}
-	return false
+	return requestMapContainsAnyToolOutput(req)
 }
 
 func requestMapContainsAnyToolOutput(req map[string]any) bool {
@@ -7884,6 +9434,31 @@ func requestMapContainsAnyToolOutput(req map[string]any) bool {
 		}
 		itemType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", item["type"])))
 		if strings.HasSuffix(itemType, "_call_output") {
+			return true
+		}
+	}
+	return false
+}
+
+func requestMapContainsApplyPatchToolOutput(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	if workflowState := buildToolWorkflowState(req); completedToolNamesContain(workflowState.CompletedToolNames, "apply_patch") {
+		return true
+	}
+	input, _ := req["input"].([]any)
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", item["type"])))
+		if itemType != "function_call_output" {
+			continue
+		}
+		output := strings.ToLower(strings.TrimSpace(encodeAnyAsJSONString(item["output"])))
+		if strings.Contains(output, "apply_patch_call_output") || strings.Contains(output, "apply_patch") {
 			return true
 		}
 	}
@@ -8076,7 +9651,7 @@ func extractResponsesRequestModeFromBody(body []byte) string {
 		}
 		return ""
 	}
-	mode := extractResponsesRequestMode(req)
+	mode := responsesRequestContractMode(req)
 	if mode == "" && rawResponsesBodyLooksLikePlanMode(body) {
 		return "plan"
 	}
@@ -8086,6 +9661,9 @@ func extractResponsesRequestModeFromBody(body []byte) string {
 func shouldRewritePlanModeResponseText(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
+		return true
+	}
+	if looksLikePlanAcknowledgementWithoutPlan(trimmed) {
 		return true
 	}
 	lower := strings.ToLower(trimmed)
@@ -8136,6 +9714,58 @@ func shouldRewritePlanModeResponseText(text string) bool {
 	return planHints < 2
 }
 
+func stripTrailingPlanFollowup(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	lower := strings.ToLower(text)
+	cutMarkers := []string{
+		"\n---",
+		"\nwant me to",
+		"\nwould you like me to",
+		"\nif so,",
+		"\nwhich approach do you prefer",
+		"\nwhich option do you prefer",
+		"\ndo you have any preferences",
+		"\ntarget directory:",
+	}
+	cutIdx := -1
+	for _, marker := range cutMarkers {
+		if idx := strings.Index(lower, marker); idx >= 0 && (cutIdx == -1 || idx < cutIdx) {
+			cutIdx = idx
+		}
+	}
+	if cutIdx >= 0 {
+		text = text[:cutIdx]
+	}
+	return strings.TrimSpace(text)
+}
+
+func sanitizeStructuredPlanText(text string) string {
+	text = sanitizePlanModeCandidateText(text)
+	text = stripTrailingPlanFollowup(text)
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	openIdx := strings.Index(lower, "<proposed_plan>")
+	if openIdx >= 0 {
+		closeIdx := strings.Index(lower, "</proposed_plan>")
+		if closeIdx > openIdx {
+			inner := strings.TrimSpace(trimmed[openIdx+len("<proposed_plan>") : closeIdx])
+			if inner == "" {
+				return ""
+			}
+			return "<proposed_plan>\n" + inner + "\n</proposed_plan>"
+		}
+		inner := strings.TrimSpace(trimmed[openIdx+len("<proposed_plan>"):])
+		if inner == "" {
+			return ""
+		}
+		return "<proposed_plan>\n" + inner + "\n</proposed_plan>"
+	}
+	return trimmed
+}
+
 func enforcedPlanModeText() string {
 	return "<proposed_plan>\n" +
 		"Planning mode is active. Here is a structured plan only:\n" +
@@ -8154,8 +9784,290 @@ func planModeLengthDiagnosticText() string {
 		"</proposed_plan>"
 }
 
+func extractPlanModeBulletsAfterMarker(text string, markers ...string) []string {
+	if strings.TrimSpace(text) == "" || len(markers) == 0 {
+		return nil
+	}
+	lower := strings.ToLower(text)
+	for _, marker := range markers {
+		marker = strings.ToLower(strings.TrimSpace(marker))
+		if marker == "" {
+			continue
+		}
+		idx := strings.Index(lower, marker)
+		if idx < 0 {
+			continue
+		}
+		segment := strings.TrimLeft(text[idx+len(marker):], " \t:\n")
+		lines := strings.Split(segment, "\n")
+		bullets := make([]string, 0, 8)
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				if len(bullets) > 0 {
+					break
+				}
+				continue
+			}
+			if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
+				bullets = append(bullets, strings.TrimSpace(trimmed[2:]))
+				continue
+			}
+			if len(bullets) > 0 {
+				break
+			}
+		}
+		if len(bullets) > 0 {
+			return bullets
+		}
+	}
+	return nil
+}
+
+func appendUniquePlanItem(items *[]string, value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	for _, existing := range *items {
+		if strings.EqualFold(strings.TrimSpace(existing), value) {
+			return
+		}
+	}
+	*items = append(*items, value)
+}
+
+func extractPlanModePreferenceValue(bullets []string, key string) string {
+	key = strings.ToLower(strings.TrimSpace(key))
+	if key == "" {
+		return ""
+	}
+	for _, bullet := range bullets {
+		trimmed := strings.TrimSpace(bullet)
+		lower := strings.ToLower(trimmed)
+		if !strings.HasPrefix(lower, key) {
+			continue
+		}
+		value := strings.TrimSpace(trimmed[len(key):])
+		value = strings.TrimLeft(value, ": ")
+		value = strings.TrimSuffix(value, "(Recommended)")
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+func countPlanModeQuestionItems(text string) int {
+	count := 0
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		dot := strings.Index(trimmed, ".")
+		if dot <= 0 {
+			continue
+		}
+		validDigits := true
+		for _, ch := range trimmed[:dot] {
+			if ch < '0' || ch > '9' {
+				validDigits = false
+				break
+			}
+		}
+		if validDigits {
+			count++
+		}
+	}
+	return count
+}
+
+func extractPlanModeQuestionCount(text string) int {
+	if count := countPlanModeQuestionItems(text); count > 0 {
+		return count
+	}
+	matches := planModeQuestionCountRegexp.FindStringSubmatch(text)
+	if len(matches) < 2 {
+		return 0
+	}
+	count, err := strconv.Atoi(matches[1])
+	if err != nil || count <= 0 {
+		return 0
+	}
+	return count
+}
+
+func buildStructuredPlanFromResearchNotes(text string) string {
+	text = sanitizePlanModeCandidateText(text)
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "<proposed_plan>") && strings.Contains(lower, "</proposed_plan>") {
+		return text
+	}
+	preferences := extractPlanModeBulletsAfterMarker(text, "the user has answered:", "user has answered:")
+	buildFeatures := extractPlanModeBulletsAfterMarker(
+		text,
+		"let me create a single html file with:",
+		"let me create a single html + javascript file with:",
+		"let me create with:",
+		"let me build with:",
+		"i will build with:",
+		"i'll build with:",
+	)
+	if len(buildFeatures) == 0 {
+		for _, feature := range []string{
+			"multiple choice answers",
+			"score tracking",
+			"progress bar",
+			"explanation section",
+			"explanations after each answer",
+			"smooth animations",
+			"confetti",
+			"colorful, fun design",
+		} {
+			if strings.Contains(lower, feature) {
+				appendUniquePlanItem(&buildFeatures, feature)
+			}
+		}
+	}
+	questionCount := extractPlanModeQuestionCount(text)
+	tech := extractPlanModePreferenceValue(preferences, "tech")
+	format := extractPlanModePreferenceValue(preferences, "features")
+	style := extractPlanModePreferenceValue(preferences, "style")
+	if tech == "" && strings.Contains(lower, "html + javascript") {
+		tech = "HTML + JavaScript"
+	} else if tech == "" && (strings.Contains(lower, "single html file") || strings.Contains(lower, "embedded css + js") || strings.Contains(lower, "embedded css + javascript")) {
+		tech = "HTML + JavaScript"
+	}
+	if format == "" && strings.Contains(lower, "classic quiz") {
+		format = "Classic quiz"
+	} else if format == "" && strings.Contains(lower, "multiple-choice questions") {
+		format = "Classic multiple-choice quiz"
+	}
+	if style == "" && strings.Contains(lower, "colorful") && strings.Contains(lower, "fun") {
+		style = "Colorful & Fun"
+	}
+	if questionCount == 0 && len(preferences) == 0 && len(buildFeatures) == 0 {
+		return ""
+	}
+
+	summaryBullets := make([]string, 0, 3)
+	implementationBullets := make([]string, 0, 5)
+	validationBullets := make([]string, 0, 3)
+	assumptionBullets := make([]string, 0, 4)
+
+	appendUniquePlanItem(&summaryBullets, "Keep the turn in Plan Mode and convert the gathered research into a decision-complete implementation plan instead of starting file changes.")
+	if questionCount > 0 {
+		appendUniquePlanItem(&summaryBullets, fmt.Sprintf("Use the %d researched chemistry questions as the initial quiz content, preserving answer choices and short explanations.", questionCount))
+	} else {
+		appendUniquePlanItem(&summaryBullets, "Use the already researched chemistry question set as the initial quiz content rather than re-running the research step.")
+	}
+
+	switch {
+	case tech != "" && format != "" && style != "":
+		appendUniquePlanItem(&summaryBullets, fmt.Sprintf("Build the first version as a %s %s in `%s` with a `%s` presentation.", style, format, tech, style))
+	case tech != "" && format != "":
+		appendUniquePlanItem(&summaryBullets, fmt.Sprintf("Build the first version as a `%s` %s implementation.", tech, format))
+	case tech != "":
+		appendUniquePlanItem(&summaryBullets, fmt.Sprintf("Keep the first version in `%s` so it stays easy to run and hand off.", tech))
+	}
+
+	appendUniquePlanItem(&implementationBullets, "Normalize each researched question into a quiz data shape with prompt, answer options, correct answer, and explanation text.")
+	if tech != "" {
+		appendUniquePlanItem(&implementationBullets, fmt.Sprintf("Create the quiz shell in `%s`, keeping the page standalone and easy to open locally.", tech))
+	} else {
+		appendUniquePlanItem(&implementationBullets, "Create a standalone quiz shell that can be opened and tested locally without extra setup.")
+	}
+	if len(buildFeatures) > 0 {
+		appendUniquePlanItem(&implementationBullets, "Implement the core quiz flow and UI behaviors called out in the research notes:")
+		for _, feature := range buildFeatures {
+			appendUniquePlanItem(&implementationBullets, "- "+feature)
+		}
+	} else {
+		appendUniquePlanItem(&implementationBullets, "Implement the core quiz flow with question progression, answer selection, score tracking, and result feedback.")
+	}
+	appendUniquePlanItem(&implementationBullets, "Finish with restart/results behavior and lightweight UI polish that fits the chosen style without expanding scope beyond the quiz itself.")
+
+	appendUniquePlanItem(&validationBullets, "Verify every researched question renders with the intended answer choices and explanation text.")
+	appendUniquePlanItem(&validationBullets, "Verify score, progress, and answer feedback stay correct across a full quiz run.")
+	if tech != "" {
+		appendUniquePlanItem(&validationBullets, fmt.Sprintf("Verify the `%s` delivery approach works directly in the target runtime without missing assets or broken interactions.", tech))
+	}
+
+	if tech != "" {
+		appendUniquePlanItem(&assumptionBullets, "Tech: "+tech)
+	}
+	if format != "" {
+		appendUniquePlanItem(&assumptionBullets, "Format: "+format)
+	}
+	if style != "" {
+		appendUniquePlanItem(&assumptionBullets, "Style: "+style)
+	}
+	if questionCount > 0 {
+		appendUniquePlanItem(&assumptionBullets, fmt.Sprintf("Content: use the %d-question research set already gathered in this turn as the initial quiz bank.", questionCount))
+	}
+
+	lines := []string{"# Chemistry Quiz Plan", "", "## Summary"}
+	for _, bullet := range summaryBullets {
+		lines = append(lines, "- "+bullet)
+	}
+	lines = append(lines, "", "## Implementation")
+	stepNumber := 1
+	for idx, bullet := range implementationBullets {
+		if strings.HasPrefix(bullet, "- ") {
+			lines = append(lines, bullet)
+			continue
+		}
+		_ = idx
+		lines = append(lines, fmt.Sprintf("%d. %s", stepNumber, bullet))
+		stepNumber++
+	}
+	lines = append(lines, "", "## Validation")
+	for _, bullet := range validationBullets {
+		lines = append(lines, "- "+bullet)
+	}
+	if len(assumptionBullets) > 0 {
+		lines = append(lines, "", "## Assumptions")
+		for _, bullet := range assumptionBullets {
+			lines = append(lines, "- "+bullet)
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func derivePlanModeFallbackText(candidates ...string) string {
+	seen := map[string]struct{}{}
+	normalized := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate = sanitizePlanModeCandidateText(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		normalized = append(normalized, candidate)
+		if !shouldRewritePlanModeResponseText(candidate) {
+			return candidate
+		}
+	}
+	for _, candidate := range normalized {
+		if structured := buildStructuredPlanFromResearchNotes(candidate); strings.TrimSpace(structured) != "" {
+			return structured
+		}
+	}
+	if len(normalized) > 1 {
+		if structured := buildStructuredPlanFromResearchNotes(strings.Join(normalized, "\n\n")); strings.TrimSpace(structured) != "" {
+			return structured
+		}
+	}
+	return enforcedPlanModeText()
+}
+
 func ensureProposedPlanWrapper(text string) string {
-	trimmed := strings.TrimSpace(text)
+	trimmed := sanitizeStructuredPlanText(text)
 	if trimmed == "" {
 		return enforcedPlanModeText()
 	}
@@ -8332,13 +10244,29 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 	}
 
 	textParts := make([]string, 0)
+	reasoningParts := make([]string, 0)
 	outputRaw, _ := resp["output"].([]any)
 	for _, rawItem := range outputRaw {
 		item, ok := rawItem.(map[string]any)
 		if !ok {
 			continue
 		}
-		if strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["type"]))) != "message" {
+		itemType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", item["type"])))
+		if itemType == "reasoning" {
+			summaryRaw, _ := item["summary"].([]any)
+			for _, rawPart := range summaryRaw {
+				part, ok := rawPart.(map[string]any)
+				if !ok {
+					continue
+				}
+				text := strings.TrimSpace(fmt.Sprintf("%v", part["text"]))
+				if text != "" {
+					reasoningParts = append(reasoningParts, text)
+				}
+			}
+			continue
+		}
+		if itemType != "message" {
 			continue
 		}
 		contentRaw, _ := item["content"].([]any)
@@ -8367,7 +10295,11 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 				return responseBody
 			}
 		} else {
-			planText = enforcedPlanModeText()
+			planText = derivePlanModeFallbackText(
+				planText,
+				strings.Join(reasoningParts, "\n\n"),
+				extractPlanTextFromBlockedApplyPatch(responseBody),
+			)
 		}
 	}
 	if strings.TrimSpace(planText) == "" && finishReason == "length" {
@@ -8377,12 +10309,13 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 		return responseBody
 	}
 	if strings.TrimSpace(planText) == "" {
-		planText = enforcedPlanModeText()
+		planText = derivePlanModeFallbackText(strings.Join(reasoningParts, "\n\n"))
 	}
 	planText = stripLeadingReasoningDirective(planText)
 	if content, _ := extractContentAndReasoning(planText); strings.TrimSpace(content) != "" {
 		planText = content
 	}
+	planText = sanitizeStructuredPlanText(planText)
 	planText = ensureProposedPlanWrapper(planText)
 
 	msgID := fmt.Sprintf("msg_plan_mode_%d", time.Now().UnixNano())
@@ -8414,12 +10347,34 @@ func shouldEnforcePlanModeSyntheticRewrite(isPlanModeRequested, enforceProxyPlan
 	if !isPlanModeRequested {
 		return false
 	}
-	// Preserve native Codex-managed plan item streams. Request-time plan filtering
-	// already strips mutating tools for managed plan turns, and rewriting here
-	// destroys upstream reasoning/message items by replacing them with a synthetic
-	// msg_plan_mode_* assistant message.
-	_ = responseBody
-	return false
+	if !gjson.ValidBytes(responseBody) {
+		return false
+	}
+	hasToolCall := false
+	hasProposedPlan := false
+	gjson.GetBytes(responseBody, "output").ForEach(func(_, item gjson.Result) bool {
+		itemType := strings.TrimSpace(strings.ToLower(item.Get("type").String()))
+		if itemType == "function_call" || strings.HasSuffix(itemType, "_call") {
+			hasToolCall = true
+			return false
+		}
+		if itemType != "message" {
+			return true
+		}
+		item.Get("content").ForEach(func(_, part gjson.Result) bool {
+			text := strings.ToLower(strings.TrimSpace(part.Get("text").String()))
+			if strings.Contains(text, "<proposed_plan>") && strings.Contains(text, "</proposed_plan>") {
+				hasProposedPlan = true
+				return false
+			}
+			return true
+		})
+		return !hasProposedPlan
+	})
+	if hasToolCall || hasProposedPlan {
+		return false
+	}
+	return true
 }
 
 func planModeBlocksMutatingToolCall(responseBody []byte) bool {
@@ -8465,7 +10420,7 @@ func maybeForceRetryToolChoice(req map[string]any, feedback string) {
 	if req == nil {
 		return
 	}
-	if requestLooksLikePlanMode(req) {
+	if responsesRequestContractMode(req) == "plan" {
 		return
 	}
 	if body, err := json.Marshal(req); err == nil && rawResponsesBodyLooksLikePlanMode(body) {
@@ -8545,7 +10500,7 @@ func appendApplyPatchFirstAttemptConstraint(req map[string]any) {
 	if req == nil {
 		return
 	}
-	if requestLooksLikePlanMode(req) {
+	if responsesRequestContractMode(req) == "plan" {
 		return
 	}
 	if body, err := json.Marshal(req); err == nil && rawResponsesBodyLooksLikePlanMode(body) {
@@ -8676,6 +10631,58 @@ func appendEmptyPostToolRecoveryInstruction(req map[string]any) {
 	prependSystemInstructionOnce(req, instruction)
 }
 
+func appendMissingWebSearchRecoveryInstruction(req map[string]any) {
+	if req == nil {
+		return
+	}
+	instruction := "If current or external information is still needed, emit exactly one real web_search tool call next." +
+		" Do not output placeholder progress text, empty <tool_code> wrappers, <websearch> tags, or print(websearch(...))." +
+		" Prefer native web_search over Playwright/browser tools for normal research steps when web_search is available."
+	prependSystemInstructionOnce(req, instruction)
+	req["llamaswap_force_search_intent"] = true
+	req["parallel_tool_calls"] = false
+}
+
+func responsesOutputContainsAnyToolCall(responseBody []byte) bool {
+	if !gjson.ValidBytes(responseBody) {
+		return false
+	}
+	for _, item := range gjson.GetBytes(responseBody, "output").Array() {
+		itemType := strings.TrimSpace(strings.ToLower(item.Get("type").String()))
+		if strings.HasSuffix(itemType, "_call") || itemType == "function_call" {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldRetryMissingWebSearchCall(req map[string]any, translatedChatRequest []byte, chatResponse []byte, translatedResponse []byte, workflowState ToolWorkflowState) bool {
+	if req == nil {
+		return false
+	}
+	if !requestIncludesWebSearchTool(req) &&
+		!chatRequestIncludesToolName(translatedChatRequest, "web_search", "web_search_preview", llamaSwapWebSearchFunctionName) {
+		return false
+	}
+	if responsesOutputContainsAnyToolCall(translatedResponse) {
+		return false
+	}
+	contentText := strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.message.content").String())
+	reasoningText := strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.message.reasoning_content").String())
+	if !(textLooksLikeWeakProgressPlaceholder(contentText) || textLooksLikeSearchArtifact(contentText) || textLooksLikeEmptyToolArtifact(contentText)) {
+		return false
+	}
+	combined := strings.TrimSpace(strings.Join([]string{
+		extractResponsesUserInputText(req),
+		contentText,
+		reasoningText,
+	}, "\n"))
+	if !textIndicatesSearchIntent(combined) && !requestExplicitlyWantsSearchIntent(req, workflowState) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.finish_reason").String()), "stop")
+}
+
 var exactFinalReplyRegexps = []*regexp.Regexp{
 	regexp.MustCompile(`(?is)\bthen\s+reply\s+exactly\s*:\s*["']?([^\r\n"']+)["']?`),
 	regexp.MustCompile(`(?is)\breply\s+exactly\s*:\s*["']?([^\r\n"']+)["']?`),
@@ -8722,7 +10729,10 @@ func extractExactFinalReplyHintFromRequestBody(body []byte) string {
 }
 
 func requestLooksLikeTextOnlyReply(req map[string]any) bool {
-	if req == nil || requestMapContainsAnyToolOutput(req) {
+	if req == nil {
+		return false
+	}
+	if proxyCompatibilityAdapters.Continuation.BuildWorkflowState(req).HasToolOutput {
 		return false
 	}
 	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
@@ -8797,6 +10807,21 @@ func requestWantsShellInspectionBeforeApplyPatch(req map[string]any) bool {
 		strings.Contains(text, "inspect the current file") ||
 		strings.Contains(text, "verify with shell first")
 	return wantsShell && wantsInspectFirst
+}
+
+func requestExplicitlyWantsShellVerification(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "verify with shell") ||
+		strings.Contains(text, "verify the final content with shell") ||
+		strings.Contains(text, "verify the final file content with shell") ||
+		strings.Contains(text, "verify the final file with shell") ||
+		strings.Contains(text, "then verify with shell")
 }
 
 func summarizeApplyPatchRetryContext(req map[string]any) string {
@@ -9050,12 +11075,7 @@ func isOversizedShellFileWrite(args string) bool {
 }
 
 func shouldForceStrictApplyPatchRetry(reasonCode string) bool {
-	switch strings.ToLower(strings.TrimSpace(reasonCode)) {
-	case "no_tool_call", "wrong_tool_call", "wrong_tool_call_oversized_shell_write", "empty_operation", "invalid_diff":
-		return true
-	default:
-		return false
-	}
+	return buildApplyPatchRetryLoopDecision(reasonCode, "").ForceStrict
 }
 
 func buildApplyPatchRetryFailedResponse(baseResp []byte, reasonCode string, sampledArgs string) []byte {
@@ -9064,18 +11084,7 @@ func buildApplyPatchRetryFailedResponse(baseResp []byte, reasonCode string, samp
 		id = fmt.Sprintf("resp_%d", time.Now().UnixNano())
 	}
 	model := strings.TrimSpace(gjson.GetBytes(baseResp, "model").String())
-	reasonCode = strings.TrimSpace(reasonCode)
-	if reasonCode == "" {
-		reasonCode = "no_tool_call"
-	}
-	text := "[proxy] apply_patch retry could not be completed. Retry with apply_patch if the task still requires a file write."
-	if strings.HasPrefix(strings.ToLower(reasonCode), "wrong_tool_call") {
-		text = applyPatchRetryPreferredFailureText
-	}
-	text += " (`" + reasonCode + "`)."
-	if strings.TrimSpace(sampledArgs) != "" {
-		text += " Sampled arguments: " + truncateBridgeDebugText(sampledArgs, 220)
-	}
+	decision := buildApplyPatchRetryLoopDecision(reasonCode, sampledArgs)
 	resp := map[string]any{
 		"id":         id,
 		"object":     "response",
@@ -9090,15 +11099,40 @@ func buildApplyPatchRetryFailedResponse(baseResp []byte, reasonCode string, samp
 				"content": []any{
 					map[string]any{
 						"type": "output_text",
-						"text": text,
+						"text": decision.FailureText,
 					},
 				},
 			},
 		},
-		"output_text": text,
+		"output_text": decision.FailureText,
 	}
 	out, _ := json.Marshal(resp)
 	return out
+}
+
+func buildApplyPatchRetryLoopDecision(reasonCode string, sampledArgs string) RetryLoopDecision {
+	normalizedReason := strings.ToLower(strings.TrimSpace(reasonCode))
+	if normalizedReason == "" {
+		normalizedReason = "no_tool_call"
+	}
+	forceStrict := false
+	switch normalizedReason {
+	case "no_tool_call", "wrong_tool_call", "wrong_tool_call_oversized_shell_write", "empty_operation", "invalid_diff":
+		forceStrict = true
+	}
+	text := "[proxy] apply_patch retry could not be completed. Retry with apply_patch if the task still requires a file write."
+	if strings.HasPrefix(normalizedReason, "wrong_tool_call") {
+		text = applyPatchRetryPreferredFailureText
+	}
+	text += " (`" + normalizedReason + "`)."
+	if strings.TrimSpace(sampledArgs) != "" {
+		text += " Sampled arguments: " + truncateBridgeDebugText(sampledArgs, 220)
+	}
+	return RetryLoopDecision{
+		ReasonCode:  normalizedReason,
+		ForceStrict: forceStrict,
+		FailureText: text,
+	}
 }
 
 func extractFirstApplyPatchInvocationFromResponse(responseBody []byte) (string, map[string]any, bool) {
@@ -9589,10 +11623,23 @@ func (w *bridgeChatStreamWriter) StatusCode() int {
 	return w.statusCode
 }
 
-func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, isPlanMode bool, requestedReasoningSummary string) error {
+func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, planOutputRequired bool, requestedReasoningSummary string) error {
+	return writeResponsesStreamFromChatSSEWithWorkflowAndContext(context.Background(), w, upstream, planOutputRequired, false, requestedReasoningSummary, ToolWorkflowState{}, "", nil)
+}
+
+func writeResponsesStreamFromChatSSEWithWorkflow(w http.ResponseWriter, upstream io.Reader, planOutputRequired bool, nativeQuestionRequired bool, requestedReasoningSummary string, workflowState ToolWorkflowState, verificationShellArgs string, originalReq map[string]any) error {
+	return writeResponsesStreamFromChatSSEWithWorkflowAndContext(context.Background(), w, upstream, planOutputRequired, nativeQuestionRequired, requestedReasoningSummary, workflowState, verificationShellArgs, originalReq)
+}
+
+func writeResponsesStreamFromChatSSEWithWorkflowAndContext(ctx context.Context, w http.ResponseWriter, upstream io.Reader, planOutputRequired bool, nativeQuestionRequired bool, requestedReasoningSummary string, workflowState ToolWorkflowState, verificationShellArgs string, originalReq map[string]any) error {
 	// Forward upstream chat.completions SSE as true incremental Responses SSE.
 	// In plan mode, mutating tool calls must be suppressed even if the upstream
 	// model emits them natively, so the final stream remains plan-only.
+	appendProxyStageTrace("stream.chat_sse_to_responses.start", map[string]any{
+		"plan_output_required":        planOutputRequired,
+		"native_question_required":    nativeQuestionRequired,
+		"requested_reasoning_summary": strings.TrimSpace(requestedReasoningSummary),
+	})
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -9616,134 +11663,34 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 	createdAt := int64(0)
 	msgID := ""
 	commentaryMsgID := ""
-	fullText := strings.Builder{}
+	finalTextBuilder := strings.Builder{}
+	commentaryText := strings.Builder{}
 	reasoningText := strings.Builder{}
+	reasoningSummaryText := strings.Builder{}
 	reasoningSeen := false
 	finishReasonStop := false
 	finishReasonLength := false
 	blockedPlanMutationText := ""
-	type toolState struct {
-		index       int
-		outputIndex int
-		itemID      string
-		callID      string
-		name        string
-		exposed     bool
-		argsBuffer  strings.Builder
-	}
-	toolStates := map[int]*toolState{}
+	toolStates := map[int]*StreamToolCallState{}
 	toolOrder := make([]int, 0, 4)
 	nextOutputIndex := 0
-	canonicalToolName := func(name string) string {
-		name = strings.TrimSpace(name)
-		if strings.EqualFold(name, llamaSwapApplyPatchFunctionName) {
-			return "apply_patch"
-		}
-		name = strings.TrimPrefix(name, "__llamaswap_")
-		if strings.EqualFold(name, "applypatch") {
-			return "apply_patch"
-		}
-		return name
-	}
-	buildToolOutputItem := func(state *toolState, arguments string) map[string]any {
-		toolName := canonicalToolName(state.name)
-		if strings.EqualFold(toolName, "apply_patch") {
-			args := parseToolArgsMapString(arguments)
-			op := preferContentDrivenApplyPatchOperation(selectApplyPatchOperation(args))
-			input := strings.TrimSpace(buildApplyPatchInputFromOperation(op))
-			appendApplyPatchTrace("chat_sse.build_tool_output_item", map[string]any{
-				"tool_name":        toolName,
-				"raw_arguments":    truncateBridgeDebugText(arguments, 400),
-				"parsed_args":      truncateBridgeDebugText(mustJSONString(args), 400),
-				"normalized_op":    truncateBridgeDebugText(mustJSONString(op), 400),
-				"normalized_input": truncateBridgeDebugText(input, 400),
-			})
-			item := map[string]any{
-				"id":      state.itemID,
-				"type":    "custom_tool_call",
-				"call_id": state.callID,
-				"name":    "apply_patch",
-				"status":  "in_progress",
-			}
-			if op != nil {
-				item["operation"] = op
-			}
-			if input != "" {
-				item["input"] = input
-			}
-			return item
-		}
-		if server, subtool, ok := parseMCPToolName(toolName); ok {
-			return map[string]any{
-				"id":        state.itemID,
-				"type":      "function_call",
-				"call_id":   state.callID,
-				"name":      buildMCPToolName(server, subtool),
-				"status":    "in_progress",
-				"arguments": mustJSONString(parseToolArgsMapString(arguments)),
-			}
-		}
-		return map[string]any{
-			"id":        state.itemID,
-			"type":      "function_call",
-			"call_id":   state.callID,
-			"name":      toolName,
-			"status":    "in_progress",
-			"arguments": arguments,
-		}
-	}
-	shouldExposeToolState := func(state *toolState) bool {
-		if state == nil {
-			return false
-		}
-		toolName := canonicalToolName(state.name)
-		if toolName == "" {
-			return false
-		}
-		if strings.EqualFold(toolName, "shell") {
-			args := parseToolArgsMapString(normalizePossiblyMixedToolArguments(state.argsBuffer.String()))
-			return shellToolArgumentsValid(args)
-		}
-		return true
-	}
-	canonicalToolArguments := func(state *toolState, arguments string) string {
-		toolName := canonicalToolName(state.name)
-		normalized := normalizePossiblyMixedToolArguments(arguments)
-		if strings.EqualFold(toolName, "apply_patch") {
-			args := parseToolArgsMapString(normalized)
-			op := preferContentDrivenApplyPatchOperation(selectApplyPatchOperation(args))
-			if input := strings.TrimSpace(buildApplyPatchInputFromOperation(op)); input != "" {
-				appendApplyPatchTrace("chat_sse.canonical_tool_arguments", map[string]any{
-					"tool_name":        toolName,
-					"raw_arguments":    truncateBridgeDebugText(arguments, 400),
-					"normalized_args":  truncateBridgeDebugText(normalized, 400),
-					"parsed_args":      truncateBridgeDebugText(mustJSONString(args), 400),
-					"normalized_op":    truncateBridgeDebugText(mustJSONString(op), 400),
-					"normalized_input": truncateBridgeDebugText(input, 400),
-				})
-				return input
-			}
-			if looksLikePatchText(normalized) {
-				return normalizeApplyPatchText(normalized)
-			}
-			return mustJSONString(map[string]any{"operation": op})
-		}
-		if strings.EqualFold(toolName, "shell") {
-			return mustJSONString(normalizeShellArgumentMapForResponse(parseToolArgsMapString(normalized)))
-		}
-		return normalized
-	}
+	streamAdapter := proxyCompatibilityAdapters.Stream
 	var latestUsage map[string]any
+	var latestTimings map[string]any
 	lifecycleStarted := false
 	messageStarted := false
 	messageOutputIndex := -1
 	commentaryStarted := false
 	commentaryOutputIndex := -1
+	lastProgressCommentary := ""
 	reasoningStarted := false
 	reasoningOutputIndex := -1
 	reasoningItemID := ""
 	sequence := 0
-	var startToolStateIfReady func(state *toolState)
+	choiceState := newAccumulatedChoiceState(0)
+	frameSummaries := make([]QwenStreamFrameTraceSummary, 0, 32)
+	var startToolStateIfReady func(state *StreamToolCallState)
+	var finalizeToolCallPhase func()
 
 	writeEvent := func(eventType string, payload map[string]any) {
 		if _, ok := payload["type"]; !ok {
@@ -9756,42 +11703,31 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		_, _ = w.Write([]byte("data: " + string(data) + "\n\n"))
 		flusher.Flush()
 	}
-	startToolStateIfReady = func(state *toolState) {
-		if state == nil || state.exposed || !shouldExposeToolState(state) {
+	writeCanonicalStreamEvent := func(event StreamEvent) {
+		writeCanonicalResponseStreamEvent(writeEvent, event)
+	}
+	startToolStateIfReady = func(state *StreamToolCallState) {
+		if state == nil || state.Exposed || !streamAdapter.ShouldExposeToolCall(state) {
 			return
 		}
-		state.outputIndex = nextOutputIndex
-		state.exposed = true
-		arguments := "{}"
-		toolName := canonicalToolName(state.name)
-		if strings.EqualFold(toolName, "shell") {
-			arguments = mustJSONString(normalizeShellArgumentMapForResponse(parseToolArgsMapString(normalizePossiblyMixedToolArguments(state.argsBuffer.String()))))
+		if planOutputRequired && strings.EqualFold(streamAdapter.CanonicalToolName(state.Name), "apply_patch") {
+			return
 		}
-		item := map[string]any{
-			"id":        state.itemID,
-			"type":      "function_call",
-			"call_id":   state.callID,
-			"name":      toolName,
-			"status":    "in_progress",
-			"arguments": arguments,
-		}
-		if server, subtool, ok := parseMCPToolName(toolName); ok {
-			item["name"] = buildMCPToolName(server, subtool)
-		}
-		if strings.EqualFold(toolName, "apply_patch") {
-			item = map[string]any{
-				"id":      state.itemID,
-				"type":    "custom_tool_call",
-				"call_id": state.callID,
-				"name":    "apply_patch",
-				"status":  "in_progress",
+		if planOutputRequired && strings.EqualFold(streamAdapter.CanonicalToolName(state.Name), "shell") {
+			rawArgs := strings.TrimSpace(normalizePossiblyMixedToolArguments(state.ArgsBuilder.String()))
+			if rawArgs == "" || !gjson.Valid(rawArgs) {
+				return
+			}
+			args := parseToolArgsMapString(streamAdapter.CanonicalToolArguments(state, state.ArgsBuilder.String()))
+			if len(args) == 0 || shellToolArgumentsLookLikePlainQuestion(args) {
+				return
 			}
 		}
-		writeEvent("response.output_item.added", map[string]any{
-			"response_id":  respID,
-			"output_index": state.outputIndex,
-			"item":         item,
-		})
+		state.OutputIndex = nextOutputIndex
+		state.Exposed = true
+		if event, ok := streamAdapter.BuildToolItemAddedEvent(state, respID); ok {
+			writeCanonicalStreamEvent(event)
+		}
 		nextOutputIndex++
 	}
 	writeReasoningSummaryPartAdded := func() {
@@ -9938,6 +11874,65 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		writeReasoningSummaryPartAdded()
 		reasoningStarted = true
 	}
+	emitCommentaryDelta := func(text string) {
+		text = strings.TrimSpace(cleanFallbackInput(text, ""))
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		startCommentaryIfNeeded()
+		commentaryText.WriteString(text)
+		writeEvent("response.output_text.delta", map[string]any{
+			"response_id":   respID,
+			"item_id":       commentaryMsgID,
+			"output_index":  commentaryOutputIndex,
+			"content_index": 0,
+			"delta":         text,
+		})
+	}
+	emitWorkflowProgressCommentary := func(latestToolName string, finalizing bool) {
+		progress := buildWorkflowProgressCommentary(planOutputRequired, nativeQuestionRequired, workflowState, latestToolName, finalizing)
+		progress = strings.TrimSpace(progress)
+		if progress == "" || progress == lastProgressCommentary {
+			return
+		}
+		lastProgressCommentary = progress
+		if commentaryText.Len() > 0 {
+			emitCommentaryDelta("\n" + progress)
+			return
+		}
+		emitCommentaryDelta(progress)
+	}
+	emitFinalDelta := func(text string) {
+		text = strings.TrimSpace(cleanFallbackInput(text, ""))
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		startMessageIfNeeded()
+		finalTextBuilder.WriteString(text)
+		writeEvent("response.output_text.delta", map[string]any{
+			"response_id":   respID,
+			"item_id":       msgID,
+			"output_index":  messageOutputIndex,
+			"content_index": 0,
+			"delta":         text,
+		})
+	}
+	finalizeToolCallPhase = func() {
+		if candidate := finalizeNormalizedToolCallPhase(
+			toolOrder,
+			toolStates,
+			respID,
+			planOutputRequired,
+			streamAdapter,
+			reasoningText.String(),
+			finalTextBuilder.String(),
+			originalReq,
+			writeCanonicalStreamEvent,
+			emitFinalDelta,
+		); strings.TrimSpace(candidate) != "" {
+			blockedPlanMutationText = candidate
+		}
+	}
 
 	scanner := bufio.NewScanner(upstream)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -9956,202 +11951,145 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		if !gjson.Valid(payload) {
 			continue
 		}
-
-		chunkID := strings.TrimSpace(gjson.Get(payload, "id").String())
-		if chunkID != "" && strings.TrimSpace(respID) == "" {
-			if strings.HasPrefix(chunkID, "resp_") {
-				respID = chunkID
-			} else {
-				respID = "resp_" + chunkID
-			}
-		}
-		if created := gjson.Get(payload, "created").Int(); created > 0 && createdAt == 0 {
-			createdAt = created
-		}
-		if chunkModel := strings.TrimSpace(gjson.Get(payload, "model").String()); chunkModel != "" && model == "" {
-			model = chunkModel
-		}
-		if strings.EqualFold(strings.TrimSpace(gjson.Get(payload, "choices.0.finish_reason").String()), "stop") {
-			finishReasonStop = true
-		}
-		if strings.EqualFold(strings.TrimSpace(gjson.Get(payload, "choices.0.finish_reason").String()), "length") {
-			finishReasonLength = true
-		}
-		if usage := gjson.Get(payload, "usage"); usage.Exists() {
-			usageMap := map[string]any{
-				"input_tokens":  usage.Get("prompt_tokens").Int(),
-				"output_tokens": usage.Get("completion_tokens").Int(),
-				"total_tokens":  usage.Get("total_tokens").Int(),
-			}
-			reasoningTokens := usage.Get("completion_tokens_details.reasoning_tokens").Int()
-			if reasoningTokens > 0 {
-				usageMap["output_tokens_details"] = map[string]any{
-					"reasoning_tokens": reasoningTokens,
-				}
-			}
-			cachedTokens := usage.Get("prompt_tokens_details.cached_tokens").Int()
-			if cachedTokens > 0 {
-				usageMap["input_tokens_details"] = map[string]any{
-					"cached_tokens": cachedTokens,
-				}
-			}
-			latestUsage = usageMap
-		}
+		choiceState.addChatCompletionChunk(payload)
+		normalizedFrame := buildQwenNormalizedStreamFrame(normalizeQwenStreamChunk(payload))
 
 		startLifecycleIfNeeded()
 
-		toolCalls := gjson.Get(payload, "choices.0.delta.tool_calls")
-		if toolCalls.IsArray() {
-			for _, tc := range toolCalls.Array() {
-				idx := int(tc.Get("index").Int())
-				state, exists := toolStates[idx]
-				if !exists {
-					callID := strings.TrimSpace(tc.Get("id").String())
-					if callID == "" {
-						callID = fmt.Sprintf("call_%s_%d", respID, idx)
+		for _, normalizedEvent := range normalizedFrame.Events {
+			switch normalizedEvent.Kind {
+			case QwenNormalizedStreamEventMeta:
+				if normalizedFrame.ChunkID != "" && strings.TrimSpace(respID) == "" {
+					if strings.HasPrefix(normalizedFrame.ChunkID, "resp_") {
+						respID = normalizedFrame.ChunkID
+					} else {
+						respID = "resp_" + normalizedFrame.ChunkID
 					}
-					state = &toolState{
-						index:       idx,
-						outputIndex: -1,
-						itemID:      fmt.Sprintf("fc_%s_%d", respID, idx),
-						callID:      callID,
+				}
+				if normalizedFrame.CreatedAt > 0 && createdAt == 0 {
+					createdAt = normalizedFrame.CreatedAt
+				}
+				if normalizedFrame.Model != "" && model == "" {
+					model = normalizedFrame.Model
+				}
+				if normalizedFrame.Usage != nil {
+					latestUsage = normalizedFrame.Usage
+				}
+				if normalizedFrame.Timings != nil {
+					latestTimings = normalizedFrame.Timings
+					if latestUsage == nil {
+						latestUsage = buildResponsesUsageFromTimingMap(normalizedFrame.Timings)
 					}
-					toolStates[idx] = state
-					toolOrder = append(toolOrder, idx)
 				}
-				if id := strings.TrimSpace(tc.Get("id").String()); id != "" {
-					state.callID = id
-				}
-				if name := strings.TrimSpace(tc.Get("function.name").String()); name != "" {
-					state.name = name
-					if isPlanMode && strings.EqualFold(canonicalToolName(state.name), "apply_patch") {
-						if existing := toolStates[idx]; existing != nil {
-							existing.name = name
+			case QwenNormalizedStreamEventToolCallDelta:
+				applyNormalizedToolCallDelta(
+					normalizedEvent,
+					toolStates,
+					&toolOrder,
+					respID,
+					planOutputRequired,
+					workflowState,
+					streamAdapter,
+					startToolStateIfReady,
+					writeCanonicalStreamEvent,
+					func(progress string) {
+						if commentaryText.Len() > 0 {
+							emitCommentaryDelta("\n" + progress)
+						} else {
+							emitCommentaryDelta(progress)
 						}
-					}
+					},
+					&lastProgressCommentary,
+				)
+			case QwenNormalizedStreamEventFinish:
+				if strings.EqualFold(normalizedFrame.FinishReason, "stop") {
+					finishReasonStop = true
 				}
-				startToolStateIfReady(state)
-				if argDelta := tc.Get("function.arguments").String(); argDelta != "" {
-					state.argsBuffer.WriteString(argDelta)
-					startToolStateIfReady(state)
-					if isPlanMode && strings.EqualFold(canonicalToolName(state.name), "apply_patch") {
-						continue
-					}
-					if state.exposed && !strings.EqualFold(canonicalToolName(state.name), "apply_patch") && !strings.HasPrefix(canonicalToolName(state.name), "mcp__") {
-						writeEvent("response.function_call_arguments.delta", map[string]any{
-							"response_id": respID,
-							"item_id":     state.itemID,
-							"delta":       canonicalToolArguments(state, state.argsBuffer.String()),
-						})
-					}
+				if strings.EqualFold(normalizedFrame.FinishReason, "length") {
+					finishReasonLength = true
 				}
 			}
 		}
 
-		delta := gjson.Get(payload, "choices.0.delta.content").String()
-		reasoningDelta := ""
-		if delta == "" {
-			reasoningDelta = gjson.Get(payload, "choices.0.delta.reasoning_content").String()
-			if reasoningDelta == "" {
-				reasoningDelta = gjson.Get(payload, "choices.0.delta.reasoning").String()
-			}
-		}
-		if delta == "" && reasoningDelta == "" {
-			// finalize tool-call phase if upstream says so
-			if strings.EqualFold(strings.TrimSpace(gjson.Get(payload, "choices.0.finish_reason").String()), "tool_calls") {
-				for _, toolIdx := range toolOrder {
-					state := toolStates[toolIdx]
-					if state == nil {
-						continue
-					}
-					arguments := canonicalToolArguments(state, state.argsBuffer.String())
-					if strings.EqualFold(canonicalToolName(state.name), "shell") && !shellToolArgumentsValid(parseToolArgsMapString(arguments)) {
-						if strings.TrimSpace(fullText.String()) == "" {
-							fullText.WriteString(shellValidationWarningPrefix + " arguments were empty. Provide a non-empty `command` string or `commands` array and retry.")
-						}
-						continue
-					}
-					if isPlanMode && strings.EqualFold(canonicalToolName(state.name), "apply_patch") {
-						args := parseToolArgsMapString(normalizePossiblyMixedToolArguments(state.argsBuffer.String()))
-						if op, ok := normalizeApplyPatchOperation(selectApplyPatchOperation(args)).(map[string]any); ok {
-							if candidate := extractApplyPatchPlanText(op); strings.TrimSpace(candidate) != "" {
-								blockedPlanMutationText = candidate
-							}
-						}
-						continue
-					}
-					startToolStateIfReady(state)
-					if !strings.EqualFold(canonicalToolName(state.name), "apply_patch") && !strings.HasPrefix(canonicalToolName(state.name), "mcp__") {
-						writeEvent("response.function_call_arguments.done", map[string]any{
-							"response_id": respID,
-							"item_id":     state.itemID,
-							"name":        state.name,
-							"call_id":     state.callID,
-							"arguments":   arguments,
-						})
-					}
-					writeEvent("response.output_item.done", map[string]any{
-						"response_id":  respID,
-						"output_index": state.outputIndex,
-						"item":         buildToolOutputItem(state, arguments),
-					})
-				}
+		frameDecision := decideQwenStreamFramePresentation(normalizedFrame, workflowState, planOutputRequired, len(toolOrder))
+		frameSummaries = append(frameSummaries, summarizeQwenNormalizedStreamFrame(normalizedFrame, frameDecision))
+		if frameDecision.Route == QwenStreamFrameRouteNone {
+			if frameDecision.ShouldFinalizeToolCalls {
+				finalizeToolCallPhase()
 			}
 			continue
 		}
 
-		if reasoningDelta != "" {
+		if frameDecision.Route == QwenStreamFrameRouteReasoning {
 			reasoningSeen = true
 			startReasoningIfNeeded()
-			startCommentaryIfNeeded()
-			previousCommentaryPreview := buildReasoningCommentaryPreview(reasoningText.String())
-			reasoningText.WriteString(reasoningDelta)
-			nextCommentaryPreview := buildReasoningCommentaryPreview(reasoningText.String())
+			reasoningText.WriteString(frameDecision.Text)
+			reasoningSummaryText.WriteString(frameDecision.Text)
 			writeEvent("response.reasoning_summary_text.delta", map[string]any{
 				"response_id":   respID,
 				"item_id":       reasoningItemID,
 				"output_index":  reasoningOutputIndex,
 				"summary_index": 0,
-				"delta":         reasoningDelta,
+				"delta":         frameDecision.Text,
 			})
-			commentaryDelta := nextCommentaryPreview
-			if previousCommentaryPreview != "" && strings.HasPrefix(nextCommentaryPreview, previousCommentaryPreview) {
-				commentaryDelta = strings.TrimPrefix(nextCommentaryPreview, previousCommentaryPreview)
+			if commentaryText.Len() == 0 {
+				latestToolName := ""
+				if len(toolOrder) > 0 {
+					if state := toolStates[toolOrder[len(toolOrder)-1]]; state != nil {
+						latestToolName = state.Name
+					}
+				}
+				emitWorkflowProgressCommentary(latestToolName, false)
 			}
-			if commentaryDelta != "" {
-				writeEvent("response.output_text.delta", map[string]any{
-					"response_id":   respID,
-					"item_id":       commentaryMsgID,
-					"output_index":  commentaryOutputIndex,
-					"content_index": 0,
-					"delta":         commentaryDelta,
-				})
+			if frameDecision.ShouldFinalizeToolCalls {
+				finalizeToolCallPhase()
 			}
 			continue
 		}
-		fullText.WriteString(delta)
-		if !isPlanMode {
-			startMessageIfNeeded()
-			writeEvent("response.output_text.delta", map[string]any{
-				"response_id":   respID,
-				"item_id":       msgID,
-				"output_index":  messageOutputIndex,
-				"content_index": 0,
-				"delta":         delta,
-			})
+
+		delta := frameDecision.Text
+		if frameDecision.Route == QwenStreamFrameRouteFinal {
+			finalTextBuilder.WriteString(delta)
+		} else if frameDecision.Route == QwenStreamFrameRouteCommentary {
+			emitCommentaryDelta(delta)
+		} else {
+			emitFinalDelta(delta)
+		}
+		if frameDecision.ShouldFinalizeToolCalls {
+			finalizeToolCallPhase()
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		choiceState.markTruncated()
 		return err
 	}
 
 	startLifecycleIfNeeded()
+	normalizedArtifacts := choiceState.buildNormalizedArtifacts(buildAccumulatedAssistantMessage(choiceState), planOutputRequired, nativeQuestionRequired)
+	normalizedView := buildNormalizedArtifactView(normalizedArtifacts)
+	addQwenNormalizedStreamCaptureStage(ctx, frameSummaries, normalizedView)
 
-	finalText := strings.TrimSpace(fullText.String())
+	finalText := strings.TrimSpace(finalTextBuilder.String())
+	commentaryTextValue := strings.TrimSpace(commentaryText.String())
 	reasoningDoneText := strings.TrimSpace(reasoningText.String())
-	commentaryReasoningText := buildReasoningCommentaryPreview(reasoningDoneText)
+	reasoningSummaryDoneText := reasoningSummaryText.String()
+	finalText = strings.TrimSpace(cleanFallbackInput(finalText, ""))
+	commentaryTextValue = strings.TrimSpace(cleanFallbackInput(commentaryTextValue, ""))
+	reasoningDoneText = strings.TrimSpace(cleanFallbackInput(reasoningDoneText, ""))
+	reasoningSummaryDoneText = strings.TrimSpace(cleanFallbackInput(reasoningSummaryDoneText, ""))
+	if normalizedView.PreferredThinking != nil {
+		if normalizedText, ok := normalizedView.PreferredThinking.Payload["text"].(string); ok && strings.TrimSpace(normalizedText) != "" {
+			reasoningDoneText = normalizedText
+			reasoningSummaryDoneText = normalizedText
+		}
+		if wellFormed, ok := normalizedView.PreferredThinking.Payload["well_formed"].(bool); ok && !wellFormed {
+			reasoningDoneText = ""
+			reasoningSummaryDoneText = ""
+		}
+	}
+	commentaryReasoningText := proxyCompatibilityAdapters.Reasoning.BuildCommentaryPreview(reasoningDoneText)
 	promotedReasoning := false
-	if !isPlanMode && strings.TrimSpace(finalText) == "" && reasoningDoneText != "" && len(toolOrder) == 0 {
+	if !planOutputRequired && strings.TrimSpace(finalText) == "" && reasoningDoneText != "" && len(toolOrder) == 0 {
 		// Codex clients may hide reasoning lanes. If upstream produced reasoning-only output,
 		// surface it on the normal output_text lane to avoid empty assistant messages.
 		promotedReasoning = true
@@ -10160,17 +12098,18 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			finalText = reasoningDoneText
 		}
 		reasoningDoneText = ""
+		reasoningSummaryDoneText = ""
 		commentaryReasoningText = ""
-		startMessageIfNeeded()
-		writeEvent("response.output_text.delta", map[string]any{
-			"response_id":   respID,
-			"item_id":       msgID,
-			"output_index":  messageOutputIndex,
-			"content_index": 0,
-			"delta":         finalText,
-		})
+		finalTextBuilder.Reset()
+		emitFinalDelta(finalText)
 	}
-	if isPlanMode {
+	if planOutputRequired {
+		if normalizedView.PreferredPlan != nil {
+			if planText, ok := normalizedView.PreferredPlan.Payload["text"].(string); ok && strings.TrimSpace(planText) != "" {
+				finalText = planText
+			}
+		}
+		finalText = sanitizeStructuredPlanText(finalText)
 		if strings.TrimSpace(finalText) == "" && strings.TrimSpace(blockedPlanMutationText) != "" {
 			finalText = blockedPlanMutationText
 		}
@@ -10182,18 +12121,21 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 					finalText = planModeLengthDiagnosticText()
 				}
 			} else {
-				finalText = enforcedPlanModeText()
+				finalText = derivePlanModeFallbackText(
+					finalText,
+					blockedPlanMutationText,
+					reasoningDoneText,
+					reasoningSummaryDoneText,
+					commentaryTextValue,
+					commentaryReasoningText,
+				)
 			}
 		}
 		if strings.TrimSpace(finalText) != "" {
 			finalText = ensureProposedPlanWrapper(finalText)
-			writeEvent("response.output_text.delta", map[string]any{
-				"response_id":   respID,
-				"item_id":       msgID,
-				"output_index":  0,
-				"content_index": 0,
-				"delta":         finalText,
-			})
+			finalTextBuilder.Reset()
+			finalTextBuilder.WriteString(finalText)
+			emitFinalDelta(finalText)
 		}
 	}
 	visibleToolCount := 0
@@ -10202,17 +12144,68 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		if state == nil {
 			continue
 		}
-		if !state.exposed {
+		if !state.Exposed {
 			continue
 		}
-		if isPlanMode && strings.EqualFold(canonicalToolName(state.name), "apply_patch") {
+		if planOutputRequired && strings.EqualFold(streamAdapter.CanonicalToolName(state.Name), "apply_patch") {
 			continue
 		}
 		visibleToolCount++
 	}
-	shouldEmitMessage := visibleToolCount == 0 || strings.TrimSpace(finalText) != "" || isPlanMode
+	if !planOutputRequired && visibleToolCount == 0 && shouldRecoverVerificationShellCall(workflowState, verificationShellArgs, finalText, reasoningDoneText) {
+		recoveredState := &StreamToolCallState{
+			Index:       len(toolOrder),
+			OutputIndex: -1,
+			ItemID:      fmt.Sprintf("fc_%s_%d", respID, len(toolOrder)),
+			CallID:      fmt.Sprintf("call_%s_recover_verify_shell", respID),
+			Name:        "shell",
+		}
+		recoveredState.ArgsBuilder.WriteString(strings.TrimSpace(verificationShellArgs))
+		toolStates[recoveredState.Index] = recoveredState
+		toolOrder = append(toolOrder, recoveredState.Index)
+		startToolStateIfReady(recoveredState)
+		if event, ok := streamAdapter.BuildToolArgsDoneEvent(recoveredState, respID); ok {
+			writeCanonicalStreamEvent(event)
+		}
+		if event, ok := streamAdapter.BuildToolItemDoneEvent(recoveredState, respID); ok {
+			writeCanonicalStreamEvent(event)
+		}
+		finalTextBuilder.Reset()
+		commentaryText.Reset()
+		reasoningText.Reset()
+		reasoningSummaryText.Reset()
+		finalText = ""
+		commentaryTextValue = ""
+		reasoningDoneText = ""
+		reasoningSummaryDoneText = ""
+		commentaryReasoningText = ""
+		visibleToolCount = 1
+	}
+	if !planOutputRequired && visibleToolCount == 0 && strings.TrimSpace(finalText) == "" && strings.TrimSpace(reasoningDoneText) == "" && finishReasonStop {
+		finalText = emptyAssistantOutputFallbackText
+	}
+	if normalizedView.PreferredError != nil && strings.EqualFold(fmt.Sprintf("%v", normalizedView.PreferredError.Payload["kind"]), string(MessageErrorUpstreamMalformedTurn)) && visibleToolCount == 0 && strings.TrimSpace(finalText) == "" {
+		finalText = emptyAssistantOutputFallbackText
+	}
+	if visibleToolCount == 0 && shouldRewriteWeakFinalWorkflowText(workflowState, finalText) {
+		finalText = buildWorkflowFinalExplanation(workflowState, finalText)
+	}
+	if visibleToolCount == 0 && workflowState.FinalAnswerSafe && strings.TrimSpace(finalText) != "" {
+		emitWorkflowProgressCommentary("", true)
+		commentaryTextValue = strings.TrimSpace(commentaryText.String())
+	}
+	finalText = strings.TrimSpace(cleanFallbackInput(finalText, ""))
+	if !planOutputRequired && visibleToolCount == 0 && strings.TrimSpace(finalText) == "" && strings.TrimSpace(reasoningDoneText) == "" && finishReasonStop {
+		finalText = emptyAssistantOutputFallbackText
+	}
+	emitReasoningCommentary := visibleToolCount == 0
+	shouldEmitMessage := visibleToolCount == 0 || (strings.TrimSpace(finalText) != "" && finishReasonStop) || planOutputRequired
 	if shouldEmitMessage {
 		startMessageIfNeeded()
+	}
+	if nativeQuestionRequired && normalizedView.PreferredQuestion != nil && commentaryText.Len() == 0 {
+		emitWorkflowProgressCommentary("", false)
+		commentaryTextValue = strings.TrimSpace(commentaryText.String())
 	}
 	if reasoningSeen && !promotedReasoning {
 		startReasoningIfNeeded()
@@ -10221,9 +12214,9 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			"item_id":       reasoningItemID,
 			"output_index":  reasoningOutputIndex,
 			"summary_index": 0,
-			"text":          reasoningDoneText,
+			"text":          reasoningSummaryDoneText,
 		})
-		writeReasoningSummaryPartDone(reasoningDoneText)
+		writeReasoningSummaryPartDone(reasoningSummaryDoneText)
 		reasoningDoneItem := map[string]any{
 			"id":     reasoningItemID,
 			"type":   "reasoning",
@@ -10231,7 +12224,7 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			"summary": []any{
 				map[string]any{
 					"type": "summary_text",
-					"text": reasoningDoneText,
+					"text": reasoningSummaryDoneText,
 				},
 			},
 		}
@@ -10245,20 +12238,25 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		})
 	}
 	var commentaryItem map[string]any
-	if reasoningSeen && commentaryStarted && !promotedReasoning {
+	if emitReasoningCommentary && !promotedReasoning && strings.TrimSpace(commentaryTextValue) == "" && strings.TrimSpace(commentaryReasoningText) != "" {
+		emitCommentaryDelta(commentaryReasoningText)
+		commentaryTextValue = strings.TrimSpace(commentaryText.String())
+	}
+	if commentaryStarted {
+		startCommentaryIfNeeded()
 		writeEvent("response.output_text.done", map[string]any{
 			"response_id":   respID,
 			"item_id":       commentaryMsgID,
 			"output_index":  commentaryOutputIndex,
 			"content_index": 0,
-			"text":          commentaryReasoningText,
+			"text":          commentaryTextValue,
 		})
 		writeEvent("response.content_part.done", map[string]any{
 			"response_id":   respID,
 			"item_id":       commentaryMsgID,
 			"output_index":  commentaryOutputIndex,
 			"content_index": 0,
-			"part":          map[string]any{"type": "output_text", "text": commentaryReasoningText},
+			"part":          map[string]any{"type": "output_text", "text": commentaryTextValue},
 		})
 		commentaryItem = map[string]any{
 			"id":      commentaryMsgID,
@@ -10266,7 +12264,7 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			"role":    "assistant",
 			"channel": "commentary",
 			"content": []any{
-				map[string]any{"type": "output_text", "text": commentaryReasoningText},
+				map[string]any{"type": "output_text", "text": commentaryTextValue},
 			},
 		}
 		writeEvent("response.output_item.done", map[string]any{
@@ -10277,15 +12275,6 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 	}
 	var finalItem map[string]any
 	if shouldEmitMessage {
-		if isPlanMode && strings.TrimSpace(finalText) != "" {
-			writeEvent("response.output_text.delta", map[string]any{
-				"response_id":   respID,
-				"item_id":       msgID,
-				"output_index":  messageOutputIndex,
-				"content_index": 0,
-				"delta":         finalText,
-			})
-		}
 		writeEvent("response.output_text.done", map[string]any{
 			"response_id":   respID,
 			"item_id":       msgID,
@@ -10306,7 +12295,7 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			"type": "message",
 			"role": "assistant",
 			"channel": func() string {
-				if visibleToolCount > 0 {
+				if visibleToolCount > 0 || (commentaryStarted && strings.TrimSpace(finalText) == "") {
 					return "commentary"
 				}
 				return "final"
@@ -10351,14 +12340,14 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 			maxOutputIndex = commentaryOutputIndex
 		}
 	}
-	if reasoningSeen && !promotedReasoning && reasoningOutputIndex >= 0 && reasoningDoneText != "" {
+	if reasoningSeen && !promotedReasoning && reasoningOutputIndex >= 0 && reasoningSummaryDoneText != "" {
 		reasoningItem := map[string]any{
 			"id":   reasoningItemID,
 			"type": "reasoning",
 			"summary": []any{
 				map[string]any{
 					"type": "summary_text",
-					"text": reasoningDoneText,
+					"text": reasoningSummaryDoneText,
 				},
 			},
 		}
@@ -10375,15 +12364,15 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 		if state == nil {
 			continue
 		}
-		if !state.exposed {
+		if !state.Exposed {
 			continue
 		}
-		if isPlanMode && strings.EqualFold(canonicalToolName(state.name), "apply_patch") {
+		if planOutputRequired && strings.EqualFold(streamAdapter.CanonicalToolName(state.Name), "apply_patch") {
 			continue
 		}
-		outputByIndex[state.outputIndex] = buildToolOutputItem(state, normalizePossiblyMixedToolArguments(state.argsBuffer.String()))
-		if state.outputIndex > maxOutputIndex {
-			maxOutputIndex = state.outputIndex
+		outputByIndex[state.OutputIndex] = streamAdapter.BuildToolOutputItem(state, normalizePossiblyMixedToolArguments(state.ArgsBuilder.String()))
+		if state.OutputIndex > maxOutputIndex {
+			maxOutputIndex = state.OutputIndex
 		}
 	}
 	orderedOutput := make([]any, 0, maxOutputIndex+1)
@@ -10396,7 +12385,20 @@ func writeResponsesStreamFromChatSSE(w http.ResponseWriter, upstream io.Reader, 
 	if latestUsage != nil {
 		fullResponse["usage"] = latestUsage
 	}
-	writeEvent("response.completed", map[string]any{"response": fullResponse})
+	if latestTimings != nil {
+		fullResponse["timings"] = latestTimings
+	}
+	if event, ok := streamAdapter.BuildResponseCompletedEvent(fullResponse); ok {
+		writeCanonicalStreamEvent(event)
+	} else {
+		writeEvent("response.completed", map[string]any{"response": fullResponse})
+	}
+	appendProxyStageTrace("stream.chat_sse_to_responses.done", map[string]any{
+		"response_status": fullResponse["status"],
+		"reasoning_seen":  reasoningSeen,
+		"tool_count":      len(toolOrder),
+		"final_text_len":  len(strings.TrimSpace(finalText)),
+	})
 	_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	flusher.Flush()
 	return nil
@@ -10462,8 +12464,8 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 		responsesRequestedStream := gjson.GetBytes(bodyBytes, "stream").Bool() || strings.Contains(strings.ToLower(strings.TrimSpace(r.Header.Get("Accept"))), "text/event-stream")
 		var initialReq map[string]any
 		_ = json.Unmarshal(bodyBytes, &initialReq)
-		initialMode := extractResponsesRequestMode(initialReq)
-		if initialMode == "" && rawResponsesBodyLooksLikePlanMode(bodyBytes) {
+		initialMode := responsesRequestContractMode(initialReq)
+		if initialMode == "default" && rawResponsesBodyLooksLikePlanMode(bodyBytes) {
 			initialMode = "plan"
 		}
 		shellFirstBeforePatch := requestWantsShellInspectionBeforeApplyPatch(initialReq)
@@ -10551,6 +12553,8 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 			isPlanModeRequested := extractResponsesRequestModeFromBody(responsesReq) == "plan"
 			codexManagedPlanMode := isCodexManagedPlanModeFromResponsesBody(responsesReq)
 			enforceProxyPlanMode := isPlanModeRequested && !codexManagedPlanMode
+			nativeQuestionRequired := nativeQuestionOutputRequiredFromRequestBody(responsesReq)
+			structuredPlanRequired := structuredPlanOutputRequiredFromRequestBody(responsesReq)
 			resolvedWebSearchItems := make([]any, 0, 4)
 			webSearchContinuations := 0
 			if isApplyPatchIntent && !enforceProxyPlanMode {
@@ -10580,13 +12584,15 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 				if err != nil {
 					return 0, nil, nil, nil, fmt.Errorf("invalid responses request: %w", err)
 				}
-				translated, err = sjson.SetBytes(translated, "stream", false)
+				upstreamStreamMode := nativeQuestionRequired || structuredPlanRequired
+				translated, err = sjson.SetBytes(translated, "stream", upstreamStreamMode)
 				if err != nil {
-					return 0, nil, nil, nil, fmt.Errorf("error forcing non-stream bridge request: %w", err)
+					return 0, nil, nil, nil, fmt.Errorf("error forcing bridge request stream mode: %w", err)
 				}
 				logTextTransform(pm.transformLogger, modelID, "bridge_request_controls", summarizeResponsesBridgeControls(responsesReq))
 				logTextTransform(pm.transformLogger, modelID, "bridge_sampling_controls", summarizeBridgeSamplingControls(translated))
 				logBodyTransform(pm.transformLogger, modelID, "bridge_translate_responses_to_chat", responsesReq, translated)
+				addCaptureStage(r.Context(), "bridge.chat_completions_request", translated)
 				if strings.Contains(strings.ToLower(string(responsesReq)), "apply_patch") {
 					appendApplyPatchTrace("bridge.chat_request", map[string]any{
 						"model_id": modelID,
@@ -10616,8 +12622,19 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 					lastCode = rr.Code
 					lastHeader = rr.Header()
 					lastBody = rr.Body.Bytes()
+					addCaptureStage(r.Context(), "bridge.chat_completions_response", lastBody)
 					if rr.Code >= 200 && rr.Code < 300 {
-						if msg := gjson.GetBytes(lastBody, "choices.0.message"); msg.Exists() {
+						translatedUpstreamBody := lastBody
+						if upstreamStreamMode {
+							if collapsedBody, _, collapseErr := collapseChatCompletionStreamToFinalBody(bytes.NewReader(lastBody)); collapseErr != nil {
+								lastErr = collapseErr
+								logTextTransform(pm.transformLogger, modelID, "bridge_upstream_retry", fmt.Sprintf("class=stream_collapse_error attempt=%d/%d error=%v", attempt, maxBridgeAttempts, collapseErr))
+								continue
+							} else {
+								translatedUpstreamBody = collapsedBody
+							}
+						}
+						if msg := gjson.GetBytes(translatedUpstreamBody, "choices.0.message"); msg.Exists() {
 							toolSummary := summarizeChatCompletionToolCalls(lastBody)
 							if strings.Contains(strings.ToLower(toolSummary), "apply_patch") {
 								appendApplyPatchTrace("upstream.chat_response", map[string]any{
@@ -10630,19 +12647,22 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 							}
 						}
 						hasPriorToolOutput := requestContainsAnyToolOutput(bodyBytes)
+						hasPriorApplyPatchOutput := requestContainsApplyPatchToolOutput(bodyBytes)
 						applyPatchPathHint := strings.TrimSpace(extractApplyPatchPathHintFromResponsesRequestBody(bodyBytes))
 						applyPatchContentHint := strings.TrimSpace(extractApplyPatchContentHintFromResponsesRequestBody(bodyBytes))
 						applyPatchTypeHint := strings.TrimSpace(extractApplyPatchTypeHintFromResponsesRequestBody(bodyBytes))
-						if hasPriorToolOutput {
+						if hasPriorToolOutput && hasPriorApplyPatchOutput {
 							applyPatchPathHint = ""
 							applyPatchContentHint = ""
 							applyPatchTypeHint = ""
 						}
-						out, err := translateChatCompletionToResponsesResponse(lastBody, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint)
+						workflowState, verificationShellArgs := extractWorkflowRecoveryContextFromRequestBody(responsesReq)
+						out, err := translateChatCompletionToResponsesResponseWithWorkflow(translatedUpstreamBody, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint, workflowState, verificationShellArgs)
 						if err == nil {
 							if rewritten, changed, rewriteErr := rewriteResponsesToolCallPayload(out, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint); rewriteErr == nil && changed {
 								out = rewritten
 							}
+							out = recoverNativeQuestionResponseIfRequired(out, translatedUpstreamBody, responsesReq)
 							if !hasPriorToolOutput && requestWantsShellInspectionBeforeApplyPatch(initialReq) && responseContainsApplyPatchCall(out) {
 								targetPath := applyPatchPathHint
 								if strings.TrimSpace(targetPath) == "" {
@@ -10654,10 +12674,24 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 							}
 							if hasPriorToolOutput {
 								if exactReply := extractExactFinalReplyHintFromRequestBody(responsesReq); exactReply != "" {
-									out = enforceExactFinalReplyHint(out, exactReply)
+									forceExactReply := workflowState.FinalAnswerSafe && len(workflowState.PendingToolNames) == 0
+									out = enforceExactFinalReplyHint(out, exactReply, forceExactReply)
 								}
 							}
 							if shouldResolveWebSearchLocally {
+								if shouldRetryMissingWebSearchCall(initialReq, translated, translatedUpstreamBody, out, workflowState) && webSearchContinuations < maxBridgeAttempts {
+									webSearchContinuations++
+									var retryReq map[string]any
+									if err := json.Unmarshal(responsesReq, &retryReq); err == nil {
+										appendMissingWebSearchRecoveryInstruction(retryReq)
+										appendEmptyPostToolRecoveryInstruction(retryReq)
+										if mutated, marshalErr := json.Marshal(retryReq); marshalErr == nil {
+											responsesReq = mutated
+											logTextTransform(pm.transformLogger, modelID, "bridge_web_search_retry", fmt.Sprintf("attempt=%d/%d class=missing_tool_call", webSearchContinuations, maxBridgeAttempts))
+											continue
+										}
+									}
+								}
 								if searchCall, ok := extractPendingBridgeWebSearchCall(out); ok && webSearchContinuations < maxBridgeAttempts {
 									webSearchContinuations++
 									callID := strings.TrimSpace(fmt.Sprintf("%v", searchCall["call_id"]))
@@ -10695,6 +12729,7 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 									"summary":  summarizeApplyPatchResponsesOutput(out),
 								})
 							}
+							addCaptureStage(r.Context(), "bridge.responses_output", out)
 							if isApplyPatchIntent && !enforceProxyPlanMode && !(shellFirstBeforePatch && !hasPriorToolOutput) {
 								valid, reasonCode, sampledArgs := evaluateApplyPatchOutput(out)
 								if !valid {
@@ -10791,7 +12826,6 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 				return nil
 			}
 
-			isPlanModeRequested := extractResponsesRequestModeFromBody(bodyBytes) == "plan"
 			codexManagedPlanMode := isCodexManagedPlanModeFromResponsesBody(bodyBytes)
 			if responsesRequestedStream {
 				translated, err := translateResponsesToChatCompletionsRequest(bodyBytes)
@@ -10826,8 +12860,12 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 
 				pr, pw := io.Pipe()
 				upstreamMon := newSSEMonitor(r.Context(), modelID, "upstream_sse", "in", bridgeReq.URL.Path)
+				var upstreamStreamCapture bytes.Buffer
 				pwWriter := newPipeResponseWriter(pw)
-				teePW := &teeResponseWriter{w: pwWriter, onWrite: upstreamMon.writeChunk}
+				teePW := &teeResponseWriter{w: pwWriter, onWrite: func(chunk []byte) {
+					upstreamMon.writeChunk(chunk)
+					_, _ = upstreamStreamCapture.Write(chunk)
+				}}
 
 				errCh := make(chan error, 1)
 				go func() {
@@ -10865,9 +12903,27 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 				}
 
 				outMon := newSSEMonitor(r.Context(), modelID, "outgoing_sse", "out", r.URL.Path)
-				teeOut := &teeResponseWriter{w: w, onWrite: outMon.writeChunk}
-				err = writeResponsesStreamFromChatSSE(teeOut, pr, isPlanModeRequested, requestedReasoningSummary)
+				var responsesStreamCapture bytes.Buffer
+				commitStreamCaptureStages := func(upstreamBody, responsesBody []byte) {
+					if len(upstreamBody) > 0 {
+						addCaptureStage(r.Context(), "bridge.chat_completions_response", upstreamBody)
+					}
+					if len(responsesBody) > 0 {
+						addCaptureStage(r.Context(), "bridge.responses_output", responsesBody)
+					}
+				}
+				teeOut := &teeResponseWriter{w: w, onWrite: func(chunk []byte) {
+					outMon.writeChunk(chunk)
+					_, _ = responsesStreamCapture.Write(chunk)
+				}}
+				workflowState, verificationShellArgs := extractWorkflowRecoveryContextFromRequestBody(bodyBytes)
+				planOutputRequired := structuredPlanOutputRequiredFromRequestBody(bodyBytes)
+				nativeQuestionRequired := nativeQuestionOutputRequiredFromRequestBody(bodyBytes)
+				var originalReq map[string]any
+				_ = json.Unmarshal(bodyBytes, &originalReq)
+				err = writeResponsesStreamFromChatSSEWithWorkflowAndContext(r.Context(), teeOut, pr, planOutputRequired, nativeQuestionRequired, requestedReasoningSummary, workflowState, verificationShellArgs, originalReq)
 				<-errCh
+				commitStreamCaptureStages(upstreamStreamCapture.Bytes(), responsesStreamCapture.Bytes())
 				return err
 			}
 
@@ -10887,7 +12943,12 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 			}
 			outMon := newSSEMonitor(r.Context(), modelID, "outgoing_sse", "out", r.URL.Path)
 			teeOut := &teeResponseWriter{w: w, onWrite: outMon.writeChunk}
-			return writeResponsesStreamFromChatSSE(teeOut, bytes.NewReader(streamBody), isPlanModeRequested, requestedReasoningSummary)
+			workflowState, verificationShellArgs := extractWorkflowRecoveryContextFromRequestBody(bodyBytes)
+			planOutputRequired := structuredPlanOutputRequiredFromRequestBody(bodyBytes)
+			nativeQuestionRequired := nativeQuestionOutputRequiredFromRequestBody(bodyBytes)
+			var originalReq map[string]any
+			_ = json.Unmarshal(bodyBytes, &originalReq)
+			return writeResponsesStreamFromChatSSEWithWorkflowAndContext(r.Context(), teeOut, bytes.NewReader(streamBody), planOutputRequired, nativeQuestionRequired, requestedReasoningSummary, workflowState, verificationShellArgs, originalReq)
 		}
 
 		status, headers, _, out, err := execResponsesRequest(bodyBytes)
@@ -11080,7 +13141,8 @@ type ProxyManager struct {
 
 	metricsMonitor *metricsMonitor
 
-	processGroups map[string]*ProcessGroup
+	processGroups     map[string]*ProcessGroup
+	lastActiveModelID string
 
 	// shutdown signaling
 	shutdownCtx    context.Context
@@ -11550,6 +13612,30 @@ func (pm *ProxyManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pm.ginEngine.ServeHTTP(w, r)
 }
 
+func (pm *ProxyManager) setLastActiveModelID(modelID string) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return
+	}
+	pm.Lock()
+	pm.lastActiveModelID = modelID
+	pm.Unlock()
+}
+
+func (pm *ProxyManager) lastActiveModelIDSnapshot() string {
+	pm.Lock()
+	id := pm.lastActiveModelID
+	pm.Unlock()
+	return strings.TrimSpace(id)
+}
+
+func (pm *ProxyManager) resolveActiveModelAlias(requestedModel string) (string, bool) {
+	if !pm.config.IsActiveModelAlias(requestedModel) {
+		return "", false
+	}
+	return pm.lastActiveModelIDSnapshot(), true
+}
+
 // StopProcesses acquires a lock and stops all running upstream processes.
 // This is the public method safe for concurrent calls.
 // Unlike Shutdown, this method only stops the processes but doesn't perform
@@ -11714,6 +13800,7 @@ func parseCtxAndFitFromArgs(args []string) (ctxSize int, source string, fitEnabl
 func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 	data := make([]gin.H, 0, len(pm.config.Models))
 	createdTime := time.Now().Unix()
+	seenIDs := make(map[string]struct{}, len(pm.config.Models))
 
 	newRecord := func(modelId string, modelConfig config.ModelConfig) gin.H {
 		record := gin.H{
@@ -11744,16 +13831,42 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 			continue
 		}
 
+		seenIDs[id] = struct{}{}
 		data = append(data, newRecord(id, modelConfig))
 
 		// Include aliases
 		if pm.config.IncludeAliasesInList {
 			for _, alias := range modelConfig.Aliases {
 				if alias := strings.TrimSpace(alias); alias != "" {
+					seenIDs[alias] = struct{}{}
 					data = append(data, newRecord(alias, modelConfig))
 				}
 			}
 		}
+	}
+
+	// Include dynamic "active model" aliases as pseudo-models so clients that
+	// enumerate /v1/models can still select them.
+	for _, alias := range pm.config.UseActiveModelForAliases {
+		alias = strings.TrimSpace(alias)
+		if alias == "" {
+			continue
+		}
+		if _, exists := seenIDs[alias]; exists {
+			continue
+		}
+		seenIDs[alias] = struct{}{}
+		data = append(data, gin.H{
+			"id":       alias,
+			"object":   "model",
+			"created":  createdTime,
+			"owned_by": "llama-swap",
+			"meta": gin.H{
+				"llamaswap": gin.H{
+					"active_model_alias": true,
+				},
+			},
+		})
 	}
 
 	if pm.peerProxy != nil {
@@ -11918,12 +14031,22 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 		return
 	}
 
+	if resolved, matched := pm.resolveActiveModelAlias(requestedModel); matched {
+		if resolved == "" {
+			pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("model '%s' is configured as an active-model alias, but no active model is set yet", requestedModel))
+			return
+		}
+		pm.proxyLogger.Debugf("Resolved active-model alias '%s' -> '%s'", requestedModel, resolved)
+		requestedModel = resolved
+	}
+
 	// Look for a matching local model first
 	var nextHandler func(modelID string, w http.ResponseWriter, r *http.Request) error
 	requestPath := c.Request.URL.Path
 
 	modelID, found := pm.config.RealModelName(requestedModel)
 	if found {
+		pm.setLastActiveModelID(modelID)
 		processGroup, err := pm.swapProcessGroup(modelID)
 		if err != nil {
 			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))

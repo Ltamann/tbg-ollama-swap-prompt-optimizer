@@ -1,0 +1,5 @@
+{
+  "method": "GET",
+  "path_template": "/responses",
+  "target_model": "GLM-4.7-Flash-UD-Q8_K_XL"
+}

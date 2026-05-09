@@ -146,11 +146,18 @@ type Config struct {
 	// present aliases to /v1/models OpenAI API listing
 	IncludeAliasesInList bool `yaml:"includeAliasesInList"`
 
+	// Treat some model names as dynamic aliases that resolve to the currently active model.
+	// Useful for clients that hardcode a model name for subagents (e.g. "gpt-5.4-mini") but you
+	// want those requests to hit whatever model is already loaded, avoiding unnecessary reloads.
+	UseActiveModelForAliases []string `yaml:"useActiveModelForAliases"`
+
 	// support API keys, see issue #433, #50, #251
 	RequiredAPIKeys []string `yaml:"apiKeys"`
 
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
+
+	activeModelAliasSet map[string]struct{}
 }
 
 func (c *Config) RealModelName(search string) (string, bool) {
@@ -161,6 +168,23 @@ func (c *Config) RealModelName(search string) (string, bool) {
 	} else {
 		return "", false
 	}
+}
+
+func (c *Config) IsActiveModelAlias(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	if normalized == "" {
+		return false
+	}
+	if c.activeModelAliasSet != nil {
+		_, ok := c.activeModelAliasSet[normalized]
+		return ok
+	}
+	for _, alias := range c.UseActiveModelForAliases {
+		if strings.ToLower(strings.TrimSpace(alias)) == normalized {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) FindConfig(modelName string) (ModelConfig, string, bool) {
@@ -231,6 +255,16 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			}
 			config.aliases[alias] = modelName
 		}
+	}
+
+	// Normalize dynamic "active model" aliases.
+	config.activeModelAliasSet = make(map[string]struct{})
+	for _, alias := range config.UseActiveModelForAliases {
+		normalized := strings.ToLower(strings.TrimSpace(alias))
+		if normalized == "" {
+			continue
+		}
+		config.activeModelAliasSet[normalized] = struct{}{}
 	}
 
 	// Validate global macros

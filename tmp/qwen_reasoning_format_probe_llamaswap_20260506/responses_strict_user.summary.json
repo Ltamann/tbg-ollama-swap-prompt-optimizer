@@ -1,0 +1,21 @@
+{
+  "duration_ms": 168340,
+  "event_types": [
+    "response.completed",
+    "response.content_part.added",
+    "response.content_part.done",
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.output_item.done",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_part.done",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.done"
+  ],
+  "reasoning_preview": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Constraint 1:** Inside the thinking block only, do not use numbered lists or prefaces like \"Here is my thinking.\"\n   - **Constraint 2:** Begin immediately with exactly:\n     [SUMMARY]\n     GOAL: <short>\n     DECISION: <short>\n     NEXT: <short>\n     STATUS: <ready|working|blocked|done>\n   - **Constraint 3:** [DETAIL] Then continue the rest of your full reasoning.\n   - **Constraint 4:** Do not repeat the summary in the final visible answer.\n   - **Task:** Design a reasoning format for a coding agent that gives short user-facing progress plus full detailed reasoning. Then answer briefly.\n\n2.  **Deconstruct Constraints & Requirements:**\n   - The thinking block must strictly follow the specified format.\n   - No numbered lists in the thinking block.\n   - No prefaces.\n   - Must start exactly with `[SUMMARY]\\nGOAL: ...`\n   - Must in",
+  "final_preview": "Working on the request.[SUMMARY]GOAL: Design a dual-layer reasoning format for coding agentsDECISION: Use a strict two-part template separating internal analysis from external progressNEXT: Present the template and usage rules conciselySTATUS: ready[DETAIL]The core challenge is balancing transparency with usability. A coding agent needs full analytical depth for correctness but should only expose high-level progress to avoid overwhelming the user. The solution is a structured two-tier format. The first tier is a compact user-facing progress block that updates incrementally. It tracks phase, current action, confidence, and next milestone. The second tier is a hidden or collapsible internal re",
+  "content_part_preview": ""
+}

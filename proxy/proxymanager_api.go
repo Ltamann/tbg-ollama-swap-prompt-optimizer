@@ -64,6 +64,7 @@ func addApiHandlers(pm *ProxyManager) {
 		apiGroup.GET("/metrics", pm.apiGetMetrics)
 		apiGroup.GET("/version", pm.apiGetVersion)
 		apiGroup.GET("/captures/:id", pm.apiGetCapture)
+		apiGroup.GET("/forensics/:id", pm.apiGetForensics)
 		apiGroup.GET("/config/path", pm.apiGetConfigPath)
 		apiGroup.GET("/settings/web-search", pm.apiGetWebSearchSettings)
 		apiGroup.POST("/settings/web-search", pm.apiSetWebSearchSettings)
@@ -684,6 +685,25 @@ func (pm *ProxyManager) apiGetCapture(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, capture)
+}
+
+func (pm *ProxyManager) apiGetForensics(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid forensic ID"})
+		return
+	}
+
+	metric := pm.metricsMonitor.getMetricByID(id)
+	if metric == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "metric not found"})
+		return
+	}
+
+	capture := pm.metricsMonitor.getCaptureByID(id)
+	summary := summarizeMetricsRow(*metric, capture)
+	c.JSON(http.StatusOK, summary)
 }
 
 type SetCtxSizeRequest struct {

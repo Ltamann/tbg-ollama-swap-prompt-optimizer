@@ -1,0 +1,10 @@
+{
+  "method": "POST",
+  "path_template": "/responses",
+  "target_model": "GLM-4.7-Flash-UD-Q8_K_XL",
+  "body": {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "stream": true,
+    "input": "Return exactly one complete <proposed_plan> block for a small language-learning game. Do not call tools."
+  }
+}

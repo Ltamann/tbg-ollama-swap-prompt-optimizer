@@ -1,0 +1,26 @@
+{
+  "http_status": 200,
+  "duration_ms": 28803,
+  "error_text": "",
+  "stream": false,
+  "response_summary": {
+    "response_id": "resp_chatcmpl-0wXirdtzERwxJDqXikMePLJeTNO3TADF",
+    "response_status": "completed",
+    "object": "response",
+    "output_types": [
+      "message"
+    ],
+    "tool_item_count": 0,
+    "message_item_count": 1,
+    "reasoning_item_count": 0,
+    "mixed_message_tool": false,
+    "top_level_output_text_present": true,
+    "usage_present": false,
+    "timings_present": false,
+    "plan_wrapper_present": false,
+    "first_message_text": "[proxy] apply_patch retry could not be completed. Retry with apply_patch if the task still requires a file write. (`no_tool_call`).",
+    "final_message_text": "[proxy] apply_patch retry could not be completed. Retry with apply_patch if the task still requires a file write. (`no_tool_call`).",
+    "tool_item_statuses": [],
+    "tool_item_names": []
+  }
+}

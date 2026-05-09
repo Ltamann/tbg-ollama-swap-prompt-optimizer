@@ -49,6 +49,7 @@ type Process struct {
 	config       config.ModelConfig
 	cmd          *exec.Cmd
 	reverseProxy *httputil.ReverseProxy
+	startMutex   sync.Mutex
 
 	// PR #155 called to cancel the upstream process
 	cmdMutex       sync.RWMutex
@@ -288,14 +289,8 @@ func rewriteResponsesOutputItem(rawItem any, applyPatchPathHint string, applyPat
 	itemType, _ := item["type"].(string)
 	if itemType == "apply_patch_call" {
 		operation := normalizeApplyPatchOperation(item["operation"])
-		if opMap, ok := operation.(map[string]any); ok && strings.TrimSpace(applyPatchPathHint) != "" {
-			opType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", opMap["type"])))
-			opPath := strings.TrimSpace(fmt.Sprintf("%v", opMap["path"]))
-			if (opType == "create_file" || opType == "update_file" || opType == "delete_file") &&
-				looksLikeAbsoluteWindowsOrUNCPath(opPath) {
-				opMap["path"] = normalizeApplyPatchPathForWorkspace(applyPatchPathHint)
-				operation = opMap
-			}
+		if repaired, repairedOK := repairApplyPatchOperationPathWithHint(operation, applyPatchPathHint); repairedOK {
+			operation = repaired
 		}
 		if (!hasNonEmptyApplyPatchOperation(operation) || !applyPatchOperationPayloadValid(operation)) &&
 			strings.TrimSpace(applyPatchPathHint) != "" {
@@ -317,6 +312,9 @@ func rewriteResponsesOutputItem(rawItem any, applyPatchPathHint string, applyPat
 		if repaired, repairedOK := repairApplyPatchOperationWithHints(operation, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint); repairedOK {
 			operation = repaired
 		}
+		if repaired, repairedOK := repairApplyPatchOperationPathWithHint(operation, applyPatchPathHint); repairedOK {
+			operation = repaired
+		}
 		if !hasNonEmptyApplyPatchOperation(operation) || !applyPatchOperationPayloadValid(operation) {
 			rewritten := map[string]any{
 				"id":   fmt.Sprintf("msg_%v_apply_patch_invalid", item["id"]),
@@ -335,9 +333,10 @@ func rewriteResponsesOutputItem(rawItem any, applyPatchPathHint string, applyPat
 		// Prefer `function_call` so Codex CLI can dispatch apply_patch as a tool.
 		rewritten["type"] = "function_call"
 		rewritten["status"] = "in_progress"
-		rewritten["operation"] = operation
-		input := strings.TrimSpace(buildApplyPatchInputFromOperation(operation))
-		payload := map[string]any{"input": input, "operation": operation}
+		normalizedOperation := normalizeApplyPatchOperation(operation)
+		rewritten["operation"] = normalizedOperation
+		input := strings.TrimSpace(buildApplyPatchInputFromOperation(normalizedOperation))
+		payload := map[string]any{"input": input, "operation": normalizedOperation}
 		rewritten["name"] = "apply_patch"
 		rewritten["arguments"] = mustJSONString(payload)
 		delete(rewritten, "input")
@@ -405,6 +404,9 @@ func rewriteResponsesOutputItem(rawItem any, applyPatchPathHint string, applyPat
 			}
 		}
 		if repaired, repairedOK := repairApplyPatchOperationWithHints(operation, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint); repairedOK {
+			operation = repaired
+		}
+		if repaired, repairedOK := repairApplyPatchOperationPathWithHint(operation, applyPatchPathHint); repairedOK {
 			operation = repaired
 		}
 		if !hasNonEmptyApplyPatchOperation(operation) || !applyPatchOperationPayloadValid(operation) {
@@ -612,6 +614,44 @@ func isValidTransition(from, to ProcessState) bool {
 	return false
 }
 
+func calculateUnexpectedRestartDelay(failedStartCount int, elapsed time.Duration) time.Duration {
+	const (
+		baseDelay = 1500 * time.Millisecond
+		maxDelay  = 8 * time.Second
+	)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	targetDelay := baseDelay
+	if failedStartCount > 1 {
+		for i := 1; i < failedStartCount; i++ {
+			targetDelay *= 2
+			if targetDelay >= maxDelay {
+				targetDelay = maxDelay
+				break
+			}
+		}
+	}
+	if elapsed >= targetDelay {
+		return 0
+	}
+	return targetDelay - elapsed
+}
+
+func (p *Process) adoptHealthyUpstream(healthURL string, reason string) bool {
+	healthURL = strings.TrimSpace(healthURL)
+	if healthURL == "" {
+		return false
+	}
+	if err := p.checkHealthEndpoint(healthURL); err != nil {
+		return false
+	}
+	p.proxyLogger.Infof("<%s> adopting healthy upstream after %s on %s", p.ID, reason, healthURL)
+	p.forceState(StateReady)
+	p.failedStartCount = 0
+	return true
+}
+
 func (p *Process) CurrentState() ProcessState {
 	p.stateMutex.RLock()
 	defer p.stateMutex.RUnlock()
@@ -631,6 +671,12 @@ func (p *Process) forceState(newState ProcessState) {
 // it is a private method because starting is automatic but stopping can be called
 // at any time.
 func (p *Process) start() error {
+	p.startMutex.Lock()
+	defer p.startMutex.Unlock()
+
+	if p.CurrentState() == StateReady {
+		return nil
+	}
 
 	if p.config.Proxy == "" {
 		return fmt.Errorf("can not start(), upstream proxy missing")
@@ -679,9 +725,7 @@ func (p *Process) start() error {
 	// Avoid immediate restart thrash after unexpected exits (common with GPU backends).
 	if last := p.lastUnexpectedExitUnixNano.Load(); last > 0 {
 		elapsed := time.Since(time.Unix(0, last))
-		const minRestartDelay = 1500 * time.Millisecond
-		if elapsed < minRestartDelay {
-			waitFor := minRestartDelay - elapsed
+		if waitFor := calculateUnexpectedRestartDelay(p.failedStartCount+1, elapsed); waitFor > 0 {
 			p.proxyLogger.Debugf("<%s> delaying restart for %v after unexpected exit", p.ID, waitFor)
 			time.Sleep(waitFor)
 		}
@@ -733,11 +777,12 @@ func (p *Process) start() error {
 	checkStartTime := time.Now()
 	maxDuration := time.Second * time.Duration(p.healthCheckTimeout)
 	checkEndpoint := strings.TrimSpace(p.config.CheckEndpoint)
+	healthURL := ""
 
 	// a "none" means don't check for health ... I could have picked a better word :facepalm:
 	if checkEndpoint != "none" {
 		proxyTo := p.config.Proxy
-		healthURL, err := url.JoinPath(proxyTo, checkEndpoint)
+		healthURL, err = url.JoinPath(proxyTo, checkEndpoint)
 		if err != nil {
 			return fmt.Errorf("failed to create health check URL proxy=%s and checkEndpoint=%s", proxyTo, checkEndpoint)
 		}
@@ -747,6 +792,9 @@ func (p *Process) start() error {
 			currentState := p.CurrentState()
 			if currentState != StateStarting {
 				if currentState == StateStopped {
+					if p.adoptHealthyUpstream(healthURL, "stopped-during-health-check") {
+						return nil
+					}
 					return fmt.Errorf("upstream command exited prematurely but successfully")
 				}
 				return errors.New("health check interrupted due to shutdown")
@@ -798,6 +846,9 @@ func (p *Process) start() error {
 	}
 
 	if curState, err := p.swapState(StateStarting, StateReady); err != nil {
+		if curState == StateStopped && p.adoptHealthyUpstream(healthURL, "ready-state-race") {
+			return nil
+		}
 		return fmt.Errorf("failed to set Process state to ready: current state: %v, error: %v", curState, err)
 	} else {
 		p.failedStartCount = 0
@@ -1074,6 +1125,36 @@ func (p *Process) checkHealthEndpoint(healthURL string) error {
 	return nil
 }
 
+func (p *Process) markStoppedIfProxyFailureSuggestsDeadUpstream(statusCode int) {
+	if p == nil || statusCode < http.StatusBadGateway || p.CurrentState() != StateReady {
+		return
+	}
+
+	checkEndpoint := strings.TrimSpace(p.config.CheckEndpoint)
+	if checkEndpoint == "none" {
+		p.proxyLogger.Warnf("<%s> upstream returned %d with health checks disabled; forcing state to stopped for clean restart", p.ID, statusCode)
+		p.lastUnexpectedExitUnixNano.Store(time.Now().UnixNano())
+		p.forceState(StateStopped)
+		return
+	}
+
+	healthURL, err := url.JoinPath(strings.TrimSpace(p.config.Proxy), checkEndpoint)
+	if err != nil || strings.TrimSpace(healthURL) == "" {
+		p.proxyLogger.Warnf("<%s> upstream returned %d and health URL could not be resolved; forcing state to stopped", p.ID, statusCode)
+		p.lastUnexpectedExitUnixNano.Store(time.Now().UnixNano())
+		p.forceState(StateStopped)
+		return
+	}
+
+	if err := p.checkHealthEndpoint(healthURL); err == nil {
+		return
+	}
+
+	p.proxyLogger.Warnf("<%s> upstream returned %d and health check failed; forcing state to stopped for retryable restart", p.ID, statusCode)
+	p.lastUnexpectedExitUnixNano.Store(time.Now().UnixNano())
+	p.forceState(StateStopped)
+}
+
 func (p *Process) ProxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	if p.reverseProxy == nil {
@@ -1083,6 +1164,7 @@ func (p *Process) ProxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	requestBeginTime := time.Now()
 	var startDuration time.Duration
+	observedWriter := newStatusCaptureResponseWriter(w)
 
 	// prevent new requests from being made while stopping or irrecoverable
 	currentState := p.CurrentState()
@@ -1121,7 +1203,7 @@ func (p *Process) ProxyRequest(w http.ResponseWriter, r *http.Request) {
 		// PR #417 (no support for anthropic v1/messages yet)
 		isChatCompletions := strings.HasPrefix(r.URL.Path, "/v1/chat/completions")
 		if p.config.SendLoadingState != nil && *p.config.SendLoadingState && isStreaming && isChatCompletions {
-			srw = newStatusResponseWriter(p, w)
+			srw = newStatusResponseWriter(p, observedWriter)
 			go srw.statusUpdates(swapCtx)
 		} else {
 			p.proxyLogger.Debugf("<%s> SendLoadingState is nil or false, not streaming loading state", p.ID)
@@ -1168,8 +1250,9 @@ func (p *Process) ProxyRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		p.reverseProxy.ServeHTTP(srw, r)
 	} else {
-		p.reverseProxy.ServeHTTP(w, r)
+		p.reverseProxy.ServeHTTP(observedWriter, r)
 	}
+	p.markStoppedIfProxyFailureSuggestsDeadUpstream(observedWriter.StatusCode())
 
 	totalTime := time.Since(requestBeginTime)
 	p.proxyLogger.Debugf("<%s> request %s - start: %v, total: %v",

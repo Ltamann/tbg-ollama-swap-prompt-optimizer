@@ -1,0 +1,66 @@
+{
+  "http_status": 200,
+  "duration_ms": 6883,
+  "error_text": "",
+  "stream": true,
+  "stream_summary": {
+    "raw_event_count": 172,
+    "event_order": [
+      "response.created",
+      "response.in_progress",
+      "response.output_item.added",
+      "response.reasoning_text.delta",
+      "response.content_part.added",
+      "response.output_text.delta",
+      "response.output_item.done",
+      "response.output_text.done",
+      "response.content_part.done",
+      "response.completed"
+    ],
+    "event_counts": {
+      "response.created": 1,
+      "response.in_progress": 1,
+      "response.output_item.added": 2,
+      "response.reasoning_text.delta": 160,
+      "response.content_part.added": 1,
+      "response.output_text.delta": 2,
+      "response.output_item.done": 2,
+      "response.output_text.done": 1,
+      "response.content_part.done": 1,
+      "response.completed": 1
+    },
+    "reasoning_event_names": [
+      "response.reasoning_text.delta"
+    ],
+    "has_created": true,
+    "has_in_progress": true,
+    "has_output_text_done": true,
+    "has_function_arguments_done": false,
+    "has_completed": true,
+    "output_item_done_types": [
+      "reasoning",
+      "message"
+    ],
+    "completed_response": {
+      "response_id": "resp_p5V1Mgv9v3DExtqOZdKwAKAUIJHl4LKw",
+      "response_status": "completed",
+      "object": "response",
+      "output_types": [
+        "reasoning",
+        "message"
+      ],
+      "tool_item_count": 0,
+      "message_item_count": 1,
+      "reasoning_item_count": 1,
+      "mixed_message_tool": false,
+      "top_level_output_text_present": false,
+      "usage_present": true,
+      "timings_present": false,
+      "plan_wrapper_present": false,
+      "first_message_text": "STREAM_OK",
+      "final_message_text": "STREAM_OK",
+      "tool_item_statuses": [],
+      "tool_item_names": []
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "case": "baseline",
+  "duration_ms": 156243,
+  "finish_reasons": [
+    "stop"
+  ],
+  "reasoning_preview": "Here's a thinking process:\n\n1.  **Analyze User Request:**\n   - **Goal:** Design a coding-agent reasoning format\n   - **Requirements:** \n     - Short user-facing progress updates\n     - Full detailed reasoning (presumably hidden/internal or available on demand)\n   - **Output:** Brief answer after thinking through the design\n\n2.  **Deconstruct the Problem:**\n   - Coding agents need to reason step-by-step (plan, explore, code, test, debug, iterate)\n   - Users want transparency but not overwhelming detail in real-time\n   - Need a structured format that separates \"user-facing progress\" from \"internal reasoning\"\n   - Must be machine-parseable for the agent framework, yet human-readable for the user\n   - Should support streaming/real-time updates\n   - Should allow toggling between brief and detailed views\n\n3.  **Key Design Principles:**\n   - **Separation of Concerns:** Clear boundaries between user-facing and internal content\n   - **Structured Format:** Use tags/markers or JSON-like structure for parsing\n   - **Progress Granularity:** Map agent phases to user-friendly milestones\n   - **State Tracking:** Maintain context across steps\n   - **Extensibility:** Allow plugins/tools to inject st",
+  "content_preview": "**Format:** Step-based tagged output per agent turn:\n```xml\n<step phase=\"planning|coding|testing|debugging|done\">\n  <progress>\ud83d\udd0d 1\u20132 line user milestone</progress>\n  <reasoning>Full CoT, tool calls, error analysis, alternatives considered</reasoning>\n  <metadata confidence=\"0.85\" next=\"install_deps\"/>\n</step>\n```\n\n**Key Design Choices:**\n- **Separation:** `progress` is strictly user-facing (actionable, jargon-light); `reasoning` contains full internal chain-of-thought, tool traces, and backtracking.\n- **Streaming:** Emit `progress` tokens immediately for real-time UI feedback; buffer or stream ",
+  "has_summary_tag": false,
+  "has_detail_tag": false,
+  "starts_with_json": false
+}

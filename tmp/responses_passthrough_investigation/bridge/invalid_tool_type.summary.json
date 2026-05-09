@@ -1,0 +1,27 @@
+{
+  "http_status": 200,
+  "duration_ms": 7837,
+  "error_text": "",
+  "stream": false,
+  "response_summary": {
+    "response_id": "resp_chatcmpl-0KFwqNEfN0374I84Aj2X2Fq7wV0zjQen",
+    "response_status": "completed",
+    "object": "response",
+    "output_types": [
+      "reasoning",
+      "message"
+    ],
+    "tool_item_count": 0,
+    "message_item_count": 1,
+    "reasoning_item_count": 1,
+    "mixed_message_tool": false,
+    "top_level_output_text_present": true,
+    "usage_present": true,
+    "timings_present": false,
+    "plan_wrapper_present": false,
+    "first_message_text": "Hello! How can I help you today? Feel free to ask me anything, whether you need information, help with a task, or just want to chat.",
+    "final_message_text": "Hello! How can I help you today? Feel free to ask me anything, whether you need information, help with a task, or just want to chat.",
+    "tool_item_statuses": [],
+    "tool_item_names": []
+  }
+}

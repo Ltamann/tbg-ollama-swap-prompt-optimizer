@@ -1,0 +1,11 @@
+{
+  "case": "strict_system_v2",
+  "duration_ms": 120612,
+  "reasoning_starts_summary": false,
+  "reasoning_has_summary": true,
+  "reasoning_has_detail": true,
+  "content_starts_summary": true,
+  "content_has_summary": true,
+  "reasoning_preview": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Goal:** Design a reasoning format for a coding agent.\n   - **Requirements:** \n     - Short user-facing progress updates\n     - Full detailed reasoning (internal/hidden or structured separately)\n     - Answer briefly at the end\n   - **Constraint (from system prompt):** Inside the thinking block only, do not use numbered lists or prefaces like \"Here is my thinking\". Begin immediately with exactly:\n     [SUMMARY]\n     GOAL: <short>\n     DECISION: <short>\n     NEXT: <short>\n     STATUS: <ready|working|blocked|done>\n     [DETAIL]\n     Then continue the rest of your full reasoning. Do not repeat the summary in the final visible answer.\n\n2.  **Deconstruct Constraints & Requirements:**\n   - Must start thinking block with exact format.\n   - Must design a reasoning format that separates user-facing progress from detailed reasoning.\n   ",
+  "content_preview": "[SUMMARY]\nGOAL: Design a dual-layer reasoning format for coding agents\nDECISION: Use structured delimiters separating progress, reasoning, and output\nNEXT: Define template, parsing rules, and usage guidelines\nSTATUS: ready\n\n[DETAIL]\nThe format must support real-time streaming for the user while preserving full traceability for debugging and evaluation. I will use explicit section markers that are easy to regex-parse. The progress layer will be strictly constrained to human-readable status update"
+}

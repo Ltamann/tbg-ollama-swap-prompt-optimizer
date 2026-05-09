@@ -1,0 +1,6 @@
+{
+  "method": "POST",
+  "path_template": "/responses",
+  "target_model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+  "body_raw": "{\"model\":\"broken\""
+}

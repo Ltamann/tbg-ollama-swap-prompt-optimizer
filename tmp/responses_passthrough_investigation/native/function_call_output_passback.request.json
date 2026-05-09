@@ -1,0 +1,25 @@
+{
+  "method": "POST",
+  "path_template": "/responses",
+  "target_model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+  "body": {
+    "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+    "input": [
+      {
+        "type": "function_call_output",
+        "call_id": "call_123",
+        "output": "{\"ok\":true}"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Given the tool output, reply with exactly: PASSBACK_OK"
+          }
+        ]
+      }
+    ]
+  }
+}

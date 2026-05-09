@@ -1,0 +1,7 @@
+{
+  "Connection": "close",
+  "Content-Type": "application/json; charset=utf-8",
+  "Server": "llama.cpp",
+  "Content-Length": "1339",
+  "Access-Control-Allow-Origin": ""
+}

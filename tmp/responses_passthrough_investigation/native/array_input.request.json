@@ -1,0 +1,20 @@
+{
+  "method": "POST",
+  "path_template": "/responses",
+  "target_model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+  "body": {
+    "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Reply with exactly: ARRAY_OK"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "case": "strict_user_v2_budget",
+  "duration_ms": 50363,
+  "reasoning_starts_summary": false,
+  "reasoning_has_summary": true,
+  "reasoning_has_detail": false,
+  "content_starts_summary": true,
+  "content_has_summary": true,
+  "reasoning_preview": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Constraint 1:** Inside the thinking block only, do not use numbered lists or prefaces like \"Here is my thinking.\"\n   - **Constraint 2:** Begin immediately with exactly:\n     [SUMMARY]\n     GOAL: <short>\n     DECISION: <short>\n     NEXT: <short>\n     STATUS: <ready|working|blocked|done>\n   - **Constraint 3:** Then continue the rest of your full reasoning.\n   - **Constraint 4:** Do not repeat the summary in the final visible answer.\n   - **Task:** Design a reasoning format for a coding agent that gives short user-facing progress plus full detailed reasoning. Then answer briefly.\n\n2.  **Deconstruct Constraints & Requirements:**\n   - The thinking block must start exactly with the specified summary format.\n",
+  "content_preview": "[SUMMARY]\nGOAL: Design a dual-layer reasoning format for coding agents\nDECISION: Use a strict metadata header in thoughts, followed by structured reasoning, with a clean user-facing output\nNEXT: Provide the format specification and a brief implementation example\nSTATUS: ready\n\n[DETAIL]\nThe core challenge is separating internal agent reasoning from external user communication while maintaining transparency and efficiency. The proposed format uses a two-tier structure: an internal reasoning block "
+}

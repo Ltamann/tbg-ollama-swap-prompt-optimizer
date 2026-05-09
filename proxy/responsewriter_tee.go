@@ -28,6 +28,52 @@ func (t *teeResponseWriter) Flush() {
 	}
 }
 
+type statusCaptureResponseWriter struct {
+	w           http.ResponseWriter
+	statusCode  int
+	wroteHeader bool
+}
+
+func newStatusCaptureResponseWriter(w http.ResponseWriter) *statusCaptureResponseWriter {
+	return &statusCaptureResponseWriter{
+		w:          w,
+		statusCode: http.StatusOK,
+	}
+}
+
+func (w *statusCaptureResponseWriter) Header() http.Header { return w.w.Header() }
+
+func (w *statusCaptureResponseWriter) WriteHeader(statusCode int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	if statusCode > 0 {
+		w.statusCode = statusCode
+	}
+	w.w.WriteHeader(statusCode)
+}
+
+func (w *statusCaptureResponseWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.w.Write(b)
+}
+
+func (w *statusCaptureResponseWriter) Flush() {
+	if f, ok := w.w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusCaptureResponseWriter) StatusCode() int {
+	if w == nil {
+		return 0
+	}
+	return w.statusCode
+}
+
 type headerSnapshot struct {
 	code   int
 	header http.Header

@@ -1,0 +1,20 @@
+{
+  "method": "POST",
+  "path_template": "/responses",
+  "target_model": "GLM-4.7-Flash-UD-Q8_K_XL",
+  "body": {
+    "model": "GLM-4.7-Flash-UD-Q8_K_XL",
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Reply with exactly: ARRAY_OK"
+          }
+        ]
+      }
+    ]
+  }
+}

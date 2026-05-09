@@ -75,6 +75,15 @@ sendLoadingState: true
 #   all fields except for Id so chat UIs can use the alias equivalent to the original.
 includeAliasesInList: false
 
+# useActiveModelForAliases: treat some model names as dynamic aliases that resolve
+# to the currently active local model
+# - optional, default: []
+# - useful for clients that hardcode a subagent model name (e.g. "gpt-5.4-mini")
+#   but you want those requests to hit whatever model is already loaded, avoiding
+#   unnecessary unload/reload cycles
+useActiveModelForAliases:
+  - gpt-5.4-mini
+
 # macros: a dictionary of string substitutions
 # - optional, default: empty dictionary
 # - macros are reusable snippets

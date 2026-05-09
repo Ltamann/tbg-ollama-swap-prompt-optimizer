@@ -1,0 +1,14 @@
+{
+  "case": "baseline",
+  "duration_ms": 147011,
+  "finish_reasons": [
+    "stop"
+  ],
+  "reasoning_starts_summary": false,
+  "reasoning_has_summary": false,
+  "reasoning_has_detail": false,
+  "content_starts_summary": false,
+  "content_has_summary": false,
+  "reasoning_preview": "Here's a thinking process:\n\n1.  **Analyze User Request:**\n   - **Goal:** Design a coding-agent reasoning format\n   - **Key Requirements:** \n     - Short user-facing progress updates\n     - Full detailed reasoning (presumably hidden/internal or available on demand)\n   - **Output Requirement:** \"Think through... Then answer briefly.\"\n\n2.  **Deconstruct the Problem:**\n   - Coding agents need to reason step-by-step (plan, analyze, code, test, debug, iterate)\n   - Users want transparency but not overwhelming detail during execution\n   - Need a structured format that separates \"user-facing progress\" from \"internal reasoning\"\n   - Should be machine-parseable for the agent framework, but human-readable for logs/debugging\n   - Must support streaming/real-time updates\n\n3.  **Key Design Considerations:**\n   - **Structure:** Need clear delimiters/tags for different sections\n   - **Progress:** Concis",
+  "content_preview": "Use a step-based, tag-delimited format that separates streaming UI updates from the full trace:\n\n```xml\n<progress>[1-line status for UI]</progress>\n<reasoning>\n- Plan/decision rationale\n- Code logic & structure choices\n- Edge cases & alternatives considered\n- Test strategy & expected outputs\n- Error analysis (if debugging)\n</reasoning>\n```\n\n**Key design rules:**\n1. Emit `<progress>` first in each step for real-time UI streaming\n2. Keep `<reasoning>` complete but hidden by default; expose via log"
+}

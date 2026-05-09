@@ -1,0 +1,2090 @@
+{
+  "generated_at": "2026-05-09T07:53:43.964032+00:00",
+  "targets": [
+    {
+      "name": "native",
+      "base_url": "http://127.0.0.1:10008/v1",
+      "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf"
+    },
+    {
+      "name": "bridge",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "model": "GLM-4.7-Flash-UD-Q8_K_XL"
+    }
+  ],
+  "cases": [
+    {
+      "name": "post_basic",
+      "category": "protocol",
+      "description": "Basic non-stream text response",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "text_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Reply with exactly: BASIC_OK"
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "get_collection",
+      "category": "protocol",
+      "description": "Collection GET support",
+      "method": "GET",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "protocol_collection_get",
+      "request_body": null,
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "get_by_id",
+      "category": "protocol",
+      "description": "Response retrieval by id",
+      "method": "GET",
+      "path_template": "/responses/{response_id}",
+      "stream": false,
+      "oracle_kind": "protocol_get_by_id",
+      "request_body": null,
+      "request_body_raw": null,
+      "dynamic_response_id_from": "post_basic"
+    },
+    {
+      "name": "previous_response_id",
+      "category": "protocol",
+      "description": "Continuation via previous_response_id",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "continuation_link",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Reply with exactly: PREV_OK",
+        "previous_response_id": "resp_probe_previous"
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "invalid_json",
+      "category": "protocol",
+      "description": "Invalid JSON request validation",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "protocol_invalid_json",
+      "request_body": null,
+      "request_body_raw": "{\"model\":\"broken\"",
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "invalid_tool_type",
+      "category": "protocol",
+      "description": "Invalid tool type validation",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "protocol_invalid_tool",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "hi",
+        "tools": [
+          {
+            "type": "computer_use_preview"
+          }
+        ]
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "instructions_text",
+      "category": "nonstream",
+      "description": "Instructions plus plain input",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "text_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "instructions": "You are a terse assistant.",
+        "input": "Reply with exactly: INSTR_OK"
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "array_input",
+      "category": "nonstream",
+      "description": "Array-form input with message/input_text",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "text_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Reply with exactly: ARRAY_OK"
+              }
+            ]
+          }
+        ]
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "reasoning_effort",
+      "category": "nonstream",
+      "description": "Reasoning effort request",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "text_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Reply with exactly: THINK_OK",
+        "reasoning": {
+          "effort": "low"
+        }
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "reasoning_summary",
+      "category": "nonstream",
+      "description": "Reasoning summary request",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "text_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Reply with exactly: SUMMARY_OK",
+        "reasoning": {
+          "effort": "low",
+          "summary": "auto"
+        }
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "include_field",
+      "category": "nonstream",
+      "description": "Include field request",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "text_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Reply with exactly: INCLUDE_OK",
+        "include": [
+          "reasoning.encrypted_content"
+        ]
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "max_output_tokens",
+      "category": "nonstream",
+      "description": "max_output_tokens handling",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "text_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Reply with exactly: TOKENS_OK",
+        "max_output_tokens": 32
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "tool_choice_none",
+      "category": "tool",
+      "description": "tool_choice=none with tool present",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "text_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Reply with exactly: NO_TOOL_OK",
+        "tools": [
+          {
+            "type": "function",
+            "name": "echo_tool",
+            "description": "echo_tool test tool",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            }
+          }
+        ],
+        "tool_choice": "none"
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "tool_choice_auto",
+      "category": "tool",
+      "description": "tool_choice=auto single tool call",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "tool_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Use the tool to answer. If you can call it, do so.",
+        "tools": [
+          {
+            "type": "function",
+            "name": "echo_tool",
+            "description": "echo_tool test tool",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            }
+          }
+        ],
+        "tool_choice": "auto"
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "tool_choice_required",
+      "category": "tool",
+      "description": "tool_choice=required single tool call",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "tool_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Use the tool.",
+        "tools": [
+          {
+            "type": "function",
+            "name": "echo_tool",
+            "description": "echo_tool test tool",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            }
+          }
+        ],
+        "tool_choice": "required"
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "mixed_text_tool",
+      "category": "tool",
+      "description": "Mixed prose and tool call in one turn",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "tool_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "First say PRELUDE and then call the tool echo_tool with value mixed.",
+        "tools": [
+          {
+            "type": "function",
+            "name": "echo_tool",
+            "description": "echo_tool test tool",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            }
+          }
+        ],
+        "tool_choice": "auto"
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "function_call_output_passback",
+      "category": "tool",
+      "description": "Passback using function_call_output",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "continuation_final_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": [
+          {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "{\"ok\":true}"
+          },
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Given the tool output, reply with exactly: PASSBACK_OK"
+              }
+            ]
+          }
+        ]
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "plan_only",
+      "category": "codex",
+      "description": "Plan-only prompt with proposed plan wrapper",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "plan_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Return exactly one complete <proposed_plan> block for a small math game. Do not call tools."
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "apply_patch_intent",
+      "category": "codex",
+      "description": "Apply-patch intent with native function schema",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": false,
+      "oracle_kind": "tool_nonstream",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Use apply_patch to create hello.txt containing HELLO.",
+        "tools": [
+          {
+            "type": "function",
+            "name": "apply_patch",
+            "description": "Apply a structured file patch.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "operation": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "path": {
+                      "type": "string"
+                    },
+                    "content": {
+                      "type": "string"
+                    },
+                    "diff": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "path"
+                  ]
+                }
+              },
+              "required": [
+                "operation"
+              ]
+            }
+          }
+        ],
+        "tool_choice": "auto"
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "stream_basic",
+      "category": "stream",
+      "description": "Plain streamed final answer",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": true,
+      "oracle_kind": "stream_text",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Reply with exactly: STREAM_OK",
+        "stream": true
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "stream_tool",
+      "category": "stream",
+      "description": "Streamed tool call turn",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": true,
+      "oracle_kind": "stream_tool",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "input": "Use the tool to answer. If you can call it, do so.",
+        "stream": true,
+        "tools": [
+          {
+            "type": "function",
+            "name": "echo_tool",
+            "description": "echo_tool test tool",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ]
+            }
+          }
+        ],
+        "tool_choice": "auto"
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    },
+    {
+      "name": "stream_plan_only",
+      "category": "stream",
+      "description": "Streamed plan-only turn",
+      "method": "POST",
+      "path_template": "/responses",
+      "stream": true,
+      "oracle_kind": "stream_plan",
+      "request_body": {
+        "model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf",
+        "stream": true,
+        "input": "Return exactly one complete <proposed_plan> block for a small language-learning game. Do not call tools."
+      },
+      "request_body_raw": null,
+      "dynamic_response_id_from": null
+    }
+  ],
+  "summaries": {
+    "native": {
+      "post_basic": {
+        "http_status": 200,
+        "duration_ms": 7985,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_tBBgGVKr3Iwnm2J7y1DxVtnXrQWnHNcc",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "BASIC_OK",
+          "final_message_text": "BASIC_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "get_collection": {
+        "http_status": 404,
+        "duration_ms": 1,
+        "error_text": "HTTP Error 404: Not Found",
+        "stream": false,
+        "error_summary": {
+          "error_type": "not_found_error",
+          "error_code": 404,
+          "message": "File Not Found"
+        }
+      },
+      "get_by_id": {
+        "http_status": 404,
+        "duration_ms": 0,
+        "error_text": "HTTP Error 404: Not Found",
+        "stream": false,
+        "error_summary": {
+          "error_type": "not_found_error",
+          "error_code": 404,
+          "message": "File Not Found"
+        }
+      },
+      "previous_response_id": {
+        "http_status": 400,
+        "duration_ms": 1,
+        "error_text": "HTTP Error 400: Bad Request",
+        "stream": false,
+        "error_summary": {
+          "error_type": "invalid_request_error",
+          "error_code": 400,
+          "message": "llama.cpp does not support 'previous_response_id'."
+        }
+      },
+      "invalid_json": {
+        "http_status": 500,
+        "duration_ms": 0,
+        "error_text": "HTTP Error 500: Internal Server Error",
+        "stream": false,
+        "error_summary": {
+          "error_type": "server_error",
+          "error_code": 500,
+          "message": "[json.exception.parse_error.101] parse error at line 1, column 18: syntax error while parsing object - unexpected end of input; expected '}'"
+        }
+      },
+      "invalid_tool_type": {
+        "http_status": 400,
+        "duration_ms": 0,
+        "error_text": "HTTP Error 400: Bad Request",
+        "stream": false,
+        "error_summary": {
+          "error_type": "invalid_request_error",
+          "error_code": 400,
+          "message": "'type' of tool must be 'function'"
+        }
+      },
+      "instructions_text": {
+        "http_status": 200,
+        "duration_ms": 6481,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_IG8sIR4jvpnY3B7PIBOmdMjn46SOe9cS",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "INSTR_OK",
+          "final_message_text": "INSTR_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "array_input": {
+        "http_status": 200,
+        "duration_ms": 6462,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_tcoUiMTxqYiFGbubUkEvzvKy5huMq6We",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "ARRAY_OK",
+          "final_message_text": "ARRAY_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "reasoning_effort": {
+        "http_status": 200,
+        "duration_ms": 6140,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_mDdIIoBFVx2igWrZTZwRHGMacR3K5wSE",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "THINK_OK",
+          "final_message_text": "THINK_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "reasoning_summary": {
+        "http_status": 200,
+        "duration_ms": 6829,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_j02uUl2fN6XmvXQx1rTik0hO3Io9LE2p",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "SUMMARY_OK",
+          "final_message_text": "SUMMARY_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "include_field": {
+        "http_status": 200,
+        "duration_ms": 7374,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_5hM3DjBKEgSRBuwVTWvyp2Yj9Q2bsubZ",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "INCLUDE_OK",
+          "final_message_text": "INCLUDE_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "max_output_tokens": {
+        "http_status": 200,
+        "duration_ms": 1501,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_QTEAZEVAjFnfrrQhE02mKW9yFCqPLq6E",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 0,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "",
+          "final_message_text": "",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "tool_choice_none": {
+        "http_status": 200,
+        "duration_ms": 5679,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_4IibOWZPpa0axAYey76OTgNcOJZnaVVc",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "NO_TOOL_OK",
+          "final_message_text": "NO_TOOL_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "tool_choice_auto": {
+        "http_status": 200,
+        "duration_ms": 8349,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_CU6C4BKWPJt1EONhqR1q0sgnPvC70ThM",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "function_call"
+          ],
+          "tool_item_count": 1,
+          "message_item_count": 0,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "",
+          "final_message_text": "",
+          "tool_item_statuses": [
+            "completed"
+          ],
+          "tool_item_names": [
+            "echo_tool"
+          ]
+        }
+      },
+      "tool_choice_required": {
+        "http_status": 200,
+        "duration_ms": 4855,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_xrk5oS18wMUoPkXpmiieFdUKlC2CAp4n",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "function_call"
+          ],
+          "tool_item_count": 1,
+          "message_item_count": 0,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "",
+          "final_message_text": "",
+          "tool_item_statuses": [
+            "completed"
+          ],
+          "tool_item_names": [
+            "echo_tool"
+          ]
+        }
+      },
+      "mixed_text_tool": {
+        "http_status": 200,
+        "duration_ms": 40594,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_fwPNKOpzzDmtOGpvpRzSdS4ygDHqtV8R",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message",
+            "function_call"
+          ],
+          "tool_item_count": 1,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": true,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "PRELUDE",
+          "final_message_text": "PRELUDE",
+          "tool_item_statuses": [
+            "completed"
+          ],
+          "tool_item_names": [
+            "echo_tool"
+          ]
+        }
+      },
+      "function_call_output_passback": {
+        "http_status": 200,
+        "duration_ms": 6843,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_VbNLUU9HaddCDRne5g5tisEE72hNQL8o",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "PASSBACK_OK",
+          "final_message_text": "PASSBACK_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "plan_only": {
+        "http_status": 200,
+        "duration_ms": 64711,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_bHQCcbJMtmqIrkRozmlnbHd2a1gFsmgK",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": true,
+          "first_message_text": "<proposed_plan>\n  <game_title>QuickCalc Challenge</game_title>\n  <description>A fast-paced, single-player arithmetic game where players solve math problems against a countdown timer to build combos and achieve high scores.</description>\n  <core_mechanics>\n    <mechanic>Generates random arithmetic problems (addition, subtraction, multiplication, division) with configurable difficulty.</mechanic>\n    <mechanic>Supports both typed answers and 4-option multiple choice for accessibility.</mechanic>\n    <mechanic>Timer bar that depletes per round; correct answers add time, incorrect answers deduct time.</mechanic>\n    <mechanic>Combo multiplier rewards consecutive correct answers with bonus points.</mechanic>\n  </core_mechanics>\n  <ui_ux>\n    <element>Centered, large numeric display with high-contrast colors for readability.</element>\n    <element>Visual feedback: green pulse for correct, red shake for incorrect.</element>\n    <element>HUD shows current score, combo multiplier, timer bar, and level.</element>\n    <element>Responsive layout optimized for mobile touch and desktop keyboard/mouse.</element>\n  </ui_ux>\n  <progression>\n    <stage>Levels 1-3: Addition & subtraction (numbers 1-20)</stage>\n    <stage>Levels 4-6: Multiplication & division (tables 2-10)</stage>\n    <stage>Levels 7+: Mixed operations, larger operands (up to 99), faster decay</stage>\n    <stage>Endless mode unlocks after completing level 10</stage>\n  </progression>\n  <technical_approach>\n    <stack>HTML5, CSS3, Vanilla JavaScript (zero dependencies)</stack>\n    <state_management>Plain object tracking score, level, timer, combo, and problem queue</state_management>\n    <randomization>Weighted problem generator that adapts to player streak and accuracy</randomization>\n    <performance>DOM updates batched per tick; requestAnimationFrame for smooth timer animation</performance>\n  </technical_approach>\n  <next_steps>\n    <step>Build math problem generator with difficulty scaling and answer validation</step>\n    <step>Implement timer loop, scoring, and combo multiplier logic</step>\n    <step>Design and connect UI components (HUD, input fields, feedback animations)</step>\n    <step>Conduct cross-device testing, tune difficulty curves, and finalize</step>\n  </next_steps>\n</proposed_plan>",
+          "final_message_text": "<proposed_plan>\n  <game_title>QuickCalc Challenge</game_title>\n  <description>A fast-paced, single-player arithmetic game where players solve math problems against a countdown timer to build combos and achieve high scores.</description>\n  <core_mechanics>\n    <mechanic>Generates random arithmetic problems (addition, subtraction, multiplication, division) with configurable difficulty.</mechanic>\n    <mechanic>Supports both typed answers and 4-option multiple choice for accessibility.</mechanic>\n    <mechanic>Timer bar that depletes per round; correct answers add time, incorrect answers deduct time.</mechanic>\n    <mechanic>Combo multiplier rewards consecutive correct answers with bonus points.</mechanic>\n  </core_mechanics>\n  <ui_ux>\n    <element>Centered, large numeric display with high-contrast colors for readability.</element>\n    <element>Visual feedback: green pulse for correct, red shake for incorrect.</element>\n    <element>HUD shows current score, combo multiplier, timer bar, and level.</element>\n    <element>Responsive layout optimized for mobile touch and desktop keyboard/mouse.</element>\n  </ui_ux>\n  <progression>\n    <stage>Levels 1-3: Addition & subtraction (numbers 1-20)</stage>\n    <stage>Levels 4-6: Multiplication & division (tables 2-10)</stage>\n    <stage>Levels 7+: Mixed operations, larger operands (up to 99), faster decay</stage>\n    <stage>Endless mode unlocks after completing level 10</stage>\n  </progression>\n  <technical_approach>\n    <stack>HTML5, CSS3, Vanilla JavaScript (zero dependencies)</stack>\n    <state_management>Plain object tracking score, level, timer, combo, and problem queue</state_management>\n    <randomization>Weighted problem generator that adapts to player streak and accuracy</randomization>\n    <performance>DOM updates batched per tick; requestAnimationFrame for smooth timer animation</performance>\n  </technical_approach>\n  <next_steps>\n    <step>Build math problem generator with difficulty scaling and answer validation</step>\n    <step>Implement timer loop, scoring, and combo multiplier logic</step>\n    <step>Design and connect UI components (HUD, input fields, feedback animations)</step>\n    <step>Conduct cross-device testing, tune difficulty curves, and finalize</step>\n  </next_steps>\n</proposed_plan>",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "apply_patch_intent": {
+        "http_status": 200,
+        "duration_ms": 9778,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_6e1UnQROJpM62zopSg6y1kku3TfEVgQ3",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "function_call"
+          ],
+          "tool_item_count": 1,
+          "message_item_count": 0,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": false,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "",
+          "final_message_text": "",
+          "tool_item_statuses": [
+            "completed"
+          ],
+          "tool_item_names": [
+            "apply_patch"
+          ]
+        }
+      },
+      "stream_basic": {
+        "http_status": 200,
+        "duration_ms": 6883,
+        "error_text": "",
+        "stream": true,
+        "stream_summary": {
+          "raw_event_count": 172,
+          "event_order": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.reasoning_text.delta",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_item.done",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.completed"
+          ],
+          "event_counts": {
+            "response.created": 1,
+            "response.in_progress": 1,
+            "response.output_item.added": 2,
+            "response.reasoning_text.delta": 160,
+            "response.content_part.added": 1,
+            "response.output_text.delta": 2,
+            "response.output_item.done": 2,
+            "response.output_text.done": 1,
+            "response.content_part.done": 1,
+            "response.completed": 1
+          },
+          "reasoning_event_names": [
+            "response.reasoning_text.delta"
+          ],
+          "has_created": true,
+          "has_in_progress": true,
+          "has_output_text_done": true,
+          "has_function_arguments_done": false,
+          "has_completed": true,
+          "output_item_done_types": [
+            "reasoning",
+            "message"
+          ],
+          "completed_response": {
+            "response_id": "resp_p5V1Mgv9v3DExtqOZdKwAKAUIJHl4LKw",
+            "response_status": "completed",
+            "object": "response",
+            "output_types": [
+              "reasoning",
+              "message"
+            ],
+            "tool_item_count": 0,
+            "message_item_count": 1,
+            "reasoning_item_count": 1,
+            "mixed_message_tool": false,
+            "top_level_output_text_present": false,
+            "usage_present": true,
+            "timings_present": false,
+            "plan_wrapper_present": false,
+            "first_message_text": "STREAM_OK",
+            "final_message_text": "STREAM_OK",
+            "tool_item_statuses": [],
+            "tool_item_names": []
+          }
+        }
+      },
+      "stream_tool": {
+        "http_status": 200,
+        "duration_ms": 17081,
+        "error_text": "",
+        "stream": true,
+        "stream_summary": {
+          "raw_event_count": 435,
+          "event_order": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.reasoning_text.delta",
+            "response.function_call_arguments.delta",
+            "response.output_item.done",
+            "response.completed"
+          ],
+          "event_counts": {
+            "response.created": 1,
+            "response.in_progress": 1,
+            "response.output_item.added": 2,
+            "response.reasoning_text.delta": 423,
+            "response.function_call_arguments.delta": 5,
+            "response.output_item.done": 2,
+            "response.completed": 1
+          },
+          "reasoning_event_names": [
+            "response.reasoning_text.delta"
+          ],
+          "has_created": true,
+          "has_in_progress": true,
+          "has_output_text_done": false,
+          "has_function_arguments_done": false,
+          "has_completed": true,
+          "output_item_done_types": [
+            "reasoning",
+            "function_call"
+          ],
+          "completed_response": {
+            "response_id": "resp_GgS6GGYuYQ14oWmS5b5yazwXv6LEINcz",
+            "response_status": "completed",
+            "object": "response",
+            "output_types": [
+              "reasoning",
+              "function_call"
+            ],
+            "tool_item_count": 1,
+            "message_item_count": 0,
+            "reasoning_item_count": 1,
+            "mixed_message_tool": false,
+            "top_level_output_text_present": false,
+            "usage_present": true,
+            "timings_present": false,
+            "plan_wrapper_present": false,
+            "first_message_text": "",
+            "final_message_text": "",
+            "tool_item_statuses": [
+              "completed"
+            ],
+            "tool_item_names": [
+              "echo_tool"
+            ]
+          }
+        }
+      },
+      "stream_plan_only": {
+        "http_status": 200,
+        "duration_ms": 85492,
+        "error_text": "",
+        "stream": true,
+        "stream_summary": {
+          "raw_event_count": 2304,
+          "event_order": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.reasoning_text.delta",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_item.done",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.completed"
+          ],
+          "event_counts": {
+            "response.created": 1,
+            "response.in_progress": 1,
+            "response.output_item.added": 2,
+            "response.reasoning_text.delta": 1484,
+            "response.content_part.added": 1,
+            "response.output_text.delta": 810,
+            "response.output_item.done": 2,
+            "response.output_text.done": 1,
+            "response.content_part.done": 1,
+            "response.completed": 1
+          },
+          "reasoning_event_names": [
+            "response.reasoning_text.delta"
+          ],
+          "has_created": true,
+          "has_in_progress": true,
+          "has_output_text_done": true,
+          "has_function_arguments_done": false,
+          "has_completed": true,
+          "output_item_done_types": [
+            "reasoning",
+            "message"
+          ],
+          "completed_response": {
+            "response_id": "resp_tovHbPrJsNALFGcpOPyNTComaOwxcu2k",
+            "response_status": "completed",
+            "object": "response",
+            "output_types": [
+              "reasoning",
+              "message"
+            ],
+            "tool_item_count": 0,
+            "message_item_count": 1,
+            "reasoning_item_count": 1,
+            "mixed_message_tool": false,
+            "top_level_output_text_present": false,
+            "usage_present": true,
+            "timings_present": false,
+            "plan_wrapper_present": true,
+            "first_message_text": "<proposed_plan>\n  <game_title>LexiLoop</game_title>\n  <overview>A lightweight, mobile-first language-learning game designed for beginners to build vocabulary and basic conversational skills through bite-sized, gamified mini-challenges and adaptive spaced repetition.</overview>\n  <target_audience>Casual learners ages 16+, zero to intermediate proficiency, targeting Spanish, French, Japanese, and German as initial release languages.</target_audience>\n  <core_mechanics>\n    <mechanic name=\"Swipe Vocab\">Users swipe right for correct word-image/audio matches and left for incorrect ones. Speed and accuracy determine score multipliers.</mechanic>\n    <mechanic name=\"Sentence Builder\">Drag-and-drop word tiles to complete contextual phrases. Hints unlock after failed attempts, teaching grammar patterns naturally.</mechanic>\n    <mechanic name=\"Streak & Energy\">Daily login streaks grant bonus XP. Energy system limits play sessions to 15 minutes, encouraging consistent daily practice.</mechanic>\n    <mechanic name=\"Adaptive Review Engine\">Backend algorithm tracks error patterns and schedules review sessions at optimal intervals to maximize long-term retention.</mechanic>\n  </core_mechanics>\n  <tech_stack>\n    <engine>Unity 2022 LTS</engine>\n    <language>C#</language>\n    <backend>Firebase (Authentication, Firestore, Cloud Functions, Remote Config)</backend>\n    <audio>Platform-native TTS for pronunciation; compressed OGGS for SFX</audio>\n    <platform>iOS, Android, WebGL (browser)</platform>\n  </tech_stack>\n  <development_phases>\n    <phase id=\"1\" duration=\"Weeks 1-3\">Prototype core swipe mechanic, basic UI framework, placeholder art, and 100-word starter database. Internal playtesting.</phase>\n    <phase id=\"2\" duration=\"Weeks 4-6\">Implement spaced repetition logic, sentence builder, scoring/streak systems, and Firebase integration. Alpha build with 1 language.</phase>\n    <phase id=\"3\" duration=\"Weeks 7-9\">Add 2nd and 3rd languages, polish animations, integrate analytics (Mixpanel), and run closed beta with 500 users.</phase>\n    <phase id=\"4\" duration=\"Weeks 10-12\">App store optimization, localization, bug fixing, live-ops framework setup, and public launch across platforms.</phase>\n  </development_phases>\n  <monetization>Free-to-play with rewarded ads for extra hints. Optional $3.99 one-time ad removal. Premium tier at $4.99/month unlocks offline mode, advanced progress stats, and 4th language.</monetization>\n  <success_metrics>\n    <metric>Day-1 Retention: ≥45%</metric>\n    <metric>Day-7 Retention: ≥20%</metric>\n    <metric>Average Session Duration: 8-10 minutes</metric>\n    <metric>Lesson Completion Rate: ≥70%</metric>\n    <metric>CAC Payback Period: ≤45 days</metric>\n  </success_metrics>\n  <risk_mitigation>\n    <risk>Content bottleneck for accurate translations and audio</risk>\n    <mitigation>Use vetted AI-assisted drafting pipeline with native speaker review; prioritize high-frequency vocabulary first; batch content updates monthly.</mitigation>\n    <risk>Player churn after novelty wears off</risk>\n    <mitigation>Implement weekly themed challenges, shareable progress cards, and seasonal events; A/B test onboarding to reduce early friction.</mitigation>\n  </risk_mitigation>\n</proposed_plan>",
+            "final_message_text": "<proposed_plan>\n  <game_title>LexiLoop</game_title>\n  <overview>A lightweight, mobile-first language-learning game designed for beginners to build vocabulary and basic conversational skills through bite-sized, gamified mini-challenges and adaptive spaced repetition.</overview>\n  <target_audience>Casual learners ages 16+, zero to intermediate proficiency, targeting Spanish, French, Japanese, and German as initial release languages.</target_audience>\n  <core_mechanics>\n    <mechanic name=\"Swipe Vocab\">Users swipe right for correct word-image/audio matches and left for incorrect ones. Speed and accuracy determine score multipliers.</mechanic>\n    <mechanic name=\"Sentence Builder\">Drag-and-drop word tiles to complete contextual phrases. Hints unlock after failed attempts, teaching grammar patterns naturally.</mechanic>\n    <mechanic name=\"Streak & Energy\">Daily login streaks grant bonus XP. Energy system limits play sessions to 15 minutes, encouraging consistent daily practice.</mechanic>\n    <mechanic name=\"Adaptive Review Engine\">Backend algorithm tracks error patterns and schedules review sessions at optimal intervals to maximize long-term retention.</mechanic>\n  </core_mechanics>\n  <tech_stack>\n    <engine>Unity 2022 LTS</engine>\n    <language>C#</language>\n    <backend>Firebase (Authentication, Firestore, Cloud Functions, Remote Config)</backend>\n    <audio>Platform-native TTS for pronunciation; compressed OGGS for SFX</audio>\n    <platform>iOS, Android, WebGL (browser)</platform>\n  </tech_stack>\n  <development_phases>\n    <phase id=\"1\" duration=\"Weeks 1-3\">Prototype core swipe mechanic, basic UI framework, placeholder art, and 100-word starter database. Internal playtesting.</phase>\n    <phase id=\"2\" duration=\"Weeks 4-6\">Implement spaced repetition logic, sentence builder, scoring/streak systems, and Firebase integration. Alpha build with 1 language.</phase>\n    <phase id=\"3\" duration=\"Weeks 7-9\">Add 2nd and 3rd languages, polish animations, integrate analytics (Mixpanel), and run closed beta with 500 users.</phase>\n    <phase id=\"4\" duration=\"Weeks 10-12\">App store optimization, localization, bug fixing, live-ops framework setup, and public launch across platforms.</phase>\n  </development_phases>\n  <monetization>Free-to-play with rewarded ads for extra hints. Optional $3.99 one-time ad removal. Premium tier at $4.99/month unlocks offline mode, advanced progress stats, and 4th language.</monetization>\n  <success_metrics>\n    <metric>Day-1 Retention: ≥45%</metric>\n    <metric>Day-7 Retention: ≥20%</metric>\n    <metric>Average Session Duration: 8-10 minutes</metric>\n    <metric>Lesson Completion Rate: ≥70%</metric>\n    <metric>CAC Payback Period: ≤45 days</metric>\n  </success_metrics>\n  <risk_mitigation>\n    <risk>Content bottleneck for accurate translations and audio</risk>\n    <mitigation>Use vetted AI-assisted drafting pipeline with native speaker review; prioritize high-frequency vocabulary first; batch content updates monthly.</mitigation>\n    <risk>Player churn after novelty wears off</risk>\n    <mitigation>Implement weekly themed challenges, shareable progress cards, and seasonal events; A/B test onboarding to reduce early friction.</mitigation>\n  </risk_mitigation>\n</proposed_plan>",
+            "tool_item_statuses": [],
+            "tool_item_names": []
+          }
+        }
+      }
+    },
+    "bridge": {
+      "post_basic": {
+        "http_status": 200,
+        "duration_ms": 11023,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-u0k1GRlIxU9oFlW8Bfl1iKhhFhTX34Kd",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "BASIC_OK",
+          "final_message_text": "BASIC_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "get_collection": {
+        "http_status": 404,
+        "duration_ms": 0,
+        "error_text": "HTTP Error 404: Not Found",
+        "stream": false,
+        "non_json_body": ""
+      },
+      "get_by_id": {
+        "http_status": 404,
+        "duration_ms": 0,
+        "error_text": "HTTP Error 404: Not Found",
+        "stream": false,
+        "non_json_body": ""
+      },
+      "previous_response_id": {
+        "http_status": 200,
+        "duration_ms": 4247,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-eXFZU6vi8Ad176WniI4AU2PgdS0eNZJl",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "PREV_OK",
+          "final_message_text": "PREV_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "invalid_json": {
+        "http_status": 400,
+        "duration_ms": 0,
+        "error_text": "HTTP Error 400: Bad Request",
+        "stream": false,
+        "error_summary": {
+          "error_type": "",
+          "error_code": null,
+          "message": "could not find suitable inference handler for broken"
+        }
+      },
+      "invalid_tool_type": {
+        "http_status": 200,
+        "duration_ms": 7837,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-0KFwqNEfN0374I84Aj2X2Fq7wV0zjQen",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "Hello! How can I help you today? Feel free to ask me anything, whether you need information, help with a task, or just want to chat.",
+          "final_message_text": "Hello! How can I help you today? Feel free to ask me anything, whether you need information, help with a task, or just want to chat.",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "instructions_text": {
+        "http_status": 200,
+        "duration_ms": 5620,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-U5rhzMajZ2tlgBvE29yy67txX7AY40IK",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "INSTR_OK",
+          "final_message_text": "INSTR_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "array_input": {
+        "http_status": 200,
+        "duration_ms": 4749,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-HocIwWat5eUvtXJ6vbVZxAM4tgKn9paR",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "ARRAY_OK",
+          "final_message_text": "ARRAY_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "reasoning_effort": {
+        "http_status": 200,
+        "duration_ms": 667,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-xdkOFYimYNccY7spAoQQvfYPZz2vswAG",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 0,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "I understand. I will ensure my future responses are brief and to the point. How can I assist you?",
+          "final_message_text": "I understand. I will ensure my future responses are brief and to the point. How can I assist you?",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "reasoning_summary": {
+        "http_status": 200,
+        "duration_ms": 4329,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-kqS75r61lE12ZQOGH2JIT5lBFUtni7Q9",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "I will provide a brief, direct answer.",
+          "final_message_text": "I will provide a brief, direct answer.",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "include_field": {
+        "http_status": 200,
+        "duration_ms": 3648,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-qxP9CBzu78eMhuNdbMjAlzNvLzxZckWC",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "INCLUDE_OK",
+          "final_message_text": "INCLUDE_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "max_output_tokens": {
+        "http_status": 200,
+        "duration_ms": 850,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-2bkPqkmhZZ8T7hWqYlWH7Up015PsSJwB",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 0,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "The user wants a specific output: \"TOKENS_OK\". This looks like a simple string request, likely from a system or an automated script checking for a specific",
+          "final_message_text": "The user wants a specific output: \"TOKENS_OK\". This looks like a simple string request, likely from a system or an automated script checking for a specific",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "tool_choice_none": {
+        "http_status": 200,
+        "duration_ms": 1459,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-Ug1vkhzo7fbzaDgeadblHeLfg6EsgQoZ",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "NO_TOOL_OK",
+          "final_message_text": "NO_TOOL_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "tool_choice_auto": {
+        "http_status": 200,
+        "duration_ms": 3456,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-U8D5lNYPnQZ3yEaj04o4UyHWWYM4B0Fg",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "I'd be happy to use the echo_tool for you! However, I need a value to pass to it. Could you please provide the value you'd like me to echo?",
+          "final_message_text": "I'd be happy to use the echo_tool for you! However, I need a value to pass to it. Could you please provide the value you'd like me to echo?",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "tool_choice_required": {
+        "http_status": 200,
+        "duration_ms": 2027,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-HSXvd7nrRVJYSNTlalspORLdZ4CIb5SG",
+          "response_status": "requires_action",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "function_call"
+          ],
+          "tool_item_count": 1,
+          "message_item_count": 0,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "",
+          "final_message_text": "",
+          "tool_item_statuses": [
+            "in_progress"
+          ],
+          "tool_item_names": [
+            "echo_tool"
+          ]
+        }
+      },
+      "mixed_text_tool": {
+        "http_status": 200,
+        "duration_ms": 1954,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-XBWOD5pbuvjKUHsHvsvBfYif7SI8b2rL",
+          "response_status": "requires_action",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message",
+            "function_call"
+          ],
+          "tool_item_count": 1,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": true,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "PRELUDE",
+          "final_message_text": "PRELUDE",
+          "tool_item_statuses": [
+            "in_progress"
+          ],
+          "tool_item_names": [
+            "echo_tool"
+          ]
+        }
+      },
+      "function_call_output_passback": {
+        "http_status": 200,
+        "duration_ms": 3717,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-jErPrd7hZ69dFqFsnWlFdyW3JSCK17Dj",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": true,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "PASSBACK_OK",
+          "final_message_text": "PASSBACK_OK",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "plan_only": {
+        "http_status": 200,
+        "duration_ms": 25219,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-bxPdhEuEyuZ9ao7eHiaxa9P3chiqKOnK",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "reasoning",
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 1,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": false,
+          "timings_present": false,
+          "plan_wrapper_present": true,
+          "first_message_text": "<proposed_plan>\n1. Acknowledge receipt of the system instructions defining Default mode behavior.\n2. Confirm readiness to execute the specified format (Assistant text wrapped in `<proposed_plan>...</proposed_plan>`).\n3. Stand by for the specific user task to begin planning.\n</proposed_plan>",
+          "final_message_text": "<proposed_plan>\n1. Acknowledge receipt of the system instructions defining Default mode behavior.\n2. Confirm readiness to execute the specified format (Assistant text wrapped in `<proposed_plan>...</proposed_plan>`).\n3. Stand by for the specific user task to begin planning.\n</proposed_plan>",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "apply_patch_intent": {
+        "http_status": 200,
+        "duration_ms": 28803,
+        "error_text": "",
+        "stream": false,
+        "response_summary": {
+          "response_id": "resp_chatcmpl-0wXirdtzERwxJDqXikMePLJeTNO3TADF",
+          "response_status": "completed",
+          "object": "response",
+          "output_types": [
+            "message"
+          ],
+          "tool_item_count": 0,
+          "message_item_count": 1,
+          "reasoning_item_count": 0,
+          "mixed_message_tool": false,
+          "top_level_output_text_present": true,
+          "usage_present": false,
+          "timings_present": false,
+          "plan_wrapper_present": false,
+          "first_message_text": "[proxy] apply_patch retry could not be completed. Retry with apply_patch if the task still requires a file write. (`no_tool_call`).",
+          "final_message_text": "[proxy] apply_patch retry could not be completed. Retry with apply_patch if the task still requires a file write. (`no_tool_call`).",
+          "tool_item_statuses": [],
+          "tool_item_names": []
+        }
+      },
+      "stream_basic": {
+        "http_status": 200,
+        "duration_ms": 1378,
+        "error_text": "",
+        "stream": true,
+        "stream_summary": {
+          "raw_event_count": 64,
+          "event_order": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+            "response.output_item.done",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.completed"
+          ],
+          "event_counts": {
+            "response.created": 1,
+            "response.in_progress": 1,
+            "response.output_item.added": 3,
+            "response.reasoning_summary_part.added": 1,
+            "response.reasoning_summary_text.delta": 45,
+            "response.content_part.added": 2,
+            "response.output_text.delta": 1,
+            "response.reasoning_summary_text.done": 1,
+            "response.reasoning_summary_part.done": 1,
+            "response.output_item.done": 3,
+            "response.output_text.done": 2,
+            "response.content_part.done": 2,
+            "response.completed": 1
+          },
+          "reasoning_event_names": [
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done"
+          ],
+          "has_created": true,
+          "has_in_progress": true,
+          "has_output_text_done": true,
+          "has_function_arguments_done": false,
+          "has_completed": true,
+          "output_item_done_types": [
+            "reasoning",
+            "message",
+            "message"
+          ],
+          "completed_response": {
+            "response_id": "resp_1778313196176577765",
+            "response_status": "completed",
+            "object": "response",
+            "output_types": [
+              "reasoning",
+              "message",
+              "message"
+            ],
+            "tool_item_count": 0,
+            "message_item_count": 2,
+            "reasoning_item_count": 1,
+            "mixed_message_tool": false,
+            "top_level_output_text_present": true,
+            "usage_present": true,
+            "timings_present": true,
+            "plan_wrapper_present": false,
+            "first_message_text": "Working on the request.",
+            "final_message_text": "STREAM_OK",
+            "tool_item_statuses": [],
+            "tool_item_names": []
+          }
+        }
+      },
+      "stream_tool": {
+        "http_status": 200,
+        "duration_ms": 2742,
+        "error_text": "",
+        "stream": true,
+        "stream_summary": {
+          "raw_event_count": 78,
+          "event_order": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+            "response.output_item.done",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.completed"
+          ],
+          "event_counts": {
+            "response.created": 1,
+            "response.in_progress": 1,
+            "response.output_item.added": 3,
+            "response.reasoning_summary_part.added": 1,
+            "response.reasoning_summary_text.delta": 59,
+            "response.content_part.added": 2,
+            "response.output_text.delta": 1,
+            "response.reasoning_summary_text.done": 1,
+            "response.reasoning_summary_part.done": 1,
+            "response.output_item.done": 3,
+            "response.output_text.done": 2,
+            "response.content_part.done": 2,
+            "response.completed": 1
+          },
+          "reasoning_event_names": [
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done"
+          ],
+          "has_created": true,
+          "has_in_progress": true,
+          "has_output_text_done": true,
+          "has_function_arguments_done": false,
+          "has_completed": true,
+          "output_item_done_types": [
+            "reasoning",
+            "message",
+            "message"
+          ],
+          "completed_response": {
+            "response_id": "resp_1778313197482268601",
+            "response_status": "completed",
+            "object": "response",
+            "output_types": [
+              "reasoning",
+              "message",
+              "message"
+            ],
+            "tool_item_count": 0,
+            "message_item_count": 2,
+            "reasoning_item_count": 1,
+            "mixed_message_tool": false,
+            "top_level_output_text_present": true,
+            "usage_present": true,
+            "timings_present": true,
+            "plan_wrapper_present": false,
+            "first_message_text": "Working on the request.",
+            "final_message_text": "I can see the echo_tool function available, but I need to know what value you'd like me to test it with. Could you please provide the value you'd like me to echo?",
+            "tool_item_statuses": [],
+            "tool_item_names": []
+          }
+        }
+      },
+      "stream_plan_only": {
+        "http_status": 200,
+        "duration_ms": 23783,
+        "error_text": "",
+        "stream": true,
+        "stream_summary": {
+          "raw_event_count": 802,
+          "event_order": [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+            "response.output_item.done",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.completed"
+          ],
+          "event_counts": {
+            "response.created": 1,
+            "response.in_progress": 1,
+            "response.output_item.added": 3,
+            "response.reasoning_summary_part.added": 1,
+            "response.reasoning_summary_text.delta": 782,
+            "response.content_part.added": 2,
+            "response.output_text.delta": 2,
+            "response.reasoning_summary_text.done": 1,
+            "response.reasoning_summary_part.done": 1,
+            "response.output_item.done": 3,
+            "response.output_text.done": 2,
+            "response.content_part.done": 2,
+            "response.completed": 1
+          },
+          "reasoning_event_names": [
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done"
+          ],
+          "has_created": true,
+          "has_in_progress": true,
+          "has_output_text_done": true,
+          "has_function_arguments_done": false,
+          "has_completed": true,
+          "output_item_done_types": [
+            "reasoning",
+            "message",
+            "message"
+          ],
+          "completed_response": {
+            "response_id": "resp_1778313200426880600",
+            "response_status": "completed",
+            "object": "response",
+            "output_types": [
+              "reasoning",
+              "message",
+              "message"
+            ],
+            "tool_item_count": 0,
+            "message_item_count": 2,
+            "reasoning_item_count": 1,
+            "mixed_message_tool": false,
+            "top_level_output_text_present": true,
+            "usage_present": true,
+            "timings_present": true,
+            "plan_wrapper_present": true,
+            "first_message_text": "Generating the requested plan.",
+            "final_message_text": "<proposed_plan>\nPlanning mode is active. Here is a structured plan only:\n1. Define scope and constraints: clarify functional requirements, target users, and non-functional goals.\n2. Design the architecture: choose components, data flow, interfaces, and error-handling strategy.\n3. Break implementation into phases: identify milestones, dependencies, and deliverables for each phase.\n4. Prepare validation: define tests, acceptance criteria, and observability checks for each milestone.\n5. Assess risks and rollout: list major risks, mitigations, fallback strategy, and rollout sequence.\n</proposed_plan>",
+            "tool_item_statuses": [],
+            "tool_item_names": []
+          }
+        }
+      }
+    }
+  },
+  "evaluations": {
+    "post_basic": {
+      "classification": "needs shim",
+      "reasons": [
+        "top-level output_text is missing",
+        "top-level output_text presence differs from bridge"
+      ],
+      "bridge_differences": [
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "get_collection": {
+      "classification": "needs shim",
+      "reasons": [
+        "collection GET is not implemented natively (HTTP 404)"
+      ],
+      "bridge_differences": []
+    },
+    "get_by_id": {
+      "classification": "needs shim",
+      "reasons": [
+        "response retrieval by id is not implemented natively (HTTP 404)"
+      ],
+      "bridge_differences": []
+    },
+    "previous_response_id": {
+      "classification": "bridge-only",
+      "reasons": [
+        "previous_response_id is rejected natively (HTTP 400)"
+      ],
+      "bridge_differences": [
+        "http status differs (native 400 vs bridge 200)"
+      ]
+    },
+    "invalid_json": {
+      "classification": "needs shim",
+      "reasons": [
+        "http status differs (native 500 vs bridge 400)"
+      ],
+      "bridge_differences": [
+        "http status differs (native 500 vs bridge 400)"
+      ]
+    },
+    "invalid_tool_type": {
+      "classification": "needs shim",
+      "reasons": [
+        "http status differs (native 400 vs bridge 200)"
+      ],
+      "bridge_differences": [
+        "http status differs (native 400 vs bridge 200)"
+      ]
+    },
+    "instructions_text": {
+      "classification": "needs shim",
+      "reasons": [
+        "top-level output_text is missing",
+        "top-level output_text presence differs from bridge"
+      ],
+      "bridge_differences": [
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "array_input": {
+      "classification": "needs shim",
+      "reasons": [
+        "top-level output_text is missing",
+        "top-level output_text presence differs from bridge"
+      ],
+      "bridge_differences": [
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "reasoning_effort": {
+      "classification": "needs shim",
+      "reasons": [
+        "top-level output_text is missing",
+        "output item types differ from bridge",
+        "top-level output_text presence differs from bridge"
+      ],
+      "bridge_differences": [
+        "output item types differ from bridge",
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "reasoning_summary": {
+      "classification": "needs shim",
+      "reasons": [
+        "top-level output_text is missing",
+        "top-level output_text presence differs from bridge"
+      ],
+      "bridge_differences": [
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "include_field": {
+      "classification": "needs shim",
+      "reasons": [
+        "top-level output_text is missing",
+        "top-level output_text presence differs from bridge"
+      ],
+      "bridge_differences": [
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "max_output_tokens": {
+      "classification": "bridge-only",
+      "reasons": [
+        "text response has no assistant message"
+      ],
+      "bridge_differences": [
+        "output item types differ from bridge",
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "tool_choice_none": {
+      "classification": "needs shim",
+      "reasons": [
+        "top-level output_text is missing",
+        "top-level output_text presence differs from bridge"
+      ],
+      "bridge_differences": [
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "tool_choice_auto": {
+      "classification": "bridge-only",
+      "reasons": [
+        "tool turn does not end in requires_action",
+        "tool item status differs from bridge tool phase"
+      ],
+      "bridge_differences": [
+        "output item types differ from bridge",
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "tool_choice_required": {
+      "classification": "bridge-only",
+      "reasons": [
+        "tool turn does not end in requires_action",
+        "tool item status differs from bridge tool phase"
+      ],
+      "bridge_differences": [
+        "response status differs (native completed vs bridge requires_action)",
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "mixed_text_tool": {
+      "classification": "bridge-only",
+      "reasons": [
+        "tool turn does not end in requires_action",
+        "tool turn mixes prose and tool output",
+        "tool item status differs from bridge tool phase"
+      ],
+      "bridge_differences": [
+        "response status differs (native completed vs bridge requires_action)",
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "function_call_output_passback": {
+      "classification": "needs shim",
+      "reasons": [
+        "post-tool continuation omits top-level output_text",
+        "top-level output_text presence differs from bridge"
+      ],
+      "bridge_differences": [
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "plan_only": {
+      "classification": "needs shim",
+      "reasons": [
+        "plan response omits top-level output_text",
+        "top-level output_text presence differs from bridge"
+      ],
+      "bridge_differences": [
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "apply_patch_intent": {
+      "classification": "bridge-only",
+      "reasons": [
+        "tool turn does not end in requires_action",
+        "tool item status differs from bridge tool phase"
+      ],
+      "bridge_differences": [
+        "output item types differ from bridge",
+        "top-level output_text presence differs from bridge"
+      ]
+    },
+    "stream_basic": {
+      "classification": "needs shim",
+      "reasons": [
+        "completed streamed response omits top-level output_text",
+        "stream reasoning lane name differs from bridge expectation",
+        "stream event order differs from bridge",
+        "reasoning event names differ from bridge"
+      ],
+      "bridge_differences": [
+        "stream event order differs from bridge",
+        "reasoning event names differ from bridge"
+      ]
+    },
+    "stream_tool": {
+      "classification": "bridge-only",
+      "reasons": [
+        "tool stream does not end in requires_action",
+        "tool stream omits response.function_call_arguments.done"
+      ],
+      "bridge_differences": [
+        "stream event order differs from bridge",
+        "reasoning event names differ from bridge"
+      ]
+    },
+    "stream_plan_only": {
+      "classification": "needs shim",
+      "reasons": [
+        "streamed plan reasoning lane differs from bridge expectation",
+        "completed streamed plan response omits top-level output_text",
+        "stream event order differs from bridge",
+        "reasoning event names differ from bridge"
+      ],
+      "bridge_differences": [
+        "stream event order differs from bridge",
+        "reasoning event names differ from bridge"
+      ]
+    }
+  }
+}

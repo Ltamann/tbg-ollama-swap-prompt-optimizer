@@ -1,0 +1,334 @@
+# llama-swap config.yaml
+# Updated model mappings based on launcher profile.
+# --chat-template-file /home/admmin/llama-swap/qwen35.jinja
+
+healthCheckTimeout: 120
+startPort: 10001
+checkEndpoint: /health
+
+models:
+  
+
+  GLM-4.7-Flash-UD-Q8_K_XL:
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/GLM-4.7-Flash-UD-Q8_K_XL.gguf
+      --host 0.0.0.0 --port ${PORT}
+      --threads 16
+      --threads-batch 16
+      --n-gpu-layers 999
+      --n-cpu-moe 0
+      --batch-size 2048
+      --ubatch-size 512
+      --ctx-size 126976
+      --temp 1
+      --top-p 0.95
+      --min-p 0.01
+      --top-k 40
+      --jinja
+      --flash-attn on
+      --parallel 1
+      --context-shift
+
+  Qwen3.6-35B-A3B-MXFP4_MOE:
+    name: "Qwen3.6-35B-A3B-MXFP4_MOE.gguf"
+    description: "Qwen3.6-35B-A3B-MXFP4_MOE.gguf"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-MXFP4_MOE.gguf
+      --mmproj /home/admmin/models/Qwen3.6-35B-A3B/mmproj-F16.gguf
+      --chat-template-file /home/admmin/models/Qwen3.6-35B-A3B/chat_template.jinja
+      --temp 0.7
+      --top-p 0.95
+      --min-p 0
+      --top-k 20
+      --reasoning on
+      --host 0.0.0.0 --port ${PORT}
+      --ctx-size 126976
+      --fit on
+      --reasoning-budget -1
+      --repeat-penalty 1
+      --no-mmap
+      --no-mmproj-offload
+      --ctx-checkpoints 5
+      --flash-attn on
+
+  gemma-4-31B-it-UD-Q8_K_XL.gguf:
+    name: "gemma-4-31B-it-UD-Q8_K_XL.gguf"
+    description: "gemma-4-31B-it-UD-Q8_K_XL.gguf"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/gemma-4-31B-it-UD-Q8_K_XL.gguf
+      --mmproj /home/admmin/models/gemma4-mmproj-BF16.gguf
+      --temp 1.0
+      --top-p 0.95
+      --top-k 64
+      --reasoning on
+      --host 0.0.0.0 --port ${PORT}
+      --ctx-size 126976
+      --fit on
+    aliases:
+      - gpt-5.1
+
+  Gemopus-4-26B-A4B-it-Preview-Q8_0:
+    name: "Gemopus-4-26B-A4B-it-Preview-Q8_0"
+    description: "Gemopus 4 26B A4B it Preview Q8_0 with mmproj"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/Gemopus-4-26B-A4B-it/Gemopus-4-26B-A4B-it-Preview-Q8_0.gguf
+      --mmproj /home/admmin/models/Gemopus-4-26B-A4B-it/mmproj.gguf
+      --temp 1.0
+      --top-p 0.95
+      --top-k 64
+      --chat-template-kwargs '{"enable_thinking":false}'
+      --chat-template-file /home/admmin/models/Gemopus-4-26B-A4B-it/chat_template.jinja
+      --host 0.0.0.0 --port ${PORT}
+      --ctx-size 126976
+      --fit on
+    aliases:
+      - gpt-5.4-mini
+
+  Gemopus-4-26B-A4B-it-Preview-Q8_0-thinking:
+    name: "Gemopus-4-26B-A4B-it-Preview-Q8_0-thinking"
+    description: "Gemopus 4 26B A4B it Preview Q8_0 with mmproj"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/Gemopus-4-26B-A4B-it/Gemopus-4-26B-A4B-it-Preview-Q8_0.gguf
+      --mmproj /home/admmin/models/Gemopus-4-26B-A4B-it/mmproj.gguf
+      --temp 1.0
+      --top-p 0.95
+      --top-k 64
+      --reasoning on
+      --chat-template-file /home/admmin/models/Gemopus-4-26B-A4B-it/chat_template.jinja
+      --host 0.0.0.0 --port ${PORT}
+      --ctx-size 126976
+      --fit on
+    aliases:
+      - gpt-5.4x
+
+
+  Qwopus3.5-27B-v3-Q4_K_M:
+    name: "Qwopus3.5-27B-v3-Q4_K_M"
+    description: "Qwen3.5 27B Claude 4.6 Opus Reasoning Distilled v3 Q4_K_M with mmproj"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/Qwopus3.5-27b-v3/Qwopus3.5-27B-v3-Q4_K_M.gguf
+      --mmproj /home/admmin/models/Qwopus3.5-27b-v3/mmproj.gguf
+      --embedding
+      --host 0.0.0.0 --port ${PORT}
+      --threads 16
+      --threads-batch 16
+      --fit on
+      --batch-size 2048
+      --ubatch-size 512
+      --ctx-size 126976
+      --temp 0.6
+      --top-p 0.95
+      --min-p 0.00
+      --top-k 20
+      --jinja
+      --flash-attn on
+      --parallel 1
+      --context-shift
+      --reasoning on
+      --chat-template-file /home/admmin/llama-swap/QWEN35_unsloth_chat_template.jinja
+    filters:
+      transformResponse: "xml_to_json_tool_calls"
+
+  Qwopus3.5-27B-v3-Q8_0-thinking:
+    name: "Qwopus3.5-27B-v3-Q8_0-thinking"
+    description: "Qwen3.5 27B Claude 4.6 Opus Reasoning Distilled v3 Q8_0 with mmproj"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/Qwopus3.5-27b-v3/Qwopus3.5-27B-v3-Q8_0.gguf
+      --mmproj /home/admmin/models/Qwopus3.5-27b-v3/mmproj.gguf
+      --embedding
+      --host 0.0.0.0 --port ${PORT}
+      --threads 16
+      --threads-batch 16
+      --fit on
+      --batch-size 2048
+      --ubatch-size 512
+      --ctx-size 126976
+      --temp 0.2
+      --top-p 0.85
+      --min-p 0.00
+      --top-k 20
+      --jinja
+      --flash-attn on
+      --parallel 1
+      --context-shift
+      --chat-template-kwargs "{\"enable_thinking\":true}"
+      --chat-template-file /home/admmin/llama-swap/QWEN35_unsloth_chat_template.jinja
+    filters:
+      transformResponse: "xml_to_json_tool_calls"
+
+  Qwen3.6-27B-UD-Q8_K_XL:
+    name: "Qwen3.6-27B-UD-Q8_K_XL"
+    description: "Qwen3.6-27B-UD-Q8_K_XL"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/Qwen3.6-27B/Qwen3.6-27B-UD-Q8_K_XL.gguf
+      --mmproj /home/admmin/models/Qwen3.6-27B/mmproj-F16.gguf
+      --chat-template-file /home/admmin/models/Qwen3.6-27B/chat_template.jinja
+      --temp 0.6
+      --top-p 0.95
+      --min-p 0
+      --top-k 20
+      --jinja
+      --reasoning on
+      --host 0.0.0.0 --port ${PORT}
+      --ctx-size 126976
+      --fit on
+      --repeat-penalty 1
+      --no-mmap
+      --no-mmproj-offload
+      --ctx-checkpoints 5
+    filters:
+      transformResponse: "xml_to_json_tool_calls"
+    aliases:
+      - gpt-5.3-codex
+
+  Qwen3.6-27B-NVFP4:
+    name: "Qwen3.6-27B-NVFP4"
+    description: "Qwen3.6-27B-NVFP4"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/Qwen3.6-27B-NVFP4/Abiray-Qwen3.6-27B-NVFP4.gguf
+      --mmproj /home/admmin/models/Qwen3.6-27B-NVFP4/mmproj-BF16.gguf
+      --temp 0.6
+      --top-p 0.95
+      --min-p 0
+      --top-k 20
+      --jinja
+      --reasoning on
+      --host 0.0.0.0 --port ${PORT}
+      --ctx-size 131072
+      --repeat-penalty 1
+      --no-mmap
+      --no-mmproj-offload
+      --ctx-checkpoints 5
+      --tensor-split 1,0
+      --n-gpu-layers 999
+      --n-cpu-moe 0
+    filters:
+      transformResponse: "xml_to_json_tool_calls"
+    aliases:
+      - gpt-5.4
+
+
+  Qwen3.6-35B-A3B-UD-Q8_K_XL:
+    name: "Qwen3.6-35B-A3B-UD-Q8_K_XL"
+    description: "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf
+      --mmproj /home/admmin/models/Qwen3.6-35B-A3B/mmproj-F16.gguf
+      --chat-template-file /home/admmin/models/Qwen3.6-35B-A3B/chat_template_fixed.jinja
+      --temp 0.7
+      --top-p 0.95
+      --min-p 0
+      --top-k 20
+      --jinja
+      --reasoning on
+      --host 0.0.0.0 --port ${PORT}
+      --ctx-size 126976
+      --fit on
+      --reasoning-budget -1
+      --repeat-penalty 1
+      --flash-attn on
+      --no-mmap
+      --no-mmproj-offload
+      --ctx-checkpoints 5
+    filters:
+      transformResponse: "xml_to_json_tool_calls"
+    aliases:
+      - gpt-5.2
+
+
+  Qwen3VL-4B-Instruct-Q4_K_M:
+    name: "Qwen3VL-4B-Instruct-Q4_K_M.gguf"
+    description: "Qwen3VL-4B-Instruct-Q4_K_M.gguf"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/Qwen3VL-4B-Instruct-Q4_K_M.gguf
+      --mmproj /home/admmin/models/mmproj-Qwen3VL-4B-Instruct-F16.gguf
+      --host 0.0.0.0 --port ${PORT}
+      --ctx-size 126976
+      --n-gpu-layers 99
+      --seed 3407
+      --temp 0.6
+      --min-p 0.0
+      --top-p 0.95
+      --top-k 20
+      --fit on
+
+  gpt-oss-20b-F16:
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/gpt-oss-20b-F16.gguf
+      --host 0.0.0.0 --port ${PORT}
+      --tensor-split 0,1
+      --threads 16
+      --threads-batch 16
+      --n-gpu-layers 999
+      --n-cpu-moe 0
+      --batch-size 2048
+      --ubatch-size 512
+      --ctx-size 126976
+      --temp 1
+      --top-p 0.95
+      --min-p 0.01
+      --top-k 40
+      --jinja
+      --flash-attn on
+      --parallel 1
+      --context-shift
+
+  gpt-oss-120b:
+    name: "gpt-oss-120b"
+    description: "gpt-oss-120b"
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/gpt-oss-120b-Q4_K_M-00001-of-00002.gguf
+      --host 0.0.0.0 --port ${PORT}
+      --cache-ram -1
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --threads 32
+      --threads-batch 48
+      --fit on
+      --batch-size 1024
+      --ubatch-size 512
+      --ctx-size 126976
+      --temp 1
+      --top-p 0.95
+      --min-p 0.01
+      --top-k 40
+      --jinja
+      --flash-attn on
+      --parallel 1
+      --context-shift
+
+  MiniMaxAI.MiniMax-M2.5.Q2_K-00001-of-00006:
+    cmd: >
+      /home/admmin/llama/cuda/llama.cpp/build/bin/llama-server
+      --model /home/admmin/models/MiniMaxAI.MiniMax-M2.5.Q2_K-00001-of-00006.gguf
+      --host 0.0.0.0 --port ${PORT}
+      --cache-ram -1
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --threads 32
+      --threads-batch 48
+      --fit on
+      --batch-size 512
+      --ubatch-size 256
+      --ctx-size 32768 
+      --temp 1
+      --top-p 0.95
+      --min-p 0.01
+      --top-k 40
+      --jinja
+      --flash-attn on
+      --parallel 1
+      --context-shift

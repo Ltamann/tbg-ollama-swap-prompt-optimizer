@@ -1,0 +1,11 @@
+{
+  "http_status": 400,
+  "duration_ms": 0,
+  "error_text": "HTTP Error 400: Bad Request",
+  "stream": false,
+  "error_summary": {
+    "error_type": "",
+    "error_code": null,
+    "message": "could not find suitable inference handler for broken"
+  }
+}

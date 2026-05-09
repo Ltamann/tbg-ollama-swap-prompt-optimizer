@@ -108,6 +108,14 @@
             "default": false,
             "description": "Present aliases within the /v1/models OpenAI API listing. when true, model aliases will be output to the API model listing duplicating all fields except for Id so chat UIs can use the alias equivalent to the original."
         },
+        "useActiveModelForAliases": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            },
+            "default": [],
+            "description": "Treat these model names as dynamic aliases that resolve to the currently active model. Useful when a client hardcodes a subagent model name (e.g. \"gpt-5.4-mini\") but you want those requests to hit the model that is already loaded."
+        },
         "macros": {
             "$ref": "#/definitions/macros"
         },

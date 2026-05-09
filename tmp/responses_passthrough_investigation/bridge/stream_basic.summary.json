@@ -1,0 +1,77 @@
+{
+  "http_status": 200,
+  "duration_ms": 1378,
+  "error_text": "",
+  "stream": true,
+  "stream_summary": {
+    "raw_event_count": 64,
+    "event_order": [
+      "response.created",
+      "response.in_progress",
+      "response.output_item.added",
+      "response.reasoning_summary_part.added",
+      "response.reasoning_summary_text.delta",
+      "response.content_part.added",
+      "response.output_text.delta",
+      "response.reasoning_summary_text.done",
+      "response.reasoning_summary_part.done",
+      "response.output_item.done",
+      "response.output_text.done",
+      "response.content_part.done",
+      "response.completed"
+    ],
+    "event_counts": {
+      "response.created": 1,
+      "response.in_progress": 1,
+      "response.output_item.added": 3,
+      "response.reasoning_summary_part.added": 1,
+      "response.reasoning_summary_text.delta": 45,
+      "response.content_part.added": 2,
+      "response.output_text.delta": 1,
+      "response.reasoning_summary_text.done": 1,
+      "response.reasoning_summary_part.done": 1,
+      "response.output_item.done": 3,
+      "response.output_text.done": 2,
+      "response.content_part.done": 2,
+      "response.completed": 1
+    },
+    "reasoning_event_names": [
+      "response.reasoning_summary_part.added",
+      "response.reasoning_summary_text.delta",
+      "response.reasoning_summary_text.done",
+      "response.reasoning_summary_part.done"
+    ],
+    "has_created": true,
+    "has_in_progress": true,
+    "has_output_text_done": true,
+    "has_function_arguments_done": false,
+    "has_completed": true,
+    "output_item_done_types": [
+      "reasoning",
+      "message",
+      "message"
+    ],
+    "completed_response": {
+      "response_id": "resp_1778313196176577765",
+      "response_status": "completed",
+      "object": "response",
+      "output_types": [
+        "reasoning",
+        "message",
+        "message"
+      ],
+      "tool_item_count": 0,
+      "message_item_count": 2,
+      "reasoning_item_count": 1,
+      "mixed_message_tool": false,
+      "top_level_output_text_present": true,
+      "usage_present": true,
+      "timings_present": true,
+      "plan_wrapper_present": false,
+      "first_message_text": "Working on the request.",
+      "final_message_text": "STREAM_OK",
+      "tool_item_statuses": [],
+      "tool_item_names": []
+    }
+  }
+}

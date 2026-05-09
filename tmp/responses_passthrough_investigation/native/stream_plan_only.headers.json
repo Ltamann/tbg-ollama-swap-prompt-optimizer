@@ -1,0 +1,7 @@
+{
+  "Connection": "close",
+  "Content-Type": "text/event-stream",
+  "Server": "llama.cpp",
+  "Transfer-Encoding": "chunked",
+  "Access-Control-Allow-Origin": ""
+}

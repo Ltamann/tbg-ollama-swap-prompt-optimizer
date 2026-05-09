@@ -1,0 +1,27 @@
+{
+  "http_status": 200,
+  "duration_ms": 5679,
+  "error_text": "",
+  "stream": false,
+  "response_summary": {
+    "response_id": "resp_4IibOWZPpa0axAYey76OTgNcOJZnaVVc",
+    "response_status": "completed",
+    "object": "response",
+    "output_types": [
+      "reasoning",
+      "message"
+    ],
+    "tool_item_count": 0,
+    "message_item_count": 1,
+    "reasoning_item_count": 1,
+    "mixed_message_tool": false,
+    "top_level_output_text_present": false,
+    "usage_present": true,
+    "timings_present": false,
+    "plan_wrapper_present": false,
+    "first_message_text": "NO_TOOL_OK",
+    "final_message_text": "NO_TOOL_OK",
+    "tool_item_statuses": [],
+    "tool_item_names": []
+  }
+}

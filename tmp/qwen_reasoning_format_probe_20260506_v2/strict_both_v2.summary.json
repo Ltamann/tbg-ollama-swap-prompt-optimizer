@@ -1,0 +1,11 @@
+{
+  "case": "strict_both_v2",
+  "duration_ms": 22763331,
+  "reasoning_starts_summary": false,
+  "reasoning_has_summary": true,
+  "reasoning_has_detail": true,
+  "content_starts_summary": false,
+  "content_has_summary": false,
+  "reasoning_preview": "Here's a thinking process that leads to the suggested reasoning format:\n\n1.  **Analyze the Request:**\n    *   **Goal:** Design a reasoning format for a coding agent.\n    *   **Requirements:**\n        *   Must include short user-facing progress.\n        *   Must include full detailed reasoning.\n        *   The reasoning block must start with a specific structure (`[SUMMARY]` ... `[DETAIL]`).\n        *   No numbered lists or prefaces in the thinking block.\n        *   The final visible answer should be brief.\n\n2.  **Deconstruct the \"Reasoning Format\" Design:**\n    *   *What makes a good coding agent reasoning format?*\n        *   It needs to separate internal monologue (debugging, logic, code generation) from external communication (updates for the user).\n        *   It needs to be structured so the LLM can follow it easily.\n        *   It needs to handle the \"progress\" aspect effectively ",
+  "content_preview": ""
+}

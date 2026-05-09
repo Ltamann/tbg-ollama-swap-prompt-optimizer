@@ -1,0 +1,1 @@
+{"error":{"code":400,"message":"llama.cpp does not support 'previous_response_id'.","type":"invalid_request_error"}}

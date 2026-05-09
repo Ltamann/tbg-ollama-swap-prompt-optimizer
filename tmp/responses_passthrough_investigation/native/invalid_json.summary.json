@@ -1,0 +1,11 @@
+{
+  "http_status": 500,
+  "duration_ms": 0,
+  "error_text": "HTTP Error 500: Internal Server Error",
+  "stream": false,
+  "error_summary": {
+    "error_type": "server_error",
+    "error_code": 500,
+    "message": "[json.exception.parse_error.101] parse error at line 1, column 18: syntax error while parsing object - unexpected end of input; expected '}'"
+  }
+}

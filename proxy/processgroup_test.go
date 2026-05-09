@@ -141,6 +141,11 @@ func TestIsTransientStartError(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "ready_swap_race",
+			err:  fmt.Errorf("failed to set Process state to ready: current state: stopped, error: expected state mismatch"),
+			want: true,
+		},
+		{
 			name: "non_transient_error",
 			err:  fmt.Errorf("start() failed for command 'x': exit status 127"),
 			want: false,

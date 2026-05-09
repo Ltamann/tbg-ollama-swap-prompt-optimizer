@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"sync"
 )
@@ -28,6 +29,12 @@ func (s *captureStagesStore) add(name string, payload []byte) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if n := len(s.stages); n > 0 {
+		last := s.stages[n-1]
+		if last.Name == name && bytes.Equal(last.Payload, payload) {
+			return
+		}
+	}
 	s.stages = append(s.stages, CaptureStage{Name: name, Payload: append([]byte(nil), payload...)})
 }
 

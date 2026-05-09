@@ -145,6 +145,7 @@ func isTransientStartError(err error) bool {
 		"upstream command exited prematurely but successfully",
 		"process was already starting but wound up in state stopped",
 		"processes was in state starting when start() was called",
+		"failed to set process state to ready",
 	}
 	for _, marker := range transientMarkers {
 		if strings.Contains(msg, marker) {

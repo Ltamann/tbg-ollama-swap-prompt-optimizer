@@ -1,0 +1,5 @@
+{
+  "method": "GET",
+  "path_template": "/responses",
+  "target_model": "Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf"
+}
