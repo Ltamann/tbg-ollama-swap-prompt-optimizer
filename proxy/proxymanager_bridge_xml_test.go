@@ -1025,7 +1025,7 @@ func TestTranslateChatCompletionToResponsesResponse_PromotedReasoningStripsOrpha
 	assert.NotContains(t, string(out), "</think>")
 }
 
-func TestTranslateChatCompletionToResponsesResponse_EmptyThinkLeakGetsVisibleFallback(t *testing.T) {
+func TestTranslateChatCompletionToResponsesResponse_EmptyThinkLeakDoesNotGetVisibleFallback(t *testing.T) {
 	body := []byte(`{
 	  "id": "chatcmpl-empty-think-leak",
 	  "model": "gpt-5.2",
@@ -1042,9 +1042,9 @@ func TestTranslateChatCompletionToResponsesResponse_EmptyThinkLeakGetsVisibleFal
 	out, err := translateChatCompletionToResponsesResponse(body, "", "", "")
 	require.NoError(t, err)
 
-	assert.Equal(t, emptyAssistantOutputFallbackText, gjson.GetBytes(out, "output_text").String())
-	assert.Equal(t, "message", gjson.GetBytes(out, "output.0.type").String())
-	assert.Equal(t, emptyAssistantOutputFallbackText, gjson.GetBytes(out, "output.0.content.0.text").String())
+	assert.Equal(t, "", gjson.GetBytes(out, "output_text").String())
+	assert.False(t, gjson.GetBytes(out, "output.0.type").Exists())
+	assert.NotContains(t, string(out), "upstream returned no usable assistant content")
 }
 
 func TestTranslateChatCompletionToResponsesResponse_ReasoningFunctionStyleRecoveryAllowed(t *testing.T) {
@@ -1223,10 +1223,14 @@ func TestNormalizeTranslatedResponsesOutput_NormalizesShellCommandAndCommands(t 
 	output := resp["output"].([]any)
 	call := output[0].(map[string]any)
 	args := parseToolArgsMapString(fmt.Sprintf("%v", call["arguments"]))
+	command, hasCommand := args["command"].([]any)
+	require.True(t, hasCommand)
+	require.Len(t, command, 1)
+	assert.Equal(t, "pwd", fmt.Sprintf("%v", command[0]))
 	commands, ok := args["commands"].([]any)
 	require.True(t, ok)
-	require.Len(t, commands, 2)
-	assert.Equal(t, "pwd", fmt.Sprintf("%v", commands[0]))
+	require.Len(t, commands, 1)
+	assert.NotEmpty(t, strings.TrimSpace(fmt.Sprintf("%v", commands[0])))
 }
 
 func TestNormalizeTranslatedResponsesOutput_KeepsMCPFunctionCallClientCompatible(t *testing.T) {
@@ -1298,14 +1302,12 @@ func TestNormalizeShellArgumentMapForResponse_PromotesLegacyCommandsArray(t *tes
 		"commands": []any{"powershell.exe", "-Command", "Get-ChildItem -Force"},
 	})
 
-	_, hasCommands := args["commands"]
-	assert.False(t, hasCommands)
-	command, hasCommand := args["command"].([]any)
-	assert.True(t, hasCommand)
-	require.Len(t, command, 3)
-	assert.Equal(t, "powershell.exe", fmt.Sprintf("%v", command[0]))
-	assert.Equal(t, "-Command", fmt.Sprintf("%v", command[1]))
-	assert.Equal(t, "Get-ChildItem -Force", fmt.Sprintf("%v", command[2]))
+	_, hasCommand := args["command"]
+	assert.False(t, hasCommand)
+	commands, hasCommands := args["commands"].([]any)
+	assert.True(t, hasCommands)
+	require.Len(t, commands, 1)
+	assert.Equal(t, "powershell.exe -Command 'Get-ChildItem -Force'", fmt.Sprintf("%v", commands[0]))
 }
 
 func TestNormalizeShellArgumentMap_StripsWholeCommandQuotes(t *testing.T) {
@@ -1321,6 +1323,21 @@ func TestNormalizeShellArgumentMap_StripsWholeCommandQuotes(t *testing.T) {
 	require.Len(t, command, 2)
 	assert.Equal(t, "cat", fmt.Sprintf("%v", command[0]))
 	assert.Equal(t, "/tmp/test.txt", fmt.Sprintf("%v", command[1]))
+}
+
+func TestNormalizeShellArgumentMap_AcceptsCmdAlias(t *testing.T) {
+	args := normalizeShellArgumentMap(map[string]any{
+		"cmd": "cat ./tmp/demo/file.txt",
+	})
+
+	commands := normalizeShellCommandsValue(args["commands"])
+	require.Len(t, commands, 1)
+	assert.Equal(t, "cat ./tmp/demo/file.txt", commands[0])
+	command, hasCommand := args["command"].([]any)
+	assert.True(t, hasCommand)
+	require.Len(t, command, 2)
+	assert.Equal(t, "cat", fmt.Sprintf("%v", command[0]))
+	assert.Equal(t, "./tmp/demo/file.txt", fmt.Sprintf("%v", command[1]))
 }
 
 func TestXMLToolPayloadCommandArray(t *testing.T) {
@@ -2137,6 +2154,23 @@ func TestExtractApplyPatchPathHintFromResponsesRequestBody_UsesEarlierEnvironmen
 	assert.Equal(t, filepath.ToSlash(targetPath), extractApplyPatchPathHintFromResponsesRequestBody(body))
 }
 
+func TestExtractApplyPatchContentHintFromResponsesRequestBody_PreservesQuotedCodeLine(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{
+				"type":"message",
+				"role":"user",
+				"content":[
+					{"type":"input_text","text":"Update ./tmp/demo/app.js by appending exactly one line: console.log(\"stress-suite-ready\");\nVerify the saved file before the final answer."}
+				]
+			}
+		]
+	}`)
+
+	assert.Equal(t, `console.log("stress-suite-ready");`, extractApplyPatchContentHintFromResponsesRequestBody(body))
+}
+
 func TestNormalizeApplyPatchPathForWorkspace_UnescapesEscapedWindowsPath(t *testing.T) {
 	assert.Equal(
 		t,
@@ -2942,6 +2976,33 @@ func TestTranslateResponsesToChatCompletionsRequest_OmitsForcedApplyPatchToolCho
 	assert.False(t, gjson.GetBytes(out, "tool_choice").Exists())
 }
 
+func TestTranslateResponsesToChatCompletionsRequest_PlanModeKeepsWebSearchToolHistory(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"stream":false,
+		"instructions":"<collaboration_mode># Plan Mode (Conversational)\nOnly output the final plan when it is decision complete.\nWrap the final answer in <proposed_plan>...</proposed_plan> tags exactly.\nYou are in Plan Mode.\n</collaboration_mode>",
+		"tools":[{"type":"web_search"}],
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Investigate the web for first-grade quiz game ideas, then write the final plan. Do not implement it."}]},
+			{"type":"web_search_call","call_id":"call_web_1","action":{"query":"first grade quiz game ideas educational"}},
+			{"type":"web_search_call_output","call_id":"call_web_1","output":"{\"results\":[{\"title\":\"A\"}]}"}
+		]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(out, &payload))
+	rawMessages, ok := payload["messages"].([]any)
+	require.True(t, ok)
+	joined := mustJSONString(rawMessages)
+	assert.Contains(t, joined, `"tool_calls"`)
+	assert.Contains(t, joined, llamaSwapWebSearchFunctionName)
+	assert.Contains(t, joined, `"tool_call_id":"call_web_1"`)
+	assert.Contains(t, joined, `web_search_call_output`)
+}
+
 func TestTranslateResponsesToChatCompletionsRequest_ForcesFinalAnswerAfterSatisfiedApplyPatch(t *testing.T) {
 	tmpDir := t.TempDir()
 	target := filepath.Join(tmpDir, "done.txt")
@@ -3096,6 +3157,30 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanModeInvestigateTheWebAft
 	assert.NotContains(t, string(out), `Return exactly one complete <proposed_plan> block now`)
 }
 
+func TestTranslateResponsesToChatCompletionsRequest_SlashModePlanWebResearchKeepsSearchTools(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.2",
+		"stream":true,
+		"parallel_tool_calls":true,
+		"tool_choice":"auto",
+		"tools":[
+			{"type":"web_search"},
+			{"type":"function","function":{"name":"shell"}}
+		],
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"/mode plan\nInvestigate the web for a first grade quiz game, define a plan. Use web search and return the final visible answer as exactly one <proposed_plan>...</proposed_plan> block."}]}
+		]
+	}`)
+
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	assert.Equal(t, "auto", gjson.GetBytes(out, "tool_choice").String())
+	assert.Contains(t, string(out), `"name":"web_search"`)
+	assert.Contains(t, string(out), `"name":"shell"`)
+	assert.NotContains(t, string(out), `"tool_choice":"none"`)
+}
+
 func TestTranslateResponsesToChatCompletionsRequest_SlashModeAndReasoningCommands(t *testing.T) {
 	body := []byte(`{
 		"model":"gpt-5.2",
@@ -3243,6 +3328,7 @@ func TestTranslateResponsesToChatCompletionsRequest_ToolsStripGrammarConstraints
 
 	assert.True(t, gjson.GetBytes(out, "tools").Exists())
 	assert.False(t, gjson.GetBytes(out, "grammar").Exists())
+	assert.False(t, gjson.GetBytes(out, "logit_bias.248069").Exists())
 	assert.Equal(t, true, gjson.GetBytes(out, "chat_template_kwargs.enable_thinking").Bool())
 }
 
@@ -3487,7 +3573,29 @@ func TestEnforcePlanModeResponse_RewritesPhaseOneExplorationWithShellTags(t *tes
 
 	out := enforcePlanModeResponse(body, true)
 	text := gjson.GetBytes(out, "output.0.content.0.text").String()
-	assert.Contains(t, text, "Planning mode is active. Here is a structured plan only:")
+	assert.Contains(t, text, "Let me first check if there is existing project context.")
+	assert.NotContains(t, text, "Planning mode is active. Here is a structured plan only:")
+}
+
+func TestEnforcePlanModeResponse_DoesNotInjectGenericPlanForPlaceholderReply(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_plan_placeholder",
+		"object":"response",
+		"status":"completed",
+		"output":[
+			{
+				"id":"msg_1",
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"Working on the request."}]
+			}
+		]
+	}`)
+
+	out := enforcePlanModeResponse(body, true)
+	text := gjson.GetBytes(out, "output.0.content.0.text").String()
+	assert.Equal(t, "Working on the request.", text)
+	assert.NotContains(t, text, "Planning mode is active. Here is a structured plan only:")
 }
 
 func TestIsCodexManagedPlanMode_DetectsCollaborationModeTag(t *testing.T) {
@@ -3571,7 +3679,7 @@ func TestEnforcePlanModeResponse_EmitsLengthDiagnosticForEmptyLengthFinish(t *te
 	assert.Contains(t, text, "<proposed_plan>")
 }
 
-func TestEnforcePlanModeResponse_UsesReasoningSummaryBeforeGenericFallback(t *testing.T) {
+func TestEnforcePlanModeResponse_DoesNotSynthesizePlanFromReasoningSummaryOnly(t *testing.T) {
 	body := []byte(`{
 		"id":"resp_plan_reasoning",
 		"object":"response",
@@ -3598,11 +3706,60 @@ func TestEnforcePlanModeResponse_UsesReasoningSummaryBeforeGenericFallback(t *te
 	}`)
 
 	out := enforcePlanModeResponse(body, true)
+	assert.JSONEq(t, string(body), string(out))
+}
+
+func TestEnforcePlanModeResponse_PrefersVisiblePlanBlockOverReasoningSummary(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_plan_native_visible",
+		"object":"response",
+		"status":"completed",
+		"output":[
+			{
+				"id":"rs_1",
+				"type":"reasoning",
+				"summary":[
+					{
+						"type":"summary_text",
+						"text":"The user has answered the questions. Now I have clear direction:\n1. Plain HTML/CSS/JS\n2. Local JSON files for quiz storage\n3. Solo play first"
+					}
+				]
+			},
+			{
+				"id":"msg_1",
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"Perfect—plain HTML/CSS/JS, local JSON quizzes, and solo play first.\n\n<proposed_plan>\n## First-Grade Quiz Game\n1. Build the UI\n2. Load local JSON quizzes\n3. Validate solo play flow\n</proposed_plan>"}]
+			}
+		],
+		"output_text":"Perfect—plain HTML/CSS/JS, local JSON quizzes, and solo play first.\n\n<proposed_plan>\n## First-Grade Quiz Game\n1. Build the UI\n2. Load local JSON quizzes\n3. Validate solo play flow\n</proposed_plan>"
+	}`)
+
+	out := enforcePlanModeResponse(body, true)
 	text := gjson.GetBytes(out, "output.0.content.0.text").String()
-	assert.Contains(t, text, "<proposed_plan>")
-	assert.Contains(t, text, "HTML + JavaScript")
-	assert.Contains(t, text, "Score tracking")
-	assert.NotContains(t, text, "Define scope and constraints")
+	assert.Contains(t, text, "## First-Grade Quiz Game")
+	assert.Contains(t, text, "Load local JSON quizzes")
+	assert.NotContains(t, text, "The user has answered the questions. Now I have clear direction")
+}
+
+func TestEnforcePlanModeResponse_DoesNotWrapResearchSummaryWithoutVisiblePlanBlock(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_plan_research_summary",
+		"object":"response",
+		"status":"completed",
+		"output":[
+			{
+				"id":"msg_1",
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"I've gathered great research from several quiz platforms.\n\nKey findings from the web:\n- Big buttons\n- Bright colors\n- Short questions"}]
+			}
+		],
+		"output_text":"I've gathered great research from several quiz platforms.\n\nKey findings from the web:\n- Big buttons\n- Bright colors\n- Short questions"
+	}`)
+
+	out := enforcePlanModeResponse(body, true)
+	assert.JSONEq(t, string(body), string(out))
 }
 
 func TestBuildResponsesBridgeHandler_ForwardsNativeStreamWhenSafe(t *testing.T) {
@@ -3916,6 +4073,104 @@ func TestBuildResponsesBridgeHandler_RetriesMissingWebSearchCallBeforeFinalizing
 	assert.Contains(t, rec.Body.String(), "web_search_call_output")
 }
 
+func TestBuildResponsesBridgeHandler_RetriesInvalidApplyPatchOperationBeforeSurfacingWarning(t *testing.T) {
+	pm := &ProxyManager{}
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"stream":false,
+		"tools":[{"type":"apply_patch"},{"type":"shell"}],
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Create quiz/index.html with apply_patch."}]}]
+	}`)
+
+	attempts := 0
+	var upstreamBodies [][]byte
+	nextHandler := func(_ string, w http.ResponseWriter, r *http.Request) error {
+		attempts++
+		raw, _ := io.ReadAll(r.Body)
+		upstreamBodies = append(upstreamBodies, raw)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		switch attempts {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-ap-1",
+				"model":"qwen-test",
+				"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_ap_1","type":"function","function":{"name":"apply_patch","arguments":"{\"operation\":{\"path\":\"quiz/index.html\",\"type\":\"create_file\"}}"}}]},"finish_reason":"tool_calls"}]
+			}`))
+		default:
+			assert.Contains(t, string(raw), "Strict apply_patch recovery mode")
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-ap-2",
+				"model":"qwen-test",
+				"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_ap_2","type":"function","function":{"name":"apply_patch","arguments":"{\"operation\":{\"type\":\"create_file\",\"path\":\"quiz/index.html\",\"content\":\"<html></html>\"}}"}}]},"finish_reason":"tool_calls"}]
+			}`))
+		}
+		return nil
+	}
+
+	handler := pm.buildResponsesBridgeHandler("gpt-5.4", body, nextHandler)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	err := handler("gpt-5.4", rec, req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, attempts)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"path":"quiz/index.html"`)
+	assert.Contains(t, rec.Body.String(), `"type":"create_file"`)
+	assert.NotContains(t, rec.Body.String(), "apply_patch call was not executed because operation was invalid")
+}
+
+func TestBuildResponsesBridgeHandler_RetriesMissingBrowserOpenCallBeforeFinalizing(t *testing.T) {
+	pm := &ProxyManager{}
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"stream":false,
+		"tools":[{"type":"shell"},{"type":"apply_patch"}],
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"Create a quiz app, verify it, and open it in the default browser."}]},
+			{"type":"function_call_output","call_id":"call_patch_1","output":"Patch applied."},
+			{"type":"function_call_output","call_id":"call_shell_1","output":"index.html style.css script.js"}
+		]
+	}`)
+
+	attempts := 0
+	nextHandler := func(_ string, w http.ResponseWriter, r *http.Request) error {
+		attempts++
+		raw, _ := io.ReadAll(r.Body)
+		bodyText := string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		switch attempts {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-browser-1",
+				"model":"qwen-test",
+				"choices":[{"message":{"role":"assistant","content":"Let's open it in your default browser!","reasoning_content":"All three files are created successfully. Let me open it in the browser so the user can see it working."},"finish_reason":"stop"}]
+			}`))
+		default:
+			assert.Contains(t, bodyText, "open the finished local artifact in the user's default browser")
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-browser-2",
+				"model":"qwen-test",
+				"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_shell_open_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"powershell.exe -Command Start-Process quiz/index.html\"}"}}]},"finish_reason":"tool_calls"}]
+			}`))
+		}
+		return nil
+	}
+
+	handler := pm.buildResponsesBridgeHandler("gpt-5.4", body, nextHandler)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	err := handler("gpt-5.4", rec, req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, attempts)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"name":"shell"`)
+	assert.NotContains(t, rec.Body.String(), `"output_text":"Let's open it in your default browser!"`)
+}
+
 func TestTranslateChatCompletionToResponsesResponse_StripsEmptyToolCodeMarkup(t *testing.T) {
 	body := []byte(`{
 		"id":"chatcmpl-empty-tool-code",
@@ -3930,12 +4185,189 @@ func TestTranslateChatCompletionToResponsesResponse_StripsEmptyToolCodeMarkup(t 
 		}]
 	}`)
 
-	out, err := translateChatCompletionToResponsesResponseWithWorkflow(body, "", "", "", ToolWorkflowState{}, "")
+	out, err := translateChatCompletionToResponsesResponseWithWorkflow(body, "", "", "", ToolWorkflowState{}, "", nil)
 	require.NoError(t, err)
 
 	assert.NotContains(t, string(out), "<tool_code>")
 	assert.NotContains(t, gjson.GetBytes(out, "output_text").String(), "<tool_code>")
 	assert.NotEmpty(t, strings.TrimSpace(gjson.GetBytes(out, "output_text").String()))
+}
+
+func TestBuildResponsesBridgeHandler_RetriesDeferredSearchPromiseWithoutToolCall(t *testing.T) {
+	searchServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"A","url":"https://example.com/a","content":"alpha"}]}`))
+	}))
+	defer searchServer.Close()
+
+	pm := &ProxyManager{}
+	pm.setWebSearchFallbackSettings(true, "searxng", searchServer.URL+"/search")
+	body := []byte(`{
+		"model":"gpt-5.3-codex",
+		"stream":false,
+		"tools":[{"type":"web_search"}],
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Research first-grade quiz game ideas and mechanics"}]}]
+	}`)
+
+	attempts := 0
+	nextHandler := func(_ string, w http.ResponseWriter, r *http.Request) error {
+		attempts++
+		raw, _ := io.ReadAll(r.Body)
+		bodyText := string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		switch attempts {
+		case 1:
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-web-deferred-1",
+				"model":"qwen-test",
+				"choices":[{"message":{"role":"assistant","content":"Good! I now have more context. Let me also search for first-grade specific quiz game ideas and mechanics."},"finish_reason":"stop"}]
+			}`))
+		case 2:
+			assert.Contains(t, bodyText, "emit exactly one real web_search tool call next")
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-web-deferred-2",
+				"model":"qwen-test",
+				"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_web_retry_2","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"first-grade quiz game ideas and mechanics\"}"}}]},"finish_reason":"tool_calls"}]
+			}`))
+		default:
+			assert.Contains(t, bodyText, "web_search_call_output")
+			_, _ = w.Write([]byte(`{
+				"id":"chatcmpl-web-deferred-3",
+				"model":"qwen-test",
+				"choices":[{"message":{"role":"assistant","content":"FINAL_DEFERRED_SEARCH_OK"},"finish_reason":"stop"}]
+			}`))
+		}
+		return nil
+	}
+
+	handler := pm.buildResponsesBridgeHandler("gpt-5.3-codex", body, nextHandler)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	err := handler("gpt-5.3-codex", rec, req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, attempts)
+	assert.Contains(t, rec.Body.String(), "FINAL_DEFERRED_SEARCH_OK")
+	assert.Contains(t, rec.Body.String(), "web_search_call_output")
+}
+
+func TestBuildResponsesBridgeHandler_RepeatedWebSearchContinuationsFinalizeLastSearchWithoutBridge500(t *testing.T) {
+	searchServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"A","url":"https://example.com/a","content":"alpha"}]}`))
+	}))
+	defer searchServer.Close()
+
+	pm := &ProxyManager{}
+	pm.setWebSearchFallbackSettings(true, "searxng", searchServer.URL+"/search")
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"stream":false,
+		"instructions":"<collaboration_mode># Plan Mode (Conversational)\nOnly output the final plan when it is decision complete.\nWrap the final answer in <proposed_plan>...</proposed_plan> tags exactly.\nYou are in Plan Mode.\n</collaboration_mode>",
+		"tools":[{"type":"web_search"}],
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Investigate the web for first-grade quiz game ideas, then write the final plan. Do not implement it."}]}]
+	}`)
+
+	attempts := 0
+	nextHandler := func(_ string, w http.ResponseWriter, r *http.Request) error {
+		attempts++
+		raw, _ := io.ReadAll(r.Body)
+		bodyText := string(raw)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		switch attempts {
+		case 1:
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-loop-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_web_1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"first grade quiz game ideas educational\\\"}\"}}]},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-loop-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			assert.Contains(t, bodyText, "web_search_call_output")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-loop-2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_web_2\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"first grade quiz game mechanics interactive learning games kids\\\"}\"}}]},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-loop-2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 3:
+			assert.Contains(t, bodyText, "web_search_call_output")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-loop-3\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_web_3\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"first grade quiz reward systems stars badges classroom\\\"}\"}}]},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-loop-3\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected extra attempt %d", attempts)
+		}
+		return nil
+	}
+
+	handler := pm.buildResponsesBridgeHandler("gpt-5.4", body, nextHandler)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	err := handler("gpt-5.4", rec, req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, attempts)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"type":"web_search_call_output"`)
+	assert.Contains(t, rec.Body.String(), `"call_id":"call_web_3"`)
+	assert.NotContains(t, rec.Body.String(), "responses bridge failed after retries")
+}
+
+func TestBuildResponsesBridgeHandler_FinalizesMultiplePendingWebSearchCallsFromLastTurn(t *testing.T) {
+	searchServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"A","url":"https://example.com/a","content":"alpha"}]}`))
+	}))
+	defer searchServer.Close()
+
+	pm := &ProxyManager{}
+	pm.setWebSearchFallbackSettings(true, "searxng", searchServer.URL+"/search")
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"stream":false,
+		"instructions":"<collaboration_mode># Plan Mode (Conversational)\nOnly output the final plan when it is decision complete.\nWrap the final answer in <proposed_plan>...</proposed_plan> tags exactly.\nYou are in Plan Mode.\n</collaboration_mode>",
+		"tools":[{"type":"web_search"}],
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Investigate the web for first-grade quiz game ideas, then write the final plan. Do not implement it."}]}]
+	}`)
+
+	attempts := 0
+	nextHandler := func(_ string, w http.ResponseWriter, r *http.Request) error {
+		attempts++
+		raw, _ := io.ReadAll(r.Body)
+		bodyText := string(raw)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		switch attempts {
+		case 1:
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-multi-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_web_1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"first grade quiz game ideas educational\\\"}\"}}]},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-multi-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			assert.Contains(t, bodyText, "web_search_call_output")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-multi-2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_web_2\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"first grade quiz game mechanics interactive learning games kids\\\"}\"}}]},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-multi-2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 3:
+			assert.Contains(t, bodyText, "web_search_call_output")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-multi-3\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_web_3\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"first grade quiz reward systems stars badges classroom\\\"}\"}},{\"index\":1,\"id\":\"call_web_4\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"ABCya first grade quiz game features how it works\\\"}\"}}]},\"finish_reason\":null}]}\n\n"))
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-web-multi-3\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected extra attempt %d", attempts)
+		}
+		return nil
+	}
+
+	handler := pm.buildResponsesBridgeHandler("gpt-5.4", body, nextHandler)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	err := handler("gpt-5.4", rec, req)
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, attempts)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"type":"web_search_call_output"`)
+	assert.Contains(t, rec.Body.String(), `"call_id":"call_web_3"`)
+	assert.Contains(t, rec.Body.String(), `"call_id":"call_web_4"`)
+	assert.NotContains(t, rec.Body.String(), `"status":"requires_action"`)
+	assert.NotContains(t, rec.Body.String(), "responses bridge failed after retries")
 }
 
 func TestWriteResponsesStreamFromChatSSE_EmitsReasoningAndContentOnSeparateLanes(t *testing.T) {
@@ -4262,7 +4694,7 @@ func TestWriteResponsesStreamFromChatSSE_PreservesTimingsAndBackfillsUsage(t *te
 	assert.Contains(t, body, `"usage":{"input_tokens":16,"input_tokens_details":{"cached_tokens":3},"output_tokens":2,"total_tokens":18}`)
 }
 
-func TestWriteResponsesStreamFromChatSSE_EmptyStopTurnGetsVisibleFallback(t *testing.T) {
+func TestWriteResponsesStreamFromChatSSE_EmptyStopTurnDoesNotGetVisibleFallback(t *testing.T) {
 	upstream := strings.Join([]string{
 		`data: {"id":"chatcmpl-empty-stop","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
 		``,
@@ -4275,7 +4707,7 @@ func TestWriteResponsesStreamFromChatSSE_EmptyStopTurnGetsVisibleFallback(t *tes
 	require.NoError(t, err)
 
 	body := rec.Body.String()
-	assert.Contains(t, body, emptyAssistantOutputFallbackText)
+	assert.NotContains(t, body, "upstream returned no usable assistant content")
 	assert.Contains(t, body, `"status":"completed"`)
 	assert.Contains(t, body, `event: response.completed`)
 }
@@ -4385,7 +4817,7 @@ func TestWriteResponsesStreamFromChatSSE_PlanModeBlocksApplyPatchAndRecoversPlan
 	assert.Contains(t, body, `"status":"completed"`)
 }
 
-func TestWriteResponsesStreamFromChatSSE_DefaultPlanPrefaceIsRewrittenToStructuredPlan(t *testing.T) {
+func TestWriteResponsesStreamFromChatSSE_DefaultPlanPrefaceStaysPlainWithoutVisiblePlanBlock(t *testing.T) {
 	upstream := strings.Join([]string{
 		`data: {"id":"chatcmpl-plan-preface","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Great — I have everything I need. Here's the plan:"},"finish_reason":"stop"}]}`,
 		``,
@@ -4402,10 +4834,8 @@ func TestWriteResponsesStreamFromChatSSE_DefaultPlanPrefaceIsRewrittenToStructur
 	require.NoError(t, err)
 
 	body := rec.Body.String()
-	assert.Contains(t, body, `\u003cproposed_plan\u003e`)
-	assert.Contains(t, body, `\u003c/proposed_plan\u003e`)
-	assert.NotContains(t, body, "Great — I have everything I need. Here's the plan:")
-	assert.Contains(t, body, "Planning mode is active")
+	assert.Contains(t, body, "Great — I have everything I need. Here's the plan:")
+	assert.NotContains(t, body, `\u003cproposed_plan\u003e`)
 }
 
 func TestWriteResponsesStreamFromChatSSE_PlanModeStripsFollowupQuestionsAndMalformedCloser(t *testing.T) {
@@ -4451,6 +4881,43 @@ func TestWriteResponsesStreamFromChatSSE_PlanModeUsesReasoningToBuildSpecificPla
 	assert.NotContains(t, body, "Define scope and constraints")
 }
 
+func TestWriteResponsesStreamFromChatSSE_PlanModePrefersVisiblePlanOverReasoningSummary(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl-plan-visible","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"The user has answered the questions. Now I have clear direction:\n1. Plain HTML/CSS/JS\n2. Local JSON files for quiz storage\n3. Solo play first"},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl-plan-visible","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Perfect—plain HTML/CSS/JS, local JSON quizzes, and solo play first.\n\n<proposed_plan>\n## First-Grade Quiz Game\n1. Build the UI\n2. Load local JSON quizzes\n3. Validate solo play flow\n</proposed_plan>"},"finish_reason":"stop"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	err := writeResponsesStreamFromChatSSE(rec, strings.NewReader(upstream), true, "")
+	require.NoError(t, err)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, "## First-Grade Quiz Game")
+	assert.Contains(t, body, "Load local JSON quizzes")
+	assert.Contains(t, body, `"output_text":"\u003cproposed_plan\u003e\n## First-Grade Quiz Game`)
+}
+
+func TestWriteResponsesStreamFromChatSSE_PlanModeDoesNotWrapResearchSummaryWithoutVisiblePlanBlock(t *testing.T) {
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl-plan-research","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"I've gathered great research from several quiz platforms.\n\nKey findings from the web:\n- Big buttons\n- Bright colors\n- Short questions"},"finish_reason":"stop"}]}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	err := writeResponsesStreamFromChatSSE(rec, strings.NewReader(upstream), true, "")
+	require.NoError(t, err)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, "Key findings from the web:")
+	assert.NotContains(t, body, `\u003cproposed_plan\u003e`)
+}
+
 func TestWriteResponsesStreamFromChatSSE_PlanModeSuppressesQuestionShapedShellRecovery(t *testing.T) {
 	upstream := strings.Join([]string{
 		`data: {"id":"chatcmpl-plan-shell","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"The user has answered:\n- Tech: HTML + JavaScript (Recommended)\n- Features: Classic quiz (Recommended)\n- Style: Colorful & Fun\n\nLet me create a single HTML file with:\n- Multiple choice answers\n- Score tracking\n- Progress bar"},"finish_reason":null}]}`,
@@ -4473,7 +4940,7 @@ func TestWriteResponsesStreamFromChatSSE_PlanModeSuppressesQuestionShapedShellRe
 	assert.Contains(t, body, `"status":"completed"`)
 }
 
-func TestWriteResponsesStreamFromChatSSE_RewritesWeakFinalWorkflowTextAfterVerification(t *testing.T) {
+func TestWriteResponsesStreamFromChatSSE_PreservesWeakFinalWorkflowTextAfterVerification(t *testing.T) {
 	upstream := strings.Join([]string{
 		`data: {"id":"chatcmpl-weak-final","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Now verifying the final file content:"},"finish_reason":"stop"}]}`,
 		``,
@@ -4495,8 +4962,8 @@ func TestWriteResponsesStreamFromChatSSE_RewritesWeakFinalWorkflowTextAfterVerif
 	require.NoError(t, err)
 
 	body := rec.Body.String()
-	assert.Contains(t, body, "The requested file changes were applied and verified successfully.")
-	assert.NotContains(t, body, "Now verifying the final file content:")
+	assert.Contains(t, body, "Now verifying the final file content:")
+	assert.NotContains(t, body, "The requested file changes were applied and verified successfully.")
 }
 
 func TestRequestLooksLikePlanMode_DetectsSlashAndFlagSignals(t *testing.T) {
@@ -5012,7 +5479,7 @@ func TestTranslateResponsesToChatCompletionsRequest_LatestDefaultTagDoesNotStrip
 	assert.Contains(t, string(out), `"name":"shell"`)
 }
 
-func TestTranslateResponsesToChatCompletionsRequest_CodexManagedPlanModePrefersRequestUserInputTool(t *testing.T) {
+func TestTranslateResponsesToChatCompletionsRequest_CodexManagedPlanModeDoesNotForceRequestUserInputTool(t *testing.T) {
 	body := []byte(`{
 	  "model":"gpt-5.2",
 	  "instructions":"<collaboration_mode># Plan Mode (Conversational)\nUse Codex plan mode.</collaboration_mode>",
@@ -5036,17 +5503,17 @@ func TestTranslateResponsesToChatCompletionsRequest_CodexManagedPlanModePrefersR
 	require.NoError(t, err)
 
 	text := string(out)
-	assert.Contains(t, text, "use the request_user_input tool instead of writing the questions as plain assistant text")
-	assert.Contains(t, text, "Return a native function call named request_user_input")
-	assert.Contains(t, text, "Arguments must contain a questions array with exactly one short question")
-	assert.Contains(t, text, `"tool_choice":{"function":{"name":"request_user_input"},"type":"function"}`)
+	assert.NotContains(t, text, "use the request_user_input tool instead of writing the questions as plain assistant text")
+	assert.NotContains(t, text, "Return a native function call named request_user_input")
+	assert.NotContains(t, text, "Arguments must contain a questions array with exactly one short question")
+	assert.Contains(t, text, `"tool_choice":"auto"`)
 	assert.Contains(t, text, `"name":"request_user_input"`)
-	assert.NotContains(t, text, `"name":"update_plan"`)
-	assert.NotContains(t, text, `"name":"shell"`)
+	assert.Contains(t, text, `"name":"update_plan"`)
+	assert.Contains(t, text, `"name":"shell"`)
 	assert.NotContains(t, text, `"name":"apply_patch"`)
 }
 
-func TestTranslateResponsesToChatCompletionsRequest_T20NativeQuestionPromptForcesRequestUserInput(t *testing.T) {
+func TestTranslateResponsesToChatCompletionsRequest_T20NativeQuestionPromptDoesNotForceRequestUserInput(t *testing.T) {
 	body := []byte(`{
 	  "model":"gpt-5.2",
 	  "instructions":"<collaboration_mode># Plan Mode (Conversational)\nUse Codex plan mode.</collaboration_mode>",
@@ -5070,12 +5537,12 @@ func TestTranslateResponsesToChatCompletionsRequest_T20NativeQuestionPromptForce
 	require.NoError(t, err)
 
 	text := string(out)
-	assert.Contains(t, text, `"tool_choice":{"function":{"name":"request_user_input"},"type":"function"}`)
+	assert.Contains(t, text, `"tool_choice":"auto"`)
 	assert.Contains(t, text, `"name":"request_user_input"`)
-	assert.NotContains(t, text, `"name":"update_plan"`)
-	assert.NotContains(t, text, `"name":"shell"`)
+	assert.Contains(t, text, `"name":"update_plan"`)
+	assert.Contains(t, text, `"name":"shell"`)
 	assert.NotContains(t, text, `"name":"apply_patch"`)
-	assert.Equal(t, "false", gjson.GetBytes(out, "chat_template_kwargs.enable_thinking").Raw)
+	assert.Equal(t, "", gjson.GetBytes(out, "chat_template_kwargs.enable_thinking").Raw)
 }
 
 func TestTranslateResponsesToChatCompletionsRequest_PrunesToolsToForcedSpecificToolChoice(t *testing.T) {
@@ -6069,6 +6536,7 @@ func TestTranslateChatCompletionToResponsesResponseWithWorkflow_RecoversVerifica
 			VerificationCompleted: false,
 		},
 		`{"command":["powershell.exe","-Command","Get-Content mutations/base_a.txt"]}`,
+		nil,
 	)
 	require.NoError(t, err)
 
@@ -6077,6 +6545,94 @@ func TestTranslateChatCompletionToResponsesResponseWithWorkflow_RecoversVerifica
 	assert.Contains(t, jsonText, `"name":"shell"`)
 	assert.Contains(t, jsonText, `Get-Content mutations/base_a.txt`)
 	assert.NotContains(t, jsonText, `Now verifying the final file content.`)
+}
+
+func TestTranslateChatCompletionToResponsesResponseWithWorkflow_PreservesVisibleProposedPlanBlock(t *testing.T) {
+	body := []byte(`{
+	  "id":"chatcmpl-plan-visible",
+	  "object":"chat.completion",
+	  "created":123,
+	  "model":"qwen-test",
+	  "choices":[
+	    {
+	      "index":0,
+	      "finish_reason":"stop",
+	      "message":{
+	        "role":"assistant",
+	        "content":"Based on the research, here's the plan.\n\n<proposed_plan>\n1. Research current first-grade quiz patterns.\n2. Define kid-friendly mechanics.\n3. Build the MVP in plain HTML/CSS/JS.\n</proposed_plan>",
+	        "reasoning_content":"I should provide the visible plan block exactly as requested."
+	      }
+	    }
+	  ]
+	}`)
+
+	out, err := translateChatCompletionToResponsesResponseWithWorkflow(body, "", "", "", ToolWorkflowState{}, "", nil)
+	require.NoError(t, err)
+
+	text := gjson.GetBytes(out, "output.1.content.0.text").String()
+	assert.Contains(t, text, "<proposed_plan>")
+	assert.Contains(t, text, "Build the MVP in plain HTML/CSS/JS.")
+	assert.Equal(t, "completed", gjson.GetBytes(out, "status").String())
+}
+
+func TestTranslateChatCompletionToResponsesResponseWithWorkflow_RecoversCodexSkillProofShellCallFromFalseFoundClaim(t *testing.T) {
+	body := []byte(`{
+	  "id":"chatcmpl-skill-found-claim",
+	  "object":"chat.completion",
+	  "created":123,
+	  "model":"qwen-test",
+	  "choices":[
+	    {
+	      "index":0,
+	      "finish_reason":"stop",
+	      "message":{
+	        "role":"assistant",
+	        "content":"Found it — let me look for the actual list-workspace-files definition.",
+	        "reasoning_content":"I found it."
+	      }
+	    }
+	  ]
+	}`)
+
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "update $list-workspace-files and find where the skill is stored"},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "shell",
+				"call_id":   "call_shell_1",
+				"arguments": `{"command":["powershell.exe","-Command","Get-ChildItem $env:USERPROFILE/.codex -Recurse -Filter *workspace*"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_shell_1",
+				"output":  "C:\\Users\\YLAB-Partner\\.codex\\.tmp\\plugins\\plugins\\plugin-eval\\src\\core\\benchmark-workspace.js",
+			},
+		},
+	}
+
+	out, err := translateChatCompletionToResponsesResponseWithWorkflow(
+		body,
+		"",
+		"",
+		"",
+		ToolWorkflowState{VerificationExpected: true, VerificationCompleted: false},
+		`{"command":["powershell.exe","-Command","$root = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else { Join-Path $env:USERPROFILE '.codex\\skills' }; Get-ChildItem -Path $root -Recurse -Filter 'SKILL.md' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match '(?i)[\\\\/](list-workspace-files)[\\\\/]SKILL\\.md$' -or $_.FullName -match '(?i)list-workspace-files' } | Select-Object FullName"]}`,
+		req,
+	)
+	require.NoError(t, err)
+
+	jsonText := string(out)
+	assert.Contains(t, jsonText, `"type":"function_call"`)
+	assert.Contains(t, jsonText, `"name":"shell"`)
+	assert.Contains(t, jsonText, `list-workspace-files`)
+	assert.NotContains(t, jsonText, `Found it`)
 }
 
 func TestTranslateChatCompletionToResponsesResponse_RepairsStringifiedOperationFromReasoningXML(t *testing.T) {
@@ -6416,6 +6972,99 @@ func TestTranslateChatCompletionToResponsesResponse_ApplyPatchContentUsesTypeHin
 	assert.Equal(t, "update_file", gjson.GetBytes(out, "output.0.operation.type").String())
 	assert.Equal(t, filepath.ToSlash(path), gjson.GetBytes(out, "output.0.operation.path").String())
 	assert.Equal(t, "BASE_A\nORDERED_T11", gjson.GetBytes(out, "output.0.operation.content").String())
+	assert.NotContains(t, string(out), "operation was invalid")
+}
+
+func TestTranslateChatCompletionToResponsesResponse_ApplyPatchInfersUpdateTypeWhenOperationTypeMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "base_a.txt")
+	require.NoError(t, os.WriteFile(path, []byte("BASE_A\n"), 0o644))
+
+	body := []byte(`{
+	  "id":"chatcmpl-apply-patch-infer-update-type",
+	  "model":"qwen-test",
+	  "choices":[{
+	    "message":{
+	      "role":"assistant",
+	      "tool_calls":[{
+	        "id":"call_patch_1",
+	        "type":"function",
+	        "function":{"name":"apply_patch","arguments":"{\"operation\":{\"path\":\"` + filepath.ToSlash(path) + `\",\"content\":\"BASE_A\nORDERED_T11\"}}"}
+	      }]
+	    },
+	    "finish_reason":"tool_calls"
+	  }]
+	}`)
+
+	out, err := translateChatCompletionToResponsesResponse(body, "", "", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "apply_patch_call", gjson.GetBytes(out, "output.0.type").String())
+	assert.Equal(t, "update_file", gjson.GetBytes(out, "output.0.operation.type").String())
+	assert.Equal(t, filepath.ToSlash(path), gjson.GetBytes(out, "output.0.operation.path").String())
+	assert.Equal(t, "BASE_A\nORDERED_T11", gjson.GetBytes(out, "output.0.operation.content").String())
+	assert.NotContains(t, string(out), "operation was invalid")
+}
+
+func TestTranslateChatCompletionToResponsesResponse_ApplyPatchInfersCreateTypeWhenOperationTypeMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "new_skill.txt")
+
+	body := []byte(`{
+	  "id":"chatcmpl-apply-patch-infer-create-type",
+	  "model":"qwen-test",
+	  "choices":[{
+	    "message":{
+	      "role":"assistant",
+	      "tool_calls":[{
+	        "id":"call_patch_1",
+	        "type":"function",
+	        "function":{"name":"apply_patch","arguments":"{\"operation\":{\"path\":\"` + filepath.ToSlash(path) + `\",\"content\":\"HELLO_SKILL\"}}"}
+	      }]
+	    },
+	    "finish_reason":"tool_calls"
+	  }]
+	}`)
+
+	out, err := translateChatCompletionToResponsesResponse(body, "", "", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "apply_patch_call", gjson.GetBytes(out, "output.0.type").String())
+	assert.Equal(t, "create_file", gjson.GetBytes(out, "output.0.operation.type").String())
+	assert.Equal(t, filepath.ToSlash(path), gjson.GetBytes(out, "output.0.operation.path").String())
+	assert.Equal(t, "HELLO_SKILL", gjson.GetBytes(out, "output.0.operation.content").String())
+	assert.NotContains(t, string(out), "operation was invalid")
+}
+
+func TestTranslateChatCompletionToResponsesResponse_ApplyPatchRecoversFromReasoningWhenNativeArgsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "probe.txt")
+
+	body := []byte(`{
+	  "id":"chatcmpl-apply-patch-reasoning-recovery",
+	  "model":"Abiray-Qwen3.6-27B-NVFP4.gguf",
+	  "choices":[{
+	    "message":{
+	      "role":"assistant",
+	      "reasoning_content":"I need to create the file with apply_patch.\\n\\napply_patch(input=\"` + filepath.ToSlash(path) + `\", operation={}, patch=\"*** Begin Patch\\n*** Add File: ` + filepath.ToSlash(path) + `\\n+HELLO_PROBE\\n*** End Patch\")",
+	      "tool_calls":[{
+	        "id":"call_patch_1",
+	        "type":"function",
+	        "function":{"name":"apply_patch","arguments":"{}"}
+	      }]
+	    },
+	    "finish_reason":"tool_calls"
+	  }]
+	}`)
+
+	out, err := translateChatCompletionToResponsesResponse(body, "", "", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, "reasoning", gjson.GetBytes(out, "output.0.type").String())
+	assert.Equal(t, "apply_patch_call", gjson.GetBytes(out, "output.1.type").String())
+	assert.Equal(t, "create_file", gjson.GetBytes(out, "output.1.operation.type").String())
+	assert.Equal(t, filepath.ToSlash(path), gjson.GetBytes(out, "output.1.operation.path").String())
+	assert.Contains(t, gjson.GetBytes(out, "output.1.input").String(), "HELLO_PROBE")
 	assert.NotContains(t, string(out), "operation was invalid")
 }
 

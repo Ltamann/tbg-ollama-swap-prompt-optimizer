@@ -129,6 +129,46 @@ func TestCollapseChatCompletionStreamToFinalBody_ReassemblesQuestionToolCall(t *
 	}
 }
 
+func TestCollapseChatCompletionStreamToFinalBody_NormalizesThinkBoundaryBeforeAssembly(t *testing.T) {
+	stream := strings.NewReader("" +
+		"data: {\"id\":\"chatcmpl_think\",\"created\":123,\"model\":\"qwen-test\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"</think>\\n\\nWIN_P9_FILE_LOCALCWD_DONE\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n")
+
+	body, _, err := collapseChatCompletionStreamToFinalBody(stream)
+	if err != nil {
+		t.Fatalf("collapse failed: %v", err)
+	}
+	if got := gjson.GetBytes(body, "choices.0.message.content").String(); got != "WIN_P9_FILE_LOCALCWD_DONE" {
+		t.Fatalf("unexpected content: %q", got)
+	}
+	if gjson.GetBytes(body, "choices.0.message.reasoning_content").Exists() {
+		t.Fatalf("expected reasoning_content to be removed, got %q", gjson.GetBytes(body, "choices.0.message.reasoning_content").String())
+	}
+	if strings.Contains(string(body), "</think>") {
+		t.Fatalf("unexpected leaked think closer in body: %s", string(body))
+	}
+}
+
+func TestCollapseChatCompletionStreamToFinalBody_StripsTrailingCloserFromVisibleContentWhenReasoningLaneExists(t *testing.T) {
+	stream := strings.NewReader("" +
+		"data: {\"id\":\"chatcmpl_think2\",\"created\":123,\"model\":\"qwen-test\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Hidden reasoning\",\"content\":\"Visible answer\\n</think>\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n")
+
+	body, _, err := collapseChatCompletionStreamToFinalBody(stream)
+	if err != nil {
+		t.Fatalf("collapse failed: %v", err)
+	}
+	if got := gjson.GetBytes(body, "choices.0.message.content").String(); got != "Visible answer" {
+		t.Fatalf("unexpected content: %q", got)
+	}
+	if got := gjson.GetBytes(body, "choices.0.message.reasoning_content").String(); got != "Hidden reasoning" {
+		t.Fatalf("unexpected reasoning: %q", got)
+	}
+	if strings.Contains(string(body), "</think>") {
+		t.Fatalf("unexpected leaked think closer in body: %s", string(body))
+	}
+}
+
 func TestBuildNormalizedArtifactView_PrefersNativeQuestionAndPlan(t *testing.T) {
 	artifacts := []NormalizedArtifact{
 		{

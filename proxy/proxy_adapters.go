@@ -155,6 +155,31 @@ func (defaultToolRepairAdapter) ValidateToolCallItem(item map[string]any) ToolVa
 		}
 		args := parseToolArgsMapString(fmt.Sprintf("%v", item["arguments"]))
 		switch {
+		case strings.EqualFold(name, "apply_patch"):
+			operation := normalizeApplyPatchOperation(selectApplyPatchOperation(args))
+			normalizedArgs := buildApplyPatchStreamArgumentPayload(operation, "")
+			if len(normalizedArgs) == 0 {
+				if input := strings.TrimSpace(cleanFallbackInput(args["input"], "")); input != "" {
+					normalizedArgs["input"] = input
+				}
+				if patch := strings.TrimSpace(cleanFallbackInput(args["patch"], "")); patch != "" {
+					normalizedArgs["patch"] = patch
+				}
+				if diff := strings.TrimSpace(cleanFallbackInput(args["diff"], "")); diff != "" {
+					normalizedArgs["diff"] = diff
+				}
+			}
+			normalized["arguments"] = mustJSONString(normalizedArgs)
+			if !hasNonEmptyApplyPatchOperation(operation) &&
+				strings.TrimSpace(cleanFallbackInput(normalizedArgs["input"], "")) == "" &&
+				strings.TrimSpace(cleanFallbackInput(normalizedArgs["patch"], "")) == "" &&
+				strings.TrimSpace(cleanFallbackInput(normalizedArgs["diff"], "")) == "" {
+				return rejected(applyPatchValidationWarningPrefix + " arguments were empty. Provide a non-empty operation with target path and diff/content.")
+			}
+			if hasNonEmptyApplyPatchOperation(operation) && !applyPatchOperationPayloadValid(operation) {
+				return rejected(applyPatchValidationWarningPrefix + " operation was invalid. Provide `operation.type`, `operation.path`, and non-empty `diff/content` for create/update.")
+			}
+			return valid("apply_patch_function_arguments_normalized")
 		case strings.EqualFold(name, "shell"), strings.EqualFold(name, "shell_command"):
 			args = normalizeShellArgumentMapForResponse(args)
 			normalized["name"] = "shell"
@@ -404,6 +429,40 @@ func buildApplyPatchStreamArgumentPayload(operation any, input string) map[strin
 	return payload
 }
 
+func canonicalApplyPatchResponsePayload(item map[string]any) map[string]any {
+	var args map[string]any
+	if item != nil {
+		args = parseToolArgsMapString(fmt.Sprintf("%v", item["arguments"]))
+	}
+	var operation any
+	if item != nil {
+		operation = item["operation"]
+	}
+	if !hasNonEmptyApplyPatchOperation(operation) {
+		operation = selectApplyPatchOperation(args)
+	}
+	input := ""
+	if item != nil {
+		input = strings.TrimSpace(cleanFallbackInput(item["input"], ""))
+	}
+	if input == "" {
+		input = strings.TrimSpace(cleanFallbackInput(args["input"], ""))
+	}
+	payload := buildApplyPatchStreamArgumentPayload(operation, input)
+	if len(payload) == 0 {
+		if input != "" {
+			payload["input"] = input
+		}
+		if patch := strings.TrimSpace(cleanFallbackInput(args["patch"], "")); patch != "" {
+			payload["patch"] = patch
+		}
+		if diff := strings.TrimSpace(cleanFallbackInput(args["diff"], "")); diff != "" {
+			payload["diff"] = diff
+		}
+	}
+	return payload
+}
+
 func (a defaultStreamReconstructionAdapter) BuildToolOutputItem(state *StreamToolCallState, arguments string) map[string]any {
 	toolName := a.CanonicalToolName(state.Name)
 	if strings.EqualFold(toolName, "apply_patch") {
@@ -564,9 +623,7 @@ func (a defaultStreamReconstructionAdapter) NormalizeResponseOutputItem(item map
 	}
 	if strings.EqualFold(itemType, "function_call") &&
 		strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["name"])), "apply_patch") {
-		args := parseToolArgsMapString(fmt.Sprintf("%v", item["arguments"]))
-		op := normalizeApplyPatchOperation(selectApplyPatchOperation(args))
-		payload := buildApplyPatchStreamArgumentPayload(op, strings.TrimSpace(cleanFallbackInput(args["input"], "")))
+		payload := canonicalApplyPatchResponsePayload(item)
 		item["arguments"] = mustJSONString(payload)
 		if operation, ok := payload["operation"]; ok {
 			item["operation"] = operation
@@ -576,24 +633,26 @@ func (a defaultStreamReconstructionAdapter) NormalizeResponseOutputItem(item map
 		}
 	}
 	if strings.EqualFold(itemType, "apply_patch_call") {
-		op := preferContentDrivenApplyPatchOperation(item["operation"])
-		payload := buildApplyPatchStreamArgumentPayload(op, strings.TrimSpace(cleanFallbackInput(item["input"], "")))
+		payload := canonicalApplyPatchResponsePayload(item)
 		item["type"] = "function_call"
 		item["name"] = "apply_patch"
 		item["arguments"] = mustJSONString(payload)
-		item["operation"] = op
+		if operation, ok := payload["operation"]; ok {
+			item["operation"] = operation
+		}
 		if input, ok := payload["input"]; ok {
 			item["input"] = input
 		}
 	}
 	if strings.EqualFold(itemType, "custom_tool_call") &&
 		strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", item["name"])), "apply_patch") {
-		op := preferContentDrivenApplyPatchOperation(item["operation"])
-		payload := buildApplyPatchStreamArgumentPayload(op, strings.TrimSpace(cleanFallbackInput(item["input"], "")))
+		payload := canonicalApplyPatchResponsePayload(item)
 		item["type"] = "function_call"
 		item["name"] = "apply_patch"
 		item["arguments"] = mustJSONString(payload)
-		item["operation"] = op
+		if operation, ok := payload["operation"]; ok {
+			item["operation"] = operation
+		}
 		if input, ok := payload["input"]; ok {
 			item["input"] = input
 		}
@@ -854,30 +913,11 @@ func (c defaultContinuationController) BuildDecision(req map[string]any, ctx Con
 		decision.Instructions = append(decision.Instructions, loopGuard.Instructions...)
 	}
 
-	if ctx.ProxyPlanEnforcement || decision.State == ContinuationStateFinalAnswerRequired {
+	if decision.State == ContinuationStateFinalAnswerRequired {
 		decision.DisableTools = true
 		return decision
 	}
 
-	currentUserText := extractResponsesUserInputText(req)
-	forcePlanQuestionContinuation := ctx.RequestUserInputAvailable &&
-		!toolChoiceTargetsSpecificTool(activeToolChoice) &&
-		!textIndicatesSearchIntent(currentUserText) &&
-		(phase == ContinuationTurnPhaseQuestion ||
-			(phase == ContinuationTurnPhasePlanGather &&
-				((hasPriorToolOutput && !hasCompletedRequestUserInputOutput) ||
-					hasCompletedRequestUserInputOutput)))
-
-	if forcePlanQuestionContinuation {
-		decision.ForceToolChoice = map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": "request_user_input",
-			},
-		}
-		decision.Instructions = append(decision.Instructions,
-			"In native Codex plan turns, when clarification is needed and request_user_input is available, use the request_user_input tool instead of writing the questions as plain assistant text. Return a native function call named request_user_input. Do not describe the question in prose. Do not explain your reasoning. Arguments must contain a questions array with exactly one short question when the prompt asks for exactly one question. If the user asked you to ask how they want the work built or which approach they prefer, use request_user_input for that question.")
-	}
 	if !toolChoiceTargetsSpecificTool(decision.ForceToolChoice) {
 		decision.AllowedToolNames = c.DeriveAllowedToolNames(req)
 	}

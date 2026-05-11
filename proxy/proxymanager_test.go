@@ -10,6 +10,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1960,6 +1962,37 @@ func TestNormalizeChatCompletionReasoningBoundary_MovesLeakedFinalAnswerOutOfRea
 	assert.NotContains(t, string(normalized), "</think>")
 }
 
+func TestNormalizeChatCompletionReasoningBoundary_StripsDanglingCloserFromVisibleContentWhenReasoningExists(t *testing.T) {
+	body := []byte(`{
+	  "id":"chatcmpl-bad-visible-split",
+	  "choices":[{
+	    "message":{
+	      "role":"assistant",
+	      "content":"Visible answer line\n</think>",
+	      "reasoning_content":"Hidden reasoning"
+	    },
+	    "finish_reason":"stop"
+	  }]
+	}`)
+
+	normalized := normalizeChatCompletionReasoningBoundary(body)
+	assert.Equal(t, "Visible answer line", gjson.GetBytes(normalized, "choices.0.message.content").String())
+	assert.Equal(t, "Hidden reasoning", gjson.GetBytes(normalized, "choices.0.message.reasoning_content").String())
+	assert.NotContains(t, gjson.GetBytes(normalized, "choices.0.message.content").String(), "</think>")
+}
+
+func TestExtractContentAndReasoning_ParsesBalancedThinkTagsStructurally(t *testing.T) {
+	content, reasoning := extractContentAndReasoning("Intro <think>internal one</think>\nVisible answer")
+	assert.Equal(t, "Visible answer", content)
+	assert.Equal(t, "internal one", reasoning)
+}
+
+func TestExtractContentAndReasoning_ParsesMultipleBalancedThinkTags(t *testing.T) {
+	content, reasoning := extractContentAndReasoning("<think>internal one</think>\nVisible\n<thinking>internal two</thinking>")
+	assert.Equal(t, "Visible", content)
+	assert.Equal(t, "internal one\n\ninternal two", reasoning)
+}
+
 func TestNormalizeResponsesRequest_InjectsQwenToolPolicyForBuiltInTools(t *testing.T) {
 	body := []byte(`{
 		"model":"Qwen3.5-35B-A3B-Q8",
@@ -2255,53 +2288,53 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanAndQuestionMatrix(t *tes
 	}
 	tests := []testCase{
 		{
-			name: "plan shell exploration forces request_user_input",
+			name: "plan shell exploration does not force request_user_input",
 			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
 				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
 				baseTools("shell", "request_user_input"), "auto"),
-			wantToolChoiceFunction: "request_user_input",
+			wantToolChoiceString: "auto",
 		},
 		{
-			name: "plan web search exploration forces request_user_input",
+			name: "plan web search exploration does not force request_user_input",
 			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
 				[]any{toolCall("web_search", "call_web_1", `{"query":"game ideas"}`), toolOutput("call_web_1", "results")},
 				baseTools("web_search", "request_user_input"), "auto"),
-			wantToolChoiceFunction: "request_user_input",
+			wantToolChoiceString: "auto",
 		},
 		{
-			name: "plan apply_patch history still forces request_user_input",
+			name: "plan apply_patch history does not force request_user_input",
 			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
 				[]any{toolCall("apply_patch", "call_patch_1", `{"patch":"*** Begin Patch"}`), toolOutput("call_patch_1", "ok")},
 				baseTools("apply_patch", "request_user_input"), "auto"),
-			wantToolChoiceFunction: "request_user_input",
+			wantToolChoiceString: "auto",
 		},
 		{
-			name: "explicit native codex question request forces request_user_input before tool output",
+			name: "explicit native codex question request does not force request_user_input before tool output",
 			req: baseReq(planDev(), "Use the request_user_input tool in native Codex question format and ask exactly one short clarifying question.",
 				"write a plan for a small game", nil, baseTools("request_user_input"), "auto"),
-			wantToolChoiceFunction: "request_user_input",
+			wantToolChoiceString: "auto",
 		},
 		{
-			name: "explicit native codex question request after shell output still forces request_user_input",
+			name: "explicit native codex question request after shell output does not force request_user_input",
 			req: baseReq(planDev(), "Use the request_user_input tool in native Codex question format and ask exactly one short clarifying question.",
 				"write a plan for a small game",
 				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
 				baseTools("shell", "request_user_input"), "auto"),
-			wantToolChoiceFunction: "request_user_input",
+			wantToolChoiceString: "auto",
 		},
 		{
-			name: "ask how they want it built still forces native question tool",
+			name: "ask how they want it built does not force native question tool",
 			req: baseReq(planDev(), "Use request_user_input in native question format and ask how they would like this built.",
 				"ask the user how they would like this game built and which approach they prefer",
 				nil, baseTools("request_user_input"), "auto"),
-			wantToolChoiceFunction: "request_user_input",
+			wantToolChoiceString: "auto",
 		},
 		{
-			name: "plan continuation with required tool choice still resolves to request_user_input",
+			name: "plan continuation with required tool choice stays required",
 			req: baseReq(planDev(), "Plan mode request.", "write a plan for a small game",
 				[]any{toolCall("shell", "call_shell_1", `{"command":"pwd"}`), toolOutput("call_shell_1", "c:/repo\n")},
 				baseTools("shell", "request_user_input"), "required"),
-			wantToolChoiceFunction: "request_user_input",
+			wantToolChoiceString: "required",
 		},
 		{
 			name: "specific shell tool choice is preserved in plan continuation",
@@ -2650,6 +2683,1039 @@ func TestTranslateResponsesToChatCompletionsRequest_PostPatchContinuationKeepsBr
 	assert.Contains(t, names, "browser_navigate")
 }
 
+func TestTranslateResponsesToChatCompletionsRequest_PostShellContinuationKeepsBroadTools(t *testing.T) {
+	req := map[string]any{
+		"model":        "gpt-5.4",
+		"instructions": "Default mode request.",
+		"tool_choice":  "auto",
+		"tools": []any{
+			map[string]any{"type": "function", "name": "apply_patch"},
+			map[string]any{"type": "function", "name": "shell"},
+			map[string]any{"type": "function", "name": "browser_navigate"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "developer",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<collaboration_mode># Collaboration Mode: Default\nYou are in Default mode."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Create a skill and write SKILL.md after you inspect the destination folder."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "shell",
+				"call_id":   "call_shell_1",
+				"arguments": `{"command":["powershell.exe","-Command","Get-ChildItem $env:CODEX_HOME/skills"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_shell_1",
+				"output":  "Directory listing complete.",
+			},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+	assert.Equal(t, "auto", payload["tool_choice"])
+
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.Len(t, tools, 3)
+
+	names := make([]string, 0, len(tools))
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		require.True(t, ok)
+		names = append(names, extractFunctionToolName(tool))
+	}
+	assert.Contains(t, names, "apply_patch")
+	assert.Contains(t, names, "shell")
+	assert.Contains(t, names, "browser_navigate")
+}
+
+func TestExtractCodexAvailableSkillsFromText(t *testing.T) {
+	text := `<skills_instructions>
+## Skills
+### Available skills
+- alpha-skill: First
+- beta_skill: Second
+### How to use skills
+</skills_instructions>`
+
+	assert.Equal(t, []string{"alpha-skill", "beta_skill"}, extractCodexAvailableSkillsFromText(text))
+}
+
+func TestExtractCodexSkillRootsFromText(t *testing.T) {
+	text := `<skills_instructions>
+## Skills
+### Available skills
+- alpha-skill: First (file: C:/Users/YLAB-Partner/.codex/skills/alpha-skill/SKILL.md)
+- beta-skill: Second (file: C:/Users/YLAB-Partner/.codex/skills/beta-skill/SKILL.md)
+### How to use skills
+</skills_instructions>`
+
+	roots := extractCodexSkillRootsFromText(text)
+	require.Len(t, roots, 1)
+	assert.Equal(t, "/mnt/c/Users/YLAB-Partner/.codex/skills", filepath.ToSlash(roots[0]))
+}
+
+func TestDetectCodexSkillSnapshotDrift(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	require.NoError(t, os.MkdirAll(filepath.Join(codexHome, "skills", "alpha-skill"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(codexHome, "skills", "beta-skill"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(codexHome, "skills", "alpha-skill", "SKILL.md"), []byte("---\nname: alpha-skill\n---\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(codexHome, "skills", "beta-skill", "SKILL.md"), []byte("---\nname: beta-skill\n---\n"), 0o644))
+
+	body := []byte(`{
+	  "input": [
+	    {
+	      "type": "message",
+	      "role": "developer",
+	      "content": [
+	        {
+	          "type": "input_text",
+	          "text": "<skills_instructions>\n## Skills\n### Available skills\n- alpha-skill: First\n- ghost-skill: Missing on disk\n### How to use skills\n</skills_instructions>"
+	        }
+	      ]
+	    }
+	  ]
+	}`)
+
+	missing, extra, ok := detectCodexSkillSnapshotDrift(body)
+	require.True(t, ok)
+	assert.Equal(t, []string{"beta-skill"}, missing)
+	assert.Equal(t, []string{"ghost-skill"}, extra)
+}
+
+func TestRequestHistoryShowsCodexSkillFilesystemProof(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "update $list-workspace-files and check the skill definition"},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "shell",
+				"call_id":   "call_shell_1",
+				"arguments": `{"command":["powershell.exe","-Command","Get-ChildItem $env:CODEX_HOME/skills -Recurse -Filter SKILL.md"]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_shell_1",
+				"output":  "C:\\Users\\YLAB-Partner\\.codex\\skills\\list-workspace-files\\SKILL.md",
+			},
+		},
+	}
+
+	assert.True(t, requestHistoryShowsCodexSkillFilesystemProof(req))
+}
+
+func TestRequestWantsShellInspectionBeforeApplyPatch_DetectsFirstInspectThenPatch(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "First inspect ./tmp/demo/app.js with shell, then use apply_patch to add a line.",
+					},
+				},
+			},
+		},
+	}
+
+	assert.True(t, requestWantsShellInspectionBeforeApplyPatch(req))
+}
+
+func TestRequestExplicitlyWantsShellVerification_DetectsSavedFilePhrase(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Inspect app.js with shell, then use apply_patch, then verify the saved file with shell before finishing.",
+					},
+				},
+			},
+		},
+	}
+
+	assert.True(t, requestExplicitlyWantsShellVerification(req))
+}
+
+func TestDeriveContinuationAllowedToolNames_AfterApplyPatchWithPendingShellVerificationReturnsShell(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "First inspect ./tmp/demo/app.js with shell, then use apply_patch to add a line logging verified-change, then verify the saved file with shell before finishing.",
+					},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "apply_patch",
+				"call_id":   "call_patch_1",
+				"arguments": `{"operation":{"type":"update_file","path":"./tmp/demo/app.js","content":"console.log('verified-change')\n"}}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_patch_1",
+				"output":  "Patch applied.",
+			},
+		},
+	}
+
+	assert.Equal(t, []string{"shell"}, deriveContinuationAllowedToolNames(req))
+}
+
+func TestDeriveContinuationAllowedToolNames_AfterWebSearchDoesNotCollapseToApplyPatch(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "apply_patch"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "exec_command"}},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Investigate the web for a first grade quiz game and then define a plan."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "__llamaswap_web_search_preview",
+				"call_id":   "call_web_1",
+				"arguments": `{"query":"first grade quiz game ideas"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_web_1",
+				"output":  `{"type":"web_search_call_output","output":"results"}`,
+			},
+		},
+	}
+
+	assert.Nil(t, deriveContinuationAllowedToolNames(req))
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_ShellFirstThenPatchStartsWithShellTools(t *testing.T) {
+	req := map[string]any{
+		"model":       "gpt-5.4",
+		"tool_choice": "auto",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Inspect ./tmp/demo/app.js with shell, then use apply_patch to add a line logging verified-change, then verify the saved file with shell before finishing.",
+					},
+				},
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "write_stdin"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, tools)
+
+	names := make([]string, 0, len(tools))
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		require.True(t, ok)
+		names = append(names, extractFunctionToolName(tool))
+	}
+
+	assert.Contains(t, names, "exec_command")
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_ApplyPatchThenShellVerificationKeepsShellTools(t *testing.T) {
+	req := map[string]any{
+		"model":       "gpt-5.4",
+		"tool_choice": "auto",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Inspect ./tmp/demo/app.js with shell, then use apply_patch to add a line logging verified-change, then verify the saved file with shell before finishing.",
+					},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "apply_patch",
+				"call_id":   "call_patch_1",
+				"arguments": `{"operation":{"type":"update_file","path":"./tmp/demo/app.js","content":"console.log('verified-change')\n"}}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_patch_1",
+				"output":  "Patch applied.",
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "write_stdin"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+
+	tools, ok := payload["tools"].([]any)
+	require.True(t, ok)
+	require.NotEmpty(t, tools)
+
+	names := make([]string, 0, len(tools))
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		require.True(t, ok)
+		names = append(names, extractFunctionToolName(tool))
+	}
+
+	assert.Contains(t, names, "exec_command")
+	assert.NotContains(t, names, "apply_patch")
+}
+
+func TestShouldRetryMissingShellCall_WhenForcedShellReturnsOnlyVerificationProse(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "write_stdin"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+	}
+	translatedChatRequest := []byte(`{"tool_choice":{"type":"function","function":{"name":"shell"}}}`)
+	chatResponse := []byte(`{"choices":[{"finish_reason":"stop","message":{"content":"Patch applied. Verifying the file contents now.","reasoning_content":"The patch was applied. Now I need to verify the file with shell."}}]}`)
+	translatedResponse := []byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Patch applied. Verifying the file contents now."}]}]}`)
+	workflowState := ToolWorkflowState{VerificationExpected: true}
+
+	assert.True(t, shouldRetryMissingShellCall(req, translatedChatRequest, chatResponse, translatedResponse, workflowState))
+}
+
+func TestExtractLatestCompletedShellArguments_ExecCommandCmdAlias(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":      "function_call",
+				"name":      "exec_command",
+				"call_id":   "call_shell_1",
+				"arguments": `{"cmd":"cat ./tmp/demo/file.txt"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_shell_1",
+				"output":  "demo output",
+			},
+		},
+	}
+
+	args := parseToolArgsMapString(extractLatestCompletedShellArguments(req))
+	commands := normalizeShellCommandsValue(args["commands"])
+	require.Len(t, commands, 1)
+	assert.Equal(t, "cat ./tmp/demo/file.txt", commands[0])
+}
+
+func TestShouldRetryMissingShellCall_WhenInvalidApplyPatchNeedsFileRead(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "write_stdin"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+	}
+	translatedChatRequest := []byte(`{"tool_choice":"auto"}`)
+	chatResponse := []byte(`{"choices":[{"finish_reason":"tool_calls","message":{"content":"Let me check the current file contents first.","reasoning_content":"The diff didn't apply. Let me first read the current file contents to get the exact context."}}]}`)
+	translatedResponse := []byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Let me check the current file contents first."}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"apply_patch call was not executed because operation was invalid. Provide operation.type, operation.path, and non-empty diff/content for create/update."}]}]}`)
+
+	assert.True(t, shouldRetryMissingShellCall(req, translatedChatRequest, chatResponse, translatedResponse, ToolWorkflowState{}))
+}
+
+func TestShouldRetryMissingShellCall_WhenInvalidApplyPatchNeedsVerification(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "write_stdin"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+	}
+	translatedChatRequest := []byte(`{"tool_choice":"auto"}`)
+	chatResponse := []byte(`{"choices":[{"finish_reason":"stop","message":{"content":"Wait — I need to verify the file content, since content replaces the entire file. Let me check what was saved.","reasoning_content":"I need to verify the file to see what actually happened."}}]}`)
+	translatedResponse := []byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Wait — I need to verify the file content, since content replaces the entire file. Let me check what was saved."}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"apply_patch call was not executed because operation was invalid. Provide operation.type, operation.path, and non-empty diff/content for create/update."}]}]}`)
+	workflowState := ToolWorkflowState{VerificationExpected: true}
+
+	assert.True(t, shouldRetryMissingShellCall(req, translatedChatRequest, chatResponse, translatedResponse, workflowState))
+}
+
+func TestShouldRetryInvalidApplyPatchOperation_WhenUpstreamReturnedIncompleteApplyPatch(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "apply_patch"},
+			map[string]any{"type": "function", "name": "exec_command"},
+		},
+	}
+	chatResponse := []byte(`{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"function":{"name":"apply_patch","arguments":"{\"operation\":{\"path\":\"quiz/index.html\",\"type\":\"create_file\"}}"}}]}}]}`)
+	translatedResponse := []byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"apply_patch call was not executed because operation was invalid. Provide operation.type, operation.path, and non-empty diff/content for create/update."}]}]}`)
+
+	assert.True(t, shouldRetryInvalidApplyPatchOperation(req, chatResponse, translatedResponse))
+}
+
+func TestShouldRetryMissingBrowserOpenCall_WhenFinalizedAsProseOnly(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+	}
+	chatResponse := []byte(`{"choices":[{"finish_reason":"stop","message":{"content":"Let's open it in your default browser!","reasoning_content":"All three files are created successfully. Let me open it in the browser so the user can see it working."}}]}`)
+	translatedResponse := []byte(`{"status":"completed","output_text":"Let's open it in your default browser!","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Let's open it in your default browser!"}]}]}`)
+
+	assert.True(t, shouldRetryMissingBrowserOpenCall(req, chatResponse, translatedResponse))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenBridgeWouldCompletePlaceholder(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Read ./skills/example/SKILL.md and summarize it."},
+				},
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_shell_1",
+				"output":  "name: example-skill",
+			},
+		},
+	}
+	workflowState := buildToolWorkflowState(req)
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"Working on the request.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"Working on the request."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"Working on the request."
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, workflowState))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenCompletedPlaceholderStillCarriesHistoricalToolItems(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Inspect the workspace briefly, then return a plan."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "exec_command",
+				"call_id":   "call_shell_1",
+				"arguments": `{"cmd":"find . -maxdepth 2 -type f | head"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_shell_1",
+				"output":  "README.md\napp.js\nindex.html\n",
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"Working on the request.",
+		"output":[
+			{"type":"function_call","name":"exec_command","call_id":"call_shell_1","arguments":"{\"cmd\":\"find . -maxdepth 2 -type f | head\"}"},
+			{"type":"function_call_output","call_id":"call_shell_1","output":"README.md\napp.js\nindex.html\n"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Working on the request."}]}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"Working on the request."
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenStreamedUpstreamBodyIsRawSSE(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Summarize the workspace and then write a plan."},
+				},
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"Working on the request.",
+		"output":[
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"Let me inspect the files."}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Working on the request."}]}
+		]
+	}`)
+	chatResponse := []byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me inspect the files.\"}}]}\n\ndata: [DONE]\n")
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, ToolWorkflowState{}))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_FalseForRealSummary(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Read ./skills/example/SKILL.md and summarize it."},
+				},
+			},
+		},
+	}
+	workflowState := buildToolWorkflowState(req)
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"The skill uses shell to inspect files and apply_patch for edits.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"The skill uses shell to inspect files and apply_patch for edits."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"The skill uses shell to inspect files and apply_patch for edits."
+				}
+			}
+		]
+	}`)
+
+	assert.False(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, workflowState))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenVisibleTextIsToolArtifact(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Inspect the workspace and return a plan."},
+				},
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"<tool_call>",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"<tool_call>"}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"<tool_call>"
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenToolArtifactBecomesDeferredPromise(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Inspect the workspace and return a plan."},
+				},
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_shell_1",
+				"output":  "README.md",
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"The command was split incorrectly. Let me read the files properly.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"The command was split incorrectly. Let me read the files properly."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"<tool_call>=shell>\n<parameter=command>\ncat README.md\n</parameter>\n</function>\n</tool_call>"
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenModelPromisesFirstInspection(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Inspect the workspace briefly, then return a plan."},
+				},
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"The user wants me to inspect a specific directory and then create a plan for turning it into a quiz game. Let me first look at what's in that directory.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"The user wants me to inspect a specific directory and then create a plan for turning it into a quiz game. Let me first look at what's in that directory."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"The user wants me to inspect a specific directory and then create a plan for turning it into a quiz game. Let me first look at what's in that directory."
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenModelPromisesToStartExamining(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Inspect the workspace briefly, then return a plan."},
+				},
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"The user wants me to inspect a specific directory and then create a plan for turning it into a quiz game. Let me start by examining the directory structure.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"The user wants me to inspect a specific directory and then create a plan for turning it into a quiz game. Let me start by examining the directory structure."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"The user wants me to inspect a specific directory and then create a plan for turning it into a quiz game. Let me start by examining the directory structure."
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenVerifyingPromiseWasFinalized(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Update the file and verify it before the final answer."},
+				},
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_patch_1",
+				"output":  "updated file",
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"File created. Now verifying the content.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"File created. Now verifying the content."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"File created. Now verifying the content."
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenBareVerifyMessageWasFinalized(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Update app.js and verify the saved file before the final answer.",
+					},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "apply_patch",
+				"call_id":   "call_patch_1",
+				"arguments": `{"operation":{"type":"update_file","path":"app.js","content":"console.log('ok')\n"}}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_patch_1",
+				"output":  "Patch applied.",
+			},
+		},
+	}
+
+	chatResponse := []byte(`{"choices":[{"finish_reason":"stop","message":{"content":"Verifying the file content:","reasoning_content":"Good, now let me verify the file content."}}]}`)
+	translatedResponse := []byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Verifying the file content:"}]}]}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenCreatePromiseWasFinalized(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Update the file and verify it before the final answer."},
+				},
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"The file doesn't exist. I'll create it with the correct content.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"The file doesn't exist. I'll create it with the correct content."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"The file doesn't exist. I'll create it with the correct content."
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenApplyPatchPromiseWasFinalized(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Inspect the file, then update it with apply_patch and verify it."},
+				},
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_shell_1",
+				"output":  "{\n  \"questions\": []\n}\n",
+			},
+		},
+	}
+	translatedResponse := []byte("{\n" +
+		"  \"status\":\"completed\",\n" +
+		"  \"output_text\":\"Now I'll update the file with `apply_patch`:\",\n" +
+		"  \"output\":[\n" +
+		"    {\n" +
+		"      \"type\":\"message\",\n" +
+		"      \"role\":\"assistant\",\n" +
+		"      \"content\":[{\"type\":\"output_text\",\"text\":\"Now I'll update the file with `apply_patch`:\"}]\n" +
+		"    }\n" +
+		"  ]\n" +
+		"}")
+	chatResponse := []byte("{\n" +
+		"  \"choices\":[\n" +
+		"    {\n" +
+		"      \"finish_reason\":\"stop\",\n" +
+		"      \"message\":{\n" +
+		"        \"content\":\"Now I'll update the file with `apply_patch`:\"\n" +
+		"      }\n" +
+		"    }\n" +
+		"  ]\n" +
+		"}")
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestNormalizeResponsesInputItem_ApplyPatchCallIncludesExecutableInput(t *testing.T) {
+	item, changed := normalizeResponsesInputItem(map[string]any{
+		"type":    "apply_patch_call",
+		"call_id": "call_1",
+		"operation": map[string]any{
+			"type":    "update_file",
+			"path":    "README.md",
+			"content": "PATCH_OK",
+		},
+	})
+	require.True(t, changed)
+	mapped, ok := item.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "function_call", mapped["type"])
+	assert.Equal(t, llamaSwapApplyPatchFunctionName, mapped["name"])
+	args := fmt.Sprintf("%v", mapped["arguments"])
+	assert.Contains(t, args, `"operation"`)
+	assert.Contains(t, args, `"input"`)
+	assert.Contains(t, args, `*** Begin Patch`)
+}
+
+func TestAppendStrictApplyPatchToolOnlyInstruction_PrunesToApplyPatch(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+			map[string]any{"type": "function", "name": "write_stdin"},
+		},
+	}
+	appendStrictApplyPatchToolOnlyInstruction(req, "test")
+	tools, ok := req["tools"].([]any)
+	require.True(t, ok)
+	require.Len(t, tools, 1)
+	tool := tools[0].(map[string]any)
+	assert.Equal(t, "apply_patch", tool["name"])
+	assert.Equal(t, false, req["parallel_tool_calls"])
+}
+
+func TestShouldRetryMissingShellCall_DoesNotForceAnotherShellAfterInspectionBeforePatch(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Inspect the file with shell, then update it with apply_patch, then verify the saved file with shell."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "exec_command",
+				"call_id":   "call_shell_1",
+				"arguments": `{"cmd":"cat src/quiz-data.json"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_shell_1",
+				"output":  "{\n  \"questions\": []\n}\n",
+			},
+		},
+	}
+	translatedChatRequest := []byte(`{"tool_choice":"auto","tools":[{"type":"function","name":"exec_command"},{"type":"function","name":"apply_patch"}]}`)
+	chatResponse := []byte("{\n" +
+		"  \"choices\":[\n" +
+		"    {\n" +
+		"      \"finish_reason\":\"stop\",\n" +
+		"      \"message\":{\n" +
+		"        \"content\":\"Now applying the update with apply_patch:\",\n" +
+		"        \"reasoning_content\":\"Now I need to use apply_patch to update the file with the exact content specified.\"\n" +
+		"      }\n" +
+		"    }\n" +
+		"  ]\n" +
+		"}")
+	translatedResponse := []byte("{\n" +
+		"  \"status\":\"completed\",\n" +
+		"  \"output_text\":\"Now applying the update with apply_patch:\",\n" +
+		"  \"output\":[\n" +
+		"    {\n" +
+		"      \"type\":\"message\",\n" +
+		"      \"role\":\"assistant\",\n" +
+		"      \"content\":[{\"type\":\"output_text\",\"text\":\"Now applying the update with apply_patch:\"}]\n" +
+		"    }\n" +
+		"  ]\n" +
+		"}")
+
+	assert.False(t, shouldRetryMissingShellCall(req, translatedChatRequest, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, translatedChatRequest, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldTreatUpdateFragmentAsAppend_DoesNotAppendStandaloneDocumentRewrite(t *testing.T) {
+	existing := "<!doctype html><html><body><main>stress-suite</main></body></html>\n"
+	fragment := "<!doctype html>\n<html><body><main>quiz home</main></body></html>\n"
+	assert.False(t, shouldTreatUpdateFragmentAsAppend(existing, fragment))
+}
+
+func TestShouldRetryMissingShellCall_WhenWrongApplyPatchUsedInsteadOfReadingFile(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "write_stdin"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+	}
+	translatedChatRequest := []byte(`{"tool_choice":"auto"}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"tool_calls",
+				"message":{
+					"content":"The diff didn't apply because I don't know the exact file contents. Let me read the file first.",
+					"reasoning_content":"The diff didn't apply because I don't know the exact file contents. Let me read the file first.",
+					"tool_calls":[
+						{"function":{"name":"apply_patch","arguments":"{}"}},
+						{"function":{"name":"apply_patch","arguments":"{}"}}
+					]
+				}
+			}
+		]
+	}`)
+	translatedResponse := []byte(`{
+		"output":[
+			{"type":"function_call","name":"apply_patch","arguments":"{}"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"apply_patch call was not executed because operation was invalid. Provide operation.type, operation.path, and non-empty diff/content for create/update."}]}
+		]
+	}`)
+
+	assert.True(t, shouldRetryMissingShellCall(req, translatedChatRequest, chatResponse, translatedResponse, ToolWorkflowState{}))
+}
+
 func TestTranslateResponsesToChatCompletionsRequest_WebSearchFollowupAfterQuestionKeepsTools(t *testing.T) {
 	req := map[string]any{
 		"model":       "gpt-5.2",
@@ -2839,6 +3905,53 @@ func TestRequestStillWantsStructuredPlan_FalseForWebResearchBeforePlanFollowup(t
 	assert.False(t, requestStillWantsStructuredPlan(req, buildToolWorkflowState(req)))
 }
 
+func TestRequestExplicitlyWantsSearchIntent_FalseAfterResearchHistoryInProxyPlanMode(t *testing.T) {
+	req := map[string]any{
+		"mode": "plan",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Investigate the web for a first grade quiz game, define a plan. Use web search and return the final visible answer as exactly one <proposed_plan>...</proposed_plan> block."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "web_search",
+				"call_id":   "call_web_1",
+				"arguments": `{"query":"first grade quiz game ideas"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_web_1",
+				"output":  `{"query":"first grade quiz game ideas","results":[{"title":"A"}]}`,
+			},
+		},
+	}
+
+	workflowState := buildToolWorkflowState(req)
+	assert.False(t, requestExplicitlyWantsSearchIntent(req, workflowState))
+	assert.True(t, requestStillWantsStructuredPlan(req, workflowState))
+}
+
+func TestExtractPendingBridgeWebSearchCalls_ReturnsAllUnresolvedCalls(t *testing.T) {
+	body := []byte(`{
+		"status":"requires_action",
+		"output":[
+			{"type":"web_search_call","call_id":"call_1","name":"web_search","status":"completed","action":{"query":"alpha"}},
+			{"type":"web_search_call_output","call_id":"call_1","output":"{\"results\":[{\"title\":\"A\"}]}"},
+			{"type":"web_search_call","call_id":"call_2","name":"web_search","status":"in_progress","action":{"query":"beta"}},
+			{"type":"web_search_call","call_id":"call_3","name":"web_search","status":"in_progress","action":{"query":"gamma"}}
+		]
+	}`)
+
+	pending := extractPendingBridgeWebSearchCalls(body)
+	require.Len(t, pending, 2)
+	assert.Equal(t, "call_2", strings.TrimSpace(fmt.Sprintf("%v", pending[0]["call_id"])))
+	assert.Equal(t, "call_3", strings.TrimSpace(fmt.Sprintf("%v", pending[1]["call_id"])))
+}
+
 func TestTextIndicatesSearchIntent_TrueForInvestigateTheWeb(t *testing.T) {
 	assert.True(t, textIndicatesSearchIntent("investigate the web for 10 best chemistry knowledge questions"))
 }
@@ -2911,6 +4024,69 @@ func TestShouldRetryMissingWebSearchCall_WhenOriginalRequestHasSearchToolButTran
 	translatedResponse := []byte(`{"output":[]}`)
 
 	assert.True(t, shouldRetryMissingWebSearchCall(req, translatedChatRequest, chatResponse, translatedResponse, ToolWorkflowState{}))
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_RemovesWebSearchWhenUserForbidsIt(t *testing.T) {
+	req := map[string]any{
+		"model": "gpt-5.4",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Define a short implementation plan for a first grade quiz game. Do not use web search or inspect the local workspace.",
+					},
+				},
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "write_stdin"},
+			map[string]any{"type": "web_search"},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	assert.False(t, chatRequestIncludesToolName(translated, "web_search"))
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_DoesNotReAddApplyPatchBeforeRequiredWebSearch(t *testing.T) {
+	req := map[string]any{
+		"model": "gpt-5.4",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Research the web for first grade quiz reward ideas. Then create ./tmp/demo/research-notes.md with three bullet points using apply_patch.",
+					},
+				},
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "apply_patch"},
+			map[string]any{"type": "web_search", "external_web_access": true},
+			map[string]any{"type": "function", "name": "exec_command"},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	assert.True(t, chatRequestIncludesToolName(translated, "web_search"))
+	assert.False(t, chatRequestIncludesToolName(translated, "apply_patch"))
 }
 
 func TestRequestStillWantsStructuredPlan_TrueForCodexPlanModeAfterAnsweredQuestion(t *testing.T) {
@@ -3090,28 +4266,6 @@ func TestShellToolArgumentsLookLikePlainQuestion_LiveShape(t *testing.T) {
 	}
 
 	assert.True(t, shellToolArgumentsLookLikePlainQuestion(args))
-}
-
-func TestDerivePlanModeFallbackText_MergesReasoningAndVisiblePlanDetails(t *testing.T) {
-	visiblePlan := `Now I'll build the quiz. Here's the plan:
-
-- Single HTML file with embedded CSS + JS
-- 10 multiple-choice questions from the chemistry research
-- Colorful & fun design
-- Score tracking
-- Progress bar`
-
-	reasoning := `The user has answered:
-- Tech: HTML + JavaScript (Recommended)
-- Features: Classic quiz (Recommended)
-- Style: Colorful & Fun`
-
-	plan := derivePlanModeFallbackText(visiblePlan, reasoning)
-
-	assert.Contains(t, plan, "HTML + JavaScript")
-	assert.Contains(t, plan, "10 researched chemistry questions")
-	assert.Contains(t, plan, "Colorful & Fun")
-	assert.NotContains(t, plan, "\n6. Finish")
 }
 
 func TestTranslateResponsesToChatCompletionsRequest_TopLevelPlanInstructions_WebResearchBeforePlanKeepsTools(t *testing.T) {

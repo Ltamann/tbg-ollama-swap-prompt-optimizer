@@ -122,7 +122,10 @@ func buildRequestForensicSummary(metric TokenMetrics, capture *ReqRespCapture) R
 		summary.StageNames = append(summary.StageNames, stage.Name)
 		switch stage.Name {
 		case "bridge.responses_request":
-			stageSummary.Request = summarizeForensicRequestShape(stage.Payload, "responses")
+			stageSummary.Request = summarizeForensicRequestShape(capture.ReqBody, "responses")
+			if stageSummary.Request == nil {
+				stageSummary.Request = summarizeForensicRequestShape(stage.Payload, "responses")
+			}
 			summary.ResponsesRequest = stageSummary.Request
 		case "bridge.chat_completions_request":
 			stageSummary.Request = summarizeForensicRequestShape(stage.Payload, "chat_completions")
@@ -239,6 +242,13 @@ func summarizeForensicRequestShape(payload []byte, protocol string) *ForensicReq
 			name := strings.TrimSpace(tool.Get("function.name").String())
 			if name == "" {
 				name = strings.TrimSpace(tool.Get("name").String())
+			}
+			if name == "" {
+				toolType := strings.TrimSpace(tool.Get("type").String())
+				switch toolType {
+				case "web_search", "web_search_preview", "file_search", "computer", "code_interpreter", "image_generation":
+					name = toolType
+				}
 			}
 			if name != "" {
 				shape.ToolNames = append(shape.ToolNames, name)

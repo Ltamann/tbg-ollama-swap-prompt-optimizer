@@ -54,6 +54,40 @@ func TestBuildRequestForensicSummary_ClassifiesUpstreamExitAndRequestShape(t *te
 	assert.Contains(t, summary.Notes, "tool-less translated request still carried close-think bias")
 }
 
+func TestBuildRequestForensicSummary_UsesRawIncomingResponsesBodyForToolList(t *testing.T) {
+	metric := TokenMetrics{
+		ID:         11,
+		TraceID:    "trace-11",
+		Timestamp:  time.Date(2026, 5, 11, 9, 0, 0, 0, time.FixedZone("CEST", 2*3600)),
+		Model:      "Qwen3.6-27B-NVFP4",
+		StatusCode: 200,
+		DurationMs: 1200,
+	}
+	capture := &ReqRespCapture{
+		ID:      11,
+		ReqPath: "/v1/responses",
+		ReqBody: []byte(`{
+			"model":"gpt-5.4",
+			"tool_choice":"auto",
+			"tools":[
+				{"type":"function","name":"exec_command"},
+				{"type":"web_search","external_web_access":true}
+			]
+		}`),
+		Stages: []CaptureStage{
+			{
+				Name:    "bridge.responses_request",
+				Payload: []byte(`{"model":"gpt-5.4","tool_choice":"auto","tools":[{"type":"function","name":"exec_command"}]}`),
+			},
+		},
+	}
+
+	summary := buildRequestForensicSummary(metric, capture)
+	require.NotNil(t, summary.ResponsesRequest)
+	assert.ElementsMatch(t, []string{"exec_command", "web_search"}, summary.ResponsesRequest.ToolNames)
+	assert.Equal(t, 2, summary.ResponsesRequest.ToolsCount)
+}
+
 func TestBuildRequestForensicSummary_PromotesQwenStreamAndMalformedReasoning(t *testing.T) {
 	metric := TokenMetrics{
 		ID:         9,
@@ -175,4 +209,23 @@ func TestSummarizeForensicChatResponse_StreamedChatCompletions(t *testing.T) {
 	assert.True(t, summary.HasToolCalls)
 	assert.Contains(t, summary.ToolCallNames, "shell")
 	assert.Empty(t, summary.ErrorText)
+}
+
+func TestSummarizeForensicRequestShape_IncludesBuiltInToolTypes(t *testing.T) {
+	payload := []byte(`{
+		"model":"gpt-5.4",
+		"tool_choice":"auto",
+		"parallel_tool_calls":true,
+		"tools":[
+			{"type":"function","name":"exec_command"},
+			{"type":"web_search","external_web_access":true},
+			{"type":"file_search"},
+			{"type":"computer"}
+		]
+	}`)
+
+	shape := summarizeForensicRequestShape(payload, "responses")
+	require.NotNil(t, shape)
+	assert.ElementsMatch(t, []string{"exec_command", "web_search", "file_search", "computer"}, shape.ToolNames)
+	assert.Equal(t, 4, shape.ToolsCount)
 }

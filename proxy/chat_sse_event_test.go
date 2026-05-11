@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func TestParseChatEvent_ResponsesSSETimelineIncludesToolCalls(t *testing.T) {
@@ -107,4 +108,38 @@ func TestParseChatEvent_ResponsesSSETimelineFlagsOrphanToolArgEvents(t *testing.
 
 	assert.True(t, orphanDelta)
 	assert.True(t, orphanDone)
+}
+
+func TestParseAssistantResponse_StripsLeadingOrphanThinkCloser(t *testing.T) {
+	resp := gjson.Parse(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"role":"assistant",
+					"content":"",
+					"reasoning_content":"</think>\n\nWIN_P9_FILE_LOCALCWD_DONE"
+				}
+			}
+		]
+	}`)
+
+	ar := parseAssistantResponse(resp)
+	require.NotNil(t, ar)
+	assert.Equal(t, "WIN_P9_FILE_LOCALCWD_DONE", ar.Content)
+	assert.Equal(t, "", ar.ReasoningContent)
+}
+
+func TestParseAssistantResponseFromBody_StripsLeadingOrphanThinkCloserFromSSE(t *testing.T) {
+	resp := []byte("data: " +
+		`{"choices":[{"index":0,"delta":{"reasoning_content":"</think>\n\n"},"finish_reason":null}]}` + "\n\n" +
+		"data: " +
+		`{"choices":[{"index":0,"delta":{"reasoning_content":"<tool_call>\n<function=exec_command>\n<parameter=cmd>\npwd\n</parameter>\n</function>\n</tool_call>"},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n")
+
+	ar := parseAssistantResponseFromBody(resp)
+	require.NotNil(t, ar)
+	assert.NotContains(t, ar.Content, "</think>")
+	assert.NotContains(t, ar.ReasoningContent, "</think>")
+	assert.Contains(t, ar.Content, "<tool_call>")
 }

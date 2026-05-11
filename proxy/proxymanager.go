@@ -66,6 +66,10 @@ const (
 var applyPatchTraceMu sync.Mutex
 var bridgeHTMLTagRegexp = regexp.MustCompile(`(?s)<[^>]+>`)
 var planModeQuestionCountRegexp = regexp.MustCompile(`(?i)\b(\d+)\s+(?:[a-z-]+\s+){0,3}questions\b`)
+var codexAvailableSkillsBlockRegexp = regexp.MustCompile(`(?is)### Available skills\s*(.*?)\s*(?:### How to use skills|</skills_instructions>|$)`)
+var codexAvailableSkillLineRegexp = regexp.MustCompile(`(?m)^\s*-\s*([a-z0-9][a-z0-9._-]*)\s*:`)
+var codexAvailableSkillPathRegexp = regexp.MustCompile(`(?im)^\s*-\s*[a-z0-9][a-z0-9._-]*\s*:.*?\(file:\s*([^)]+?/SKILL\.md)\s*\)\s*$`)
+var codexSkillReferenceRegexp = regexp.MustCompile(`\$([A-Za-z0-9._-]+)`)
 
 // stripTopLevelParam removes a top-level parameter from JSON body without affecting nested fields.
 // This prevents accidentally removing nested fields like tools[].type when stripping "type".
@@ -266,6 +270,163 @@ func injectQwenResponsesToolPolicy(data map[string]any, adaptedTools []string) b
 		"content": policy,
 	}}, input...)
 	return true
+}
+
+func extractCodexAvailableSkillsFromText(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	match := codexAvailableSkillsBlockRegexp.FindStringSubmatch(text)
+	if len(match) < 2 {
+		return nil
+	}
+	lines := codexAvailableSkillLineRegexp.FindAllStringSubmatch(match[1], -1)
+	if len(lines) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if len(line) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(line[1])
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func resolveCodexSkillsRoot() string {
+	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
+		return filepath.Join(codexHome, "skills")
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(homeDir) == "" {
+		return ""
+	}
+	return filepath.Join(homeDir, ".codex", "skills")
+}
+
+func extractCodexSkillRootsFromText(text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	matches := codexAvailableSkillPathRegexp.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		skillFile := strings.TrimSpace(match[1])
+		if skillFile == "" {
+			continue
+		}
+		canonical, err := canonicalizeLocalApplyPatchPath(skillFile)
+		if err != nil {
+			continue
+		}
+		root := filepath.Dir(filepath.Dir(canonical))
+		root = filepath.Clean(root)
+		if root == "" {
+			continue
+		}
+		if _, exists := seen[root]; exists {
+			continue
+		}
+		seen[root] = struct{}{}
+		out = append(out, root)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func listCodexSkillNamesOnDiskFromRoot(skillsRoot string) []string {
+	skillsRoot = strings.TrimSpace(skillsRoot)
+	if strings.TrimSpace(skillsRoot) == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(skillsRoot)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name())
+		if name == "" || strings.HasPrefix(name, ".") {
+			continue
+		}
+		if info, err := os.Stat(filepath.Join(skillsRoot, name, "SKILL.md")); err == nil && !info.IsDir() {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func detectCodexSkillSnapshotDrift(bodyBytes []byte) (missing []string, extra []string, ok bool) {
+	var data map[string]any
+	if err := json.Unmarshal(bodyBytes, &data); err != nil {
+		return nil, nil, false
+	}
+	input, _ := data["input"].([]any)
+	snapshot := map[string]struct{}{}
+	disk := map[string]struct{}{}
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		text := extractResponsesInputText(item["content"])
+		for _, candidate := range extractCodexAvailableSkillsFromText(text) {
+			snapshot[candidate] = struct{}{}
+		}
+		for _, root := range extractCodexSkillRootsFromText(text) {
+			for _, name := range listCodexSkillNamesOnDiskFromRoot(root) {
+				disk[name] = struct{}{}
+			}
+		}
+	}
+	if len(snapshot) == 0 {
+		return nil, nil, false
+	}
+	if len(disk) == 0 {
+		for _, name := range listCodexSkillNamesOnDiskFromRoot(resolveCodexSkillsRoot()) {
+			disk[name] = struct{}{}
+		}
+		if len(disk) == 0 {
+			return nil, nil, false
+		}
+	}
+	for name := range disk {
+		if _, exists := snapshot[name]; !exists {
+			missing = append(missing, name)
+		}
+	}
+	for name := range snapshot {
+		if _, exists := disk[name]; !exists {
+			extra = append(extra, name)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	return missing, extra, true
 }
 
 func isQwenModelName(modelName string) bool {
@@ -515,7 +676,10 @@ func normalizeResponsesInputItem(item any) (any, bool) {
 	case "apply_patch_call", "applypatch_call":
 		payload := map[string]any{}
 		if operation, ok := m["operation"]; ok {
-			payload["operation"] = operation
+			payload["operation"] = normalizeApplyPatchOperation(operation)
+			if input := strings.TrimSpace(buildApplyPatchInputFromOperation(operation)); input != "" {
+				payload["input"] = input
+			}
 		}
 		return map[string]any{
 			"type":      "function_call",
@@ -918,6 +1082,41 @@ func requestIncludesWebSearchTool(req map[string]any) bool {
 		}
 	}
 	return false
+}
+
+func rawResponsesBodyIncludesWebSearchTool(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	if gjson.ValidBytes(body) {
+		for _, tool := range gjson.GetBytes(body, "tools").Array() {
+			candidates := []string{
+				strings.TrimSpace(strings.ToLower(tool.Get("type").String())),
+				strings.TrimSpace(strings.ToLower(tool.Get("name").String())),
+				strings.TrimSpace(strings.ToLower(tool.Get("function.name").String())),
+			}
+			for _, candidate := range candidates {
+				switch candidate {
+				case "web_search", "web_search_preview", "websearch", "websearchpreview", llamaSwapWebSearchFunctionName:
+					return true
+				}
+			}
+		}
+	}
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, `"type":"web_search"`) || strings.Contains(lower, `"type": "web_search"`)
+}
+
+func rawResponsesBodyMentionsSearchIntent(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "research the web") ||
+		strings.Contains(lower, "web research") ||
+		strings.Contains(lower, "search the web") ||
+		strings.Contains(lower, "web search") ||
+		strings.Contains(lower, "look it up")
 }
 
 func chatRequestIncludesToolName(body []byte, names ...string) bool {
@@ -1343,13 +1542,13 @@ func (pm *ProxyManager) executeBridgeWebSearch(ctx context.Context, action map[s
 	return executeBridgeWebSearchWithSettings(ctx, action, engine, endpoint)
 }
 
-func extractPendingBridgeWebSearchCall(responseBody []byte) (map[string]any, bool) {
+func extractPendingBridgeWebSearchCalls(responseBody []byte) []map[string]any {
 	if !gjson.ValidBytes(responseBody) {
-		return nil, false
+		return nil
 	}
 	var resp map[string]any
 	if err := json.Unmarshal(responseBody, &resp); err != nil {
-		return nil, false
+		return nil
 	}
 	output, _ := resp["output"].([]any)
 	completed := map[string]bool{}
@@ -1362,6 +1561,7 @@ func extractPendingBridgeWebSearchCall(responseBody []byte) (map[string]any, boo
 			completed[strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))] = true
 		}
 	}
+	pending := make([]map[string]any, 0, 2)
 	for _, raw := range output {
 		item, ok := raw.(map[string]any)
 		if !ok {
@@ -1374,9 +1574,9 @@ func extractPendingBridgeWebSearchCall(responseBody []byte) (map[string]any, boo
 		if completed[callID] {
 			continue
 		}
-		return cloneMap(item), true
+		pending = append(pending, cloneMap(item))
 	}
-	return nil, false
+	return pending
 }
 
 func appendResponsesInputItems(body []byte, items ...map[string]any) ([]byte, error) {
@@ -1410,6 +1610,61 @@ func prependResponsesOutputItems(body []byte, items []any) ([]byte, error) {
 	resp["output"] = append(cloneAnySlice(items), output...)
 	normalizeTranslatedResponsesOutput(resp)
 	return json.Marshal(resp)
+}
+
+func replacePendingWebSearchCallWithResolvedItems(body []byte, resolvedCall map[string]any, resolvedOutput map[string]any) ([]byte, error) {
+	if !gjson.ValidBytes(body) {
+		return body, nil
+	}
+	callID := strings.TrimSpace(fmt.Sprintf("%v", resolvedCall["call_id"]))
+	if callID == "" {
+		return body, nil
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	output, _ := resp["output"].([]any)
+	rewritten := make([]any, 0, len(output)+1)
+	replaced := false
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			rewritten = append(rewritten, raw)
+			continue
+		}
+		if strings.TrimSpace(fmt.Sprintf("%v", item["type"])) == "web_search_call" &&
+			strings.TrimSpace(fmt.Sprintf("%v", item["call_id"])) == callID {
+			rewritten = append(rewritten, cloneMap(resolvedCall), cloneMap(resolvedOutput))
+			replaced = true
+			continue
+		}
+		rewritten = append(rewritten, raw)
+	}
+	if !replaced {
+		rewritten = append([]any{cloneMap(resolvedCall), cloneMap(resolvedOutput)}, rewritten...)
+	}
+	resp["output"] = rewritten
+	normalizeTranslatedResponsesOutput(resp)
+	return json.Marshal(resp)
+}
+
+func replacePendingWebSearchCallsWithResolvedItems(body []byte, resolvedCalls []map[string]any, resolvedOutputs []map[string]any) ([]byte, error) {
+	if !gjson.ValidBytes(body) {
+		return body, nil
+	}
+	if len(resolvedCalls) == 0 || len(resolvedCalls) != len(resolvedOutputs) {
+		return body, nil
+	}
+	rewritten := body
+	var err error
+	for idx := range resolvedCalls {
+		rewritten, err = replacePendingWebSearchCallWithResolvedItems(rewritten, resolvedCalls[idx], resolvedOutputs[idx])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return rewritten, nil
 }
 
 func buildResponsesFileSearchFunctionTool() map[string]any {
@@ -1807,6 +2062,8 @@ func normalizeToolTierName(name string) string {
 		return "apply_patch"
 	case llamaSwapApplyPatchFunctionName:
 		return "apply_patch"
+	case "exec_command", "write_stdin", "shellcommand":
+		return "shell"
 	}
 	if idx := strings.LastIndex(normalized, "__"); idx >= 0 && idx+2 < len(normalized) {
 		normalized = normalized[idx+2:]
@@ -2312,25 +2569,24 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	stripSlashDirectivesFromResponsesInput(req)
 	sanitizeResponsesInputToolArguments(req)
 	workflowState := proxyCompatibilityAdapters.Continuation.BuildWorkflowState(req)
+	if requestExplicitlyForbidsWebSearch(req) && !workflowState.HasToolOutput {
+		removeNamedTools(req, "web_search")
+	}
 	if explicitNoMutationPlan && !workflowState.HasToolOutput {
 		planModeRequested = true
 		proxyPlanEnforcement = true
 	}
 
-	if proxyPlanEnforcement {
-		prependSystemInstructionOnce(req, "Planning mode is active. Do NOT execute tasks, claim execution, or start implementing changes.")
-		prependSystemInstructionOnce(req, "Return only a structured plan: numbered phases, assumptions, risks, and validation steps.")
-		prependSystemInstructionOnce(req, "Wrap the final answer in <proposed_plan>...</proposed_plan> tags exactly.")
-		prependSystemInstructionOnce(req, "Do not ask follow-up questions, preference questions, or how-to-proceed questions in the plan response. Return only the plan for the current user task.")
-		prependSystemInstructionOnce(req, "Do not execute tools, mutate files, apply patches, or claim completed execution in planning mode. You may reference available tools only as part of the plan.")
-	}
-	if proxyPlanEnforcement {
-		prependSystemInstructionOnce(req, "In planning turns, do not call request_user_input or update_plan. If clarification is needed, ask the questions directly in normal assistant text.")
-	}
 	if profile, ok := reasoningEffortProfileForEffort(reasoningEffort); ok && strings.TrimSpace(profile.instruction) != "" {
 		prependSystemInstructionOnce(req, profile.instruction)
 	}
 	appendSerializedAgentOrchestrationInstruction(req)
+	if requestNeedsCodexSkillFilesystemProof(req) {
+		prependSystemInstructionOnce(req,
+			"For Codex skill and SKILL.md tasks, do not claim a skill was found, created, installed, updated, modified, or exists unless a tool result proves it. "+
+				"Acceptable proof is either a shell result that lists or reads the concrete SKILL.md path, or an apply_patch call that targets that SKILL.md path. "+
+				"If proof is missing, use shell to inspect the relevant skills directory before making the claim.")
+	}
 	if requestLooksLikeTextOnlyReply(req) {
 		req["parallel_tool_calls"] = false
 		req["tool_choice"] = "none"
@@ -2340,7 +2596,18 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 		keepOnlyNamedTools(req, "spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent")
 	}
 	if !planModeRequested && !workflowState.HasToolOutput {
-		if body, err := json.Marshal(req); err == nil &&
+		lowerUserText := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+		if rawResponsesBodyIncludesWebSearchTool(body) &&
+			(requestExplicitlyWantsSearchIntent(req, workflowState) ||
+				textIndicatesSearchIntent(lowerUserText) ||
+				textLooksLikeDeferredSearchPromise(lowerUserText) ||
+				rawResponsesBodyMentionsSearchIntent(body) ||
+				strings.Contains(lowerUserText, "research the web") ||
+				strings.Contains(lowerUserText, "web research") ||
+				strings.Contains(lowerUserText, "search the web")) &&
+			!requestHistoryContainsResearchArtifacts(req, workflowState) {
+			appendStrictWebSearchOnlyInstruction(req)
+		} else if body, err := json.Marshal(req); err == nil &&
 			shouldEnableStrictApplyPatchIntent(req, body) &&
 			!requestWantsShellInspectionBeforeApplyPatch(req) {
 			keepOnlyNamedTools(req, "apply_patch")
@@ -2373,7 +2640,18 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 	// Exception: explicit shell-first mixed workflows intentionally narrow the
 	// first turn to shell-only; do not re-add apply_patch during translation.
 	reqBytesForIntent, _ := json.Marshal(req)
+	lowerUserText := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	researchMustHappenFirst := rawResponsesBodyIncludesWebSearchTool(body) &&
+		!workflowState.HasToolOutput &&
+		(requestExplicitlyWantsSearchIntent(req, workflowState) ||
+			textIndicatesSearchIntent(lowerUserText) ||
+			textLooksLikeDeferredSearchPromise(lowerUserText) ||
+			strings.Contains(lowerUserText, "research the web") ||
+			strings.Contains(lowerUserText, "web research") ||
+			strings.Contains(lowerUserText, "search the web")) &&
+		!requestHistoryContainsResearchArtifacts(req, workflowState)
 	if !planModeRequested &&
+		!researchMustHappenFirst &&
 		shouldEnableStrictApplyPatchIntent(req, reqBytesForIntent) &&
 		!requestWantsShellInspectionBeforeApplyPatch(req) &&
 		!bridgeToolListHasFunction(normalizedTools, "apply_patch") {
@@ -2424,7 +2702,7 @@ func translateResponsesToChatCompletionsRequest(body []byte) ([]byte, error) {
 		if translatedToolChoice == "" {
 			translatedToolChoice = strings.TrimSpace(fmt.Sprintf("%v", req["tool_choice"]))
 		}
-		suppressCloseThinkGuard := !hasToolRequests && strings.EqualFold(translatedToolChoice, "none")
+		suppressCloseThinkGuard := hasToolRequests || strings.EqualFold(translatedToolChoice, "none")
 		if profile.hasCloseThinkBias && !suppressCloseThinkGuard {
 			if existing, hasExisting := out["logit_bias"].(map[string]any); hasExisting {
 				if _, hasCloseTokenBias := existing[qwenCloseThinkTokenID]; !hasCloseTokenBias {
@@ -2660,7 +2938,12 @@ func filterEmptyAssistantChatMessages(messages []map[string]any) []map[string]an
 	for _, message := range messages {
 		role := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", message["role"])))
 		content, _ := message["content"].(string)
-		if role == "assistant" && strings.TrimSpace(content) == "" {
+		_, hasFunctionCall := message["function_call"]
+		rawToolCalls, hasToolCalls := message["tool_calls"].([]any)
+		if role == "assistant" && strings.TrimSpace(content) == "" &&
+			(!hasToolCalls || len(rawToolCalls) == 0) &&
+			!hasFunctionCall &&
+			strings.TrimSpace(fmt.Sprintf("%v", message["reasoning_content"])) == "" {
 			continue
 		}
 		filtered = append(filtered, message)
@@ -2669,7 +2952,7 @@ func filterEmptyAssistantChatMessages(messages []map[string]any) []map[string]an
 }
 
 func filterBridgeToolsToFunctionName(tools []any, name string) []any {
-	name = strings.TrimSpace(name)
+	name = normalizeToolTierName(name)
 	if name == "" || len(tools) == 0 {
 		return tools
 	}
@@ -2679,13 +2962,7 @@ func filterBridgeToolsToFunctionName(tools []any, name string) []any {
 		if !ok {
 			continue
 		}
-		if fn, ok := tool["function"].(map[string]any); ok {
-			if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", fn["name"])), name) {
-				filtered = append(filtered, tool)
-			}
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(fmt.Sprintf("%v", tool["name"])), name) {
+		if toolDefinitionTargetsNormalizedName(tool, name) {
 			filtered = append(filtered, tool)
 		}
 	}
@@ -3098,10 +3375,90 @@ func extractResponsesInputText(input any) string {
 }
 
 var thinkTagPrefixRegex = regexp.MustCompile(`(?is)^\s*(?:<think>\s*(.*?)\s*</think>|<thinking>\s*(.*?)\s*</thinking>)\s*`)
-var thinkTagAnywhereRegex = regexp.MustCompile(`(?is)(?:<think>\s*(.*?)\s*</think>|<thinking>\s*(.*?)\s*</thinking>)`)
 var leadingReasoningDirectiveRegex = regexp.MustCompile(`(?is)^\s*/(?:no_)?think\s*(?:\r?\n+|\z)`)
 var leadingOrphanThinkCloseRegex = regexp.MustCompile(`(?is)^\s*(?:(?:</think>|</thinking>)\s*)+`)
+var trailingOrphanThinkCloseRegex = regexp.MustCompile(`(?is)(?:\s*(?:</think>|</thinking>))+\s*$`)
 var reasoningFunctionStyleRecoveryPrefixRegex = regexp.MustCompile(`(?is)^\s*(?:</think>\s*|</thinking>\s*)*(?:apply_patch|shell|shell_command|web_search|file_search|code_interpreter|image_generation|computer|update_plan|spawn_agent|send_input|resume_agent|wait_agent|close_agent)\s*\(`)
+
+func splitThinkTaggedText(raw string) (leading string, reasoning string, trailing string, found bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", "", "", false
+	}
+	lower := strings.ToLower(trimmed)
+	firstOpen := -1
+	openTag := ""
+	closeTag := ""
+	switch {
+	case strings.Contains(lower, "<think>"):
+		firstOpen = strings.Index(lower, "<think>")
+		openTag = "<think>"
+		closeTag = "</think>"
+	case strings.Contains(lower, "<thinking>"):
+		firstOpen = strings.Index(lower, "<thinking>")
+		openTag = "<thinking>"
+		closeTag = "</thinking>"
+	default:
+		return trimmed, "", "", false
+	}
+	if firstOpen < 0 {
+		return trimmed, "", "", false
+	}
+
+	leading = strings.TrimSpace(trimmed[:firstOpen])
+	pos := firstOpen
+	reasoningParts := make([]string, 0, 2)
+	trailingParts := make([]string, 0, 2)
+	for pos < len(trimmed) {
+		remainingLower := strings.ToLower(trimmed[pos:])
+		nextThink := strings.Index(remainingLower, "<think>")
+		nextThinking := strings.Index(remainingLower, "<thinking>")
+		var nextOpen int
+		if nextThink >= 0 && (nextThinking < 0 || nextThink < nextThinking) {
+			nextOpen = nextThink
+			openTag = "<think>"
+			closeTag = "</think>"
+		} else if nextThinking >= 0 {
+			nextOpen = nextThinking
+			openTag = "<thinking>"
+			closeTag = "</thinking>"
+		} else {
+			break
+		}
+		if nextOpen > 0 {
+			outside := strings.TrimSpace(trimmed[pos : pos+nextOpen])
+			if outside != "" {
+				trailingParts = append(trailingParts, outside)
+			}
+		}
+		tagStart := pos + nextOpen
+		innerStart := tagStart + len(openTag)
+		innerLower := strings.ToLower(trimmed[innerStart:])
+		closeIndex := strings.Index(innerLower, closeTag)
+		if closeIndex < 0 {
+			// Keep unmatched text visible; only balanced tags are treated structurally.
+			rest := strings.TrimSpace(trimmed[tagStart:])
+			if rest != "" {
+				trailingParts = append(trailingParts, rest)
+			}
+			break
+		}
+		innerEnd := innerStart + closeIndex
+		innerText := strings.TrimSpace(trimmed[innerStart:innerEnd])
+		if innerText != "" {
+			reasoningParts = append(reasoningParts, innerText)
+		}
+		pos = innerEnd + len(closeTag)
+		found = true
+	}
+	if pos < len(trimmed) {
+		rest := strings.TrimSpace(trimmed[pos:])
+		if rest != "" {
+			trailingParts = append(trailingParts, rest)
+		}
+	}
+	return strings.TrimSpace(leading), strings.TrimSpace(strings.Join(reasoningParts, "\n\n")), strings.TrimSpace(strings.Join(trailingParts, "\n\n")), found
+}
 
 func stripLeadingReasoningDirective(text string) string {
 	if text == "" {
@@ -3125,8 +3482,15 @@ func stripLeadingReasoningDirective(text string) string {
 func normalizeAssistantReasoningFields(content string, reasoning string) (string, string) {
 	content = strings.TrimSpace(content)
 	reasoning = strings.TrimSpace(reasoning)
-	if reasoning == "" {
-		return content, reasoning
+
+	if extractedContent, extractedReasoning := extractContentAndReasoning(content); strings.TrimSpace(extractedReasoning) != "" {
+		content = strings.TrimSpace(extractedContent)
+		extractedReasoning = strings.TrimSpace(extractedReasoning)
+		if reasoning == "" {
+			reasoning = extractedReasoning
+		} else if !strings.EqualFold(reasoning, extractedReasoning) {
+			reasoning = strings.TrimSpace(extractedReasoning + "\n\n" + reasoning)
+		}
 	}
 
 	if extractedContent, extractedReasoning := extractContentAndReasoning(reasoning); strings.TrimSpace(extractedReasoning) != "" {
@@ -3139,6 +3503,14 @@ func normalizeAssistantReasoningFields(content string, reasoning string) (string
 				content = strings.TrimSpace(extractedContent + "\n" + content)
 			}
 		}
+		return content, reasoning
+	}
+
+	if reasoning != "" {
+		content = strings.TrimSpace(trailingOrphanThinkCloseRegex.ReplaceAllString(content, ""))
+	}
+
+	if reasoning == "" {
 		return content, reasoning
 	}
 
@@ -3156,8 +3528,6 @@ func normalizeAssistantReasoningFields(content string, reasoning string) (string
 
 	return content, reasoning
 }
-
-const emptyAssistantOutputFallbackText = "[proxy] upstream returned no usable assistant content; retry the request."
 
 func chatCompletionLooksLikeEmptyVisibleOutput(content string, reasoning string) bool {
 	if strings.TrimSpace(content) == "" && strings.TrimSpace(reasoning) == "" {
@@ -3217,19 +3587,25 @@ func normalizeChatCompletionReasoningBoundary(body []byte) []byte {
 }
 
 func extractContentAndReasoning(raw string) (content string, reasoning string) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return "", ""
-	}
-	match := thinkTagAnywhereRegex.FindStringSubmatchIndex(trimmed)
-	if match == nil || len(match) < 2 {
+	leading, extractedReasoning, trailing, found := splitThinkTaggedText(raw)
+	if !found {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return "", ""
+		}
 		return trimmed, ""
 	}
-	reasoning = strings.TrimSpace(thinkTagAnywhereRegex.ReplaceAllString(trimmed[match[0]:match[1]], `$1$2`))
-	// Discard any pre-think prose. When models emit a brief sentence before the
-	// think block, only the post-think content should reach the final output lane.
-	content = strings.TrimSpace(trimmed[match[1]:])
-	return content, reasoning
+	reasoning = strings.TrimSpace(extractedReasoning)
+	if strings.TrimSpace(trailing) != "" {
+		return strings.TrimSpace(trailing), reasoning
+	}
+	if strings.TrimSpace(leading) != "" {
+		return strings.TrimSpace(leading), reasoning
+	}
+	if reasoning == "" {
+		return "", ""
+	}
+	return "", reasoning
 }
 
 func shouldAllowReasoningDerivedToolRecovery(raw string, parsedCalls []ParsedToolCall) bool {
@@ -3263,6 +3639,52 @@ func shouldAllowReasoningDerivedToolRecovery(raw string, parsedCalls []ParsedToo
 		}
 	}
 	return reasoningFunctionStyleRecoveryPrefixRegex.MatchString(trimmed)
+}
+
+func nativeToolArgumentsEmptyForParsedReasoningCall(message gjson.Result, parsedCalls []ParsedToolCall) bool {
+	if len(parsedCalls) == 0 {
+		return false
+	}
+	names := map[string]struct{}{}
+	for _, call := range parsedCalls {
+		name := strings.ToLower(strings.TrimSpace(call.Name))
+		if name != "" {
+			names[name] = struct{}{}
+		}
+	}
+	if len(names) == 0 {
+		return false
+	}
+	argsEmpty := func(raw string) bool {
+		trimmed := strings.TrimSpace(raw)
+		return trimmed == "" || trimmed == "{}" || strings.EqualFold(trimmed, "null")
+	}
+	for _, toolCall := range message.Get("tool_calls").Array() {
+		name := strings.TrimSpace(toolCall.Get("function.name").String())
+		if name == "" {
+			name = strings.TrimSpace(toolCall.Get("name").String())
+		}
+		if _, ok := names[strings.ToLower(name)]; !ok {
+			continue
+		}
+		args := strings.TrimSpace(toolCall.Get("function.arguments").String())
+		if args == "" {
+			args = strings.TrimSpace(toolCall.Get("arguments").String())
+		}
+		if argsEmpty(args) {
+			return true
+		}
+	}
+	functionCall := message.Get("function_call")
+	if functionCall.Exists() {
+		name := strings.TrimSpace(functionCall.Get("name").String())
+		if _, ok := names[strings.ToLower(name)]; ok {
+			if argsEmpty(functionCall.Get("arguments").String()) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func collectResponseText(v any, out *[]string) {
@@ -3740,6 +4162,11 @@ func normalizeShellArgumentMap(raw map[string]any) map[string]any {
 			commands = append(commands, normalized...)
 		}
 	}
+	if len(commands) == 0 {
+		if normalized := normalizeShellCommandsValue(out["cmd"]); len(normalized) > 0 {
+			commands = append(commands, normalized...)
+		}
+	}
 	if len(commands) > 0 {
 		arr := make([]any, 0, len(commands))
 		for _, cmd := range commands {
@@ -3752,8 +4179,50 @@ func normalizeShellArgumentMap(raw map[string]any) map[string]any {
 	} else {
 		delete(out, "commands")
 		delete(out, "command")
+		delete(out, "cmd")
 	}
 	return out
+}
+
+func shellTokenShouldRemainBare(token string) bool {
+	switch strings.TrimSpace(token) {
+	case "|", "||", "&", "&&", ";", ";;", "(", ")", "{", "}", ">", ">>", "<", "<<", "2>", "2>>", "1>", "1>>", "2>&1", "1>&2":
+		return true
+	default:
+		return false
+	}
+}
+
+func shellQuoteToken(token string) string {
+	token = normalizeSingleShellCommandString(token)
+	if token == "" {
+		return "''"
+	}
+	if shellTokenShouldRemainBare(token) {
+		return token
+	}
+	if !strings.ContainsAny(token, " \t\r\n'\"|&;(){}<>$`\\") {
+		return token
+	}
+	return "'" + strings.ReplaceAll(token, "'", `'\''`) + "'"
+}
+
+func buildResponseShellCommand(commands []string) string {
+	if len(commands) == 0 {
+		return ""
+	}
+	if len(commands) == 1 {
+		return normalizeSingleShellCommandString(commands[0])
+	}
+	parts := make([]string, 0, len(commands))
+	for _, cmd := range commands {
+		trimmed := strings.TrimSpace(cmd)
+		if trimmed == "" {
+			continue
+		}
+		parts = append(parts, shellQuoteToken(trimmed))
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
 }
 
 func normalizeShellArgumentMapForResponse(raw map[string]any) map[string]any {
@@ -3761,20 +4230,30 @@ func normalizeShellArgumentMapForResponse(raw map[string]any) map[string]any {
 	if len(out) == 0 {
 		return out
 	}
-	commandOnly := normalizeShellCommandsValue(out["command"])
 	legacyCommands := normalizeShellCommandsValue(out["commands"])
-	if len(legacyCommands) > 1 && len(commandOnly) == 1 &&
-		strings.EqualFold(strings.TrimSpace(commandOnly[0]), strings.TrimSpace(legacyCommands[0])) {
-		arr := make([]any, 0, len(legacyCommands))
-		for _, cmd := range legacyCommands {
-			trimmed := strings.TrimSpace(cmd)
-			if trimmed != "" {
-				arr = append(arr, trimmed)
+	if len(legacyCommands) > 0 {
+		if responseCommand := buildResponseShellCommand(legacyCommands); responseCommand != "" {
+			out["commands"] = []any{responseCommand}
+		} else {
+			delete(out, "commands")
+		}
+	} else {
+		routerCommand := normalizeShellCommandsValue(out["command"])
+		if len(routerCommand) > 0 {
+			arr := make([]any, 0, len(routerCommand))
+			for _, cmd := range routerCommand {
+				cmd = normalizeSingleShellCommandString(cmd)
+				if cmd != "" {
+					arr = append(arr, cmd)
+				}
+			}
+			if len(arr) > 0 {
+				out["commands"] = arr
+			} else {
+				delete(out, "commands")
 			}
 		}
-		out["command"] = arr
 	}
-	delete(out, "commands")
 	return out
 }
 
@@ -4260,18 +4739,21 @@ func hasNonEmptyApplyPatchMap(op map[string]any) bool {
 
 	rawType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", op["type"])))
 	path := strings.TrimSpace(fmt.Sprintf("%v", op["path"]))
+	diff := normalizeApplyPatchDiff(strings.TrimSpace(cleanFallbackInput(op["diff"], "")))
+	patch := strings.TrimSpace(cleanFallbackInput(op["patch"], ""))
+	content := strings.TrimSpace(cleanFallbackInput(op["content"], ""))
+	input := strings.TrimSpace(cleanFallbackInput(op["input"], ""))
 	switch rawType {
 	case "create_file", "update_file":
 		if path == "" {
 			return false
 		}
-		diff := normalizeApplyPatchDiff(strings.TrimSpace(cleanFallbackInput(op["diff"], "")))
-		patch := strings.TrimSpace(cleanFallbackInput(op["patch"], ""))
-		content := strings.TrimSpace(cleanFallbackInput(op["content"], ""))
-		input := strings.TrimSpace(cleanFallbackInput(op["input"], ""))
 		return diff != "" || patch != "" || content != "" || input != ""
 	case "delete_file":
 		return path != ""
+	}
+	if path != "" && (diff != "" || patch != "" || content != "" || input != "") {
+		return true
 	}
 
 	for _, key := range []string{"patch", "input", "raw", "content"} {
@@ -5335,6 +5817,24 @@ func buildHeuristicUpdatePatchFromExistingFile(path string, fragment string) str
 	}
 	existing := strings.ReplaceAll(string(raw), "\r\n", "\n")
 	appendMode := shouldTreatUpdateFragmentAsAppend(existing, fragment)
+	existingLinesRaw := strings.Split(strings.TrimRight(existing, "\n"), "\n")
+	fragmentLinesRaw := strings.Split(fragment, "\n")
+	if len(fragmentLinesRaw) >= 2 {
+		existingFirst := ""
+		fragmentFirst := ""
+		if len(existingLinesRaw) > 0 {
+			existingFirst = strings.ToLower(strings.TrimSpace(existingLinesRaw[0]))
+		}
+		if len(fragmentLinesRaw) > 0 {
+			fragmentFirst = strings.ToLower(strings.TrimSpace(fragmentLinesRaw[0]))
+		}
+		if (strings.HasPrefix(existingFirst, "<!doctype") && strings.HasPrefix(fragmentFirst, "<!doctype")) ||
+			(strings.HasPrefix(existingFirst, "<html") && strings.HasPrefix(fragmentFirst, "<html")) ||
+			(strings.HasPrefix(existingFirst, "{") && strings.HasPrefix(fragmentFirst, "{")) ||
+			(strings.HasPrefix(existingFirst, "[") && strings.HasPrefix(fragmentFirst, "[")) {
+			appendMode = false
+		}
+	}
 	addedFragment := fragment
 	existingTrimmed := strings.TrimRight(existing, "\n")
 	if appendMode && existingTrimmed != "" && strings.HasPrefix(fragment, existingTrimmed+"\n") {
@@ -5455,6 +5955,22 @@ func shouldTreatUpdateFragmentAsAppend(existing string, fragment string) bool {
 		strings.TrimSpace(existingLines[0]) != "" &&
 		strings.TrimSpace(existingLines[0]) != strings.TrimSpace(fragmentLines[0]) {
 		return false
+	}
+	existingFirst := ""
+	fragmentFirst := ""
+	if len(existingLines) > 0 {
+		existingFirst = strings.ToLower(strings.TrimSpace(existingLines[0]))
+	}
+	if len(fragmentLines) > 0 {
+		fragmentFirst = strings.ToLower(strings.TrimSpace(fragmentLines[0]))
+	}
+	if len(fragmentLines) >= 2 {
+		if (strings.HasPrefix(existingFirst, "<!doctype") && strings.HasPrefix(fragmentFirst, "<!doctype")) ||
+			(strings.HasPrefix(existingFirst, "<html") && strings.HasPrefix(fragmentFirst, "<html")) ||
+			(strings.HasPrefix(existingFirst, "{") && strings.HasPrefix(fragmentFirst, "{")) ||
+			(strings.HasPrefix(existingFirst, "[") && strings.HasPrefix(fragmentFirst, "[")) {
+			return false
+		}
 	}
 	if !strings.Contains(fragment, "\n") {
 		return true
@@ -5937,41 +6453,6 @@ func replayToolProgressCommentary(toolName string) string {
 	}
 }
 
-func shouldRewriteWeakFinalWorkflowText(workflowState ToolWorkflowState, text string) bool {
-	if !workflowState.FinalAnswerSafe || len(workflowState.PendingToolNames) > 0 {
-		return false
-	}
-	lower := strings.ToLower(strings.TrimSpace(stripLeadingReasoningDirective(text)))
-	if lower == "" {
-		return false
-	}
-	weakPrefixes := []string{
-		"i'll ",
-		"i will ",
-		"let me ",
-		"now verifying",
-		"verifying the final",
-		"i'm going to ",
-		"i am going to ",
-	}
-	for _, prefix := range weakPrefixes {
-		if strings.HasPrefix(lower, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func buildWorkflowFinalExplanation(workflowState ToolWorkflowState, fallback string) string {
-	switch {
-	case workflowState.VerificationExpected && workflowState.VerificationCompleted:
-		return "The requested file changes were applied and verified successfully."
-	case workflowState.ApplyPatchSatisfied:
-		return "The requested file changes were applied successfully."
-	}
-	return strings.TrimSpace(fallback)
-}
-
 func buildResponsesUsageFromChatUsage(usage gjson.Result) map[string]any {
 	if !usage.Exists() {
 		return nil
@@ -6284,6 +6765,18 @@ func enrichApplyPatchOperationWithHints(operation any, applyPatchPathHint string
 			rewritten["type"] = typeHint
 		}
 	}
+	if normalizeApplyPatchTypeHint(cleanFallbackInput(rewritten["type"], "")) == "" {
+		path := strings.TrimSpace(cleanFallbackInput(rewritten["path"], ""))
+		hasContentPayload := strings.TrimSpace(cleanFallbackInput(rewritten["content"], "")) != "" ||
+			strings.TrimSpace(cleanFallbackInput(rewritten["diff"], "")) != ""
+		if path != "" && hasContentPayload {
+			if applyPatchPathExistsLocally(path) {
+				rewritten["type"] = "update_file"
+			} else {
+				rewritten["type"] = "create_file"
+			}
+		}
+	}
 	opType := normalizeApplyPatchTypeHint(cleanFallbackInput(rewritten["type"], ""))
 	if (opType == "create_file" || opType == "update_file") &&
 		strings.TrimSpace(cleanFallbackInput(rewritten["content"], "")) == "" &&
@@ -6373,7 +6866,7 @@ func preferContentDrivenApplyPatchOperation(operation any) any {
 }
 
 func translateChatCompletionToResponsesResponse(body []byte, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string) ([]byte, error) {
-	return translateChatCompletionToResponsesResponseWithWorkflow(body, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint, ToolWorkflowState{}, "")
+	return translateChatCompletionToResponsesResponseWithWorkflow(body, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint, ToolWorkflowState{}, "", nil)
 }
 
 func recoverNativeQuestionResponseIfRequired(responseBody []byte, upstreamBody []byte, requestBody []byte) []byte {
@@ -6475,7 +6968,7 @@ doneReasoning:
 	return out
 }
 
-func translateChatCompletionToResponsesResponseWithWorkflow(body []byte, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string, workflowState ToolWorkflowState, verificationShellArgs string) ([]byte, error) {
+func translateChatCompletionToResponsesResponseWithWorkflow(body []byte, applyPatchPathHint string, applyPatchContentHint string, applyPatchTypeHint string, workflowState ToolWorkflowState, verificationShellArgs string, originalReq map[string]any) ([]byte, error) {
 	body = normalizeChatCompletionReasoningBoundary(body)
 	appendProxyStageTrace("translation.chat_to_responses.start", map[string]any{
 		"body_len":         len(body),
@@ -6714,7 +7207,11 @@ func translateChatCompletionToResponsesResponseWithWorkflow(body []byte, applyPa
 	cleanedReasoningText := ""
 	if len(parsedToolCalls) == 0 && strings.TrimSpace(reasoningText) != "" {
 		parsedReasoningToolCalls, cleanedReasoningText = proxyCompatibilityAdapters.ToolRepair.ParseAssistantOutput(model, reasoningText)
-		if len(parsedReasoningToolCalls) > 0 && !shouldAllowReasoningDerivedToolRecovery(reasoningText, parsedReasoningToolCalls) {
+		allowReasoningRecovery := shouldAllowReasoningDerivedToolRecovery(reasoningText, parsedReasoningToolCalls)
+		if !allowReasoningRecovery && nativeToolArgumentsEmptyForParsedReasoningCall(message, parsedReasoningToolCalls) {
+			allowReasoningRecovery = true
+		}
+		if len(parsedReasoningToolCalls) > 0 && !allowReasoningRecovery {
 			appendApplyPatchTrace("translate.reasoning_recovery_rejected", map[string]any{
 				"model":          model,
 				"reasoning_len":  len(strings.TrimSpace(reasoningText)),
@@ -6745,7 +7242,11 @@ func translateChatCompletionToResponsesResponseWithWorkflow(body []byte, applyPa
 		text = cleanedText
 	}
 	if len(parsedToolCalls) == 0 && strings.TrimSpace(cleanedText) != strings.TrimSpace(text) {
-		text = cleanedText
+		originalVisiblePlan := extractVisibleProposedPlanBlock(text)
+		cleanedVisiblePlan := extractVisibleProposedPlanBlock(cleanedText)
+		if !(originalVisiblePlan != "" && cleanedVisiblePlan == "") {
+			text = cleanedText
+		}
 	}
 	if len(parsedReasoningToolCalls) > 0 {
 		reasoningText = cleanedReasoningText
@@ -6849,10 +7350,16 @@ func translateChatCompletionToResponsesResponseWithWorkflow(body []byte, applyPa
 		reasoningText = ""
 	}
 	if !hasToolCalls && !hasFunctionCall && len(parsedToolCalls) == 0 && len(parsedReasoningToolCalls) == 0 &&
-		shouldRewriteWeakFinalWorkflowText(workflowState, text) {
-		text = buildWorkflowFinalExplanation(workflowState, text)
+		shouldRecoverCodexSkillProofShellCall(originalReq, verificationShellArgs, text, reasoningText) {
+		parsedToolCalls = []ParsedToolCall{
+			{
+				Name:      "shell",
+				Arguments: parseToolArgsMapString(verificationShellArgs),
+			},
+		}
+		text = ""
+		reasoningText = ""
 	}
-
 	parsedByName := map[string][]ParsedToolCall{}
 	for _, call := range parsedToolCalls {
 		key := strings.ToLower(strings.TrimSpace(call.Name))
@@ -6967,25 +7474,6 @@ func translateChatCompletionToResponsesResponseWithWorkflow(body []byte, applyPa
 		"model":       model,
 		"output":      output,
 		"output_text": stripLeadingReasoningDirective(text),
-	}
-	if len(output) == 0 &&
-		strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "choices.0.finish_reason").String()), "stop") &&
-		chatCompletionLooksLikeEmptyVisibleOutput(rawContent, rawReasoningText) {
-		fallback := emptyAssistantOutputFallbackText
-		resp["output"] = []any{
-			map[string]any{
-				"id":   fmt.Sprintf("msg_%s_empty_visible_output", id),
-				"type": "message",
-				"role": "assistant",
-				"content": []any{
-					map[string]any{
-						"type": "output_text",
-						"text": fallback,
-					},
-				},
-			},
-		}
-		resp["output_text"] = fallback
 	}
 	if created := gjson.GetBytes(body, "created").Int(); created > 0 {
 		resp["created_at"] = created
@@ -8115,12 +8603,76 @@ func textLooksLikeEmptyToolArtifact(text string) bool {
 		return false
 	}
 	compact = strings.NewReplacer("\n", "", "\r", "", "\t", "", " ", "").Replace(compact)
+	if strings.HasPrefix(compact, "<tool_call") || strings.HasPrefix(compact, "<tool_use") || strings.HasPrefix(compact, "<tool_code") {
+		return true
+	}
 	switch compact {
-	case "<tool_code></tool_code>", "<tool_call></tool_call>", "<tool_use></tool_use>":
+	case "<tool_code>", "<tool_call>", "<tool_use>", "<tool_code></tool_code>", "<tool_call></tool_call>", "<tool_use></tool_use>":
 		return true
 	default:
 		return false
 	}
+}
+
+func textLooksLikeDeferredToolPromise(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	promisePhrases := []string{
+		"now applying the patch",
+		"now applying the update",
+		"now applying the update with apply_patch",
+		"now i'll apply the patch",
+		"now i will apply the patch",
+		"fixing that now",
+		"i'll fix that now",
+		"i will fix that now",
+		"updating that now",
+		"now updating with apply_patch",
+		"now i'll update the file with apply_patch",
+		"now i'll update the file with `apply_patch`",
+		"now i will update the file with apply_patch",
+		"update it with apply_patch",
+		"let me read",
+		"let me first read",
+		"let me check",
+		"let me first check",
+		"let me inspect",
+		"let me first inspect",
+		"let me start by",
+		"let me start by examining",
+		"let me verify",
+		"let me first verify",
+		"let me use a shell command",
+		"let me use shell",
+		"let me search",
+		"let me get a bit more detail",
+		"let me look",
+		"let me first look",
+		"i'll read",
+		"i will read",
+		"i'll check",
+		"i will check",
+		"i'll inspect",
+		"i will inspect",
+		"i'll verify",
+		"i will verify",
+		"i'll create it",
+		"i will create it",
+		"i need to create it",
+		"now verifying",
+		"verifying the content",
+		"verifying the file content",
+		"verifying the saved content",
+		"verifying the saved file",
+	}
+	for _, phrase := range promisePhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func textLooksLikeWeakProgressPlaceholder(text string) bool {
@@ -8130,6 +8682,31 @@ func textLooksLikeWeakProgressPlaceholder(text string) bool {
 	default:
 		return false
 	}
+}
+
+func textLooksLikeDeferredSearchPromise(text string) bool {
+	lowerText := strings.ToLower(strings.TrimSpace(text))
+	if lowerText == "" {
+		return false
+	}
+	promisePhrases := []string{
+		"let me search",
+		"let me also search",
+		"i will search",
+		"i'll search",
+		"let me research",
+		"i will research",
+		"i'll research",
+		"let me browse",
+		"let me investigate",
+		"let me look up",
+	}
+	for _, phrase := range promisePhrases {
+		if strings.Contains(lowerText, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func textIndicatesSearchIntent(text string) bool {
@@ -8187,7 +8764,10 @@ func requestHistoryContainsSearchArtifacts(req map[string]any, workflowState Too
 		switch strings.TrimSpace(fmt.Sprintf("%v", item["type"])) {
 		case "message":
 			role := strings.TrimSpace(fmt.Sprintf("%v", item["role"]))
-			if role != "assistant" && role != "user" && role != "tool" {
+			// User prompts can describe a desired web-search step without meaning
+			// search already happened. Only treat assistant/tool-visible history as
+			// completed research artifacts.
+			if role != "assistant" && role != "tool" {
 				continue
 			}
 			for _, text := range extractMessageTextParts(item["content"]) {
@@ -8217,6 +8797,40 @@ func requestHistoryContainsResearchArtifacts(req map[string]any, workflowState T
 	return false
 }
 
+func requestStillNeedsWebSearchBeforeApplyPatch(req map[string]any, workflowState ToolWorkflowState) bool {
+	if req == nil || !requestIncludesWebSearchTool(req) {
+		return false
+	}
+	userText := extractResponsesUserInputText(req)
+	if !requestExplicitlyWantsSearchIntent(req, workflowState) &&
+		!textIndicatesSearchIntent(userText) &&
+		!textLooksLikeDeferredSearchPromise(userText) {
+		return false
+	}
+	if requestHistoryContainsSearchArtifacts(req, workflowState) || requestHistoryContainsResearchArtifacts(req, workflowState) {
+		return false
+	}
+	return true
+}
+
+func requestExplicitlyForbidsWebSearch(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	lowerText := strings.ToLower(strings.TrimSpace(
+		extractTrustedResponsesInstructionText(req) + "\n" + extractResponsesUserInputText(req),
+	))
+	if lowerText == "" {
+		return false
+	}
+	return strings.Contains(lowerText, "do not use web search") ||
+		strings.Contains(lowerText, "don't use web search") ||
+		strings.Contains(lowerText, "without web search") ||
+		strings.Contains(lowerText, "no web search") ||
+		strings.Contains(lowerText, "do not search the web") ||
+		strings.Contains(lowerText, "don't search the web")
+}
+
 func requestExplicitlyWantsExplorationFollowup(req map[string]any, workflowState ToolWorkflowState) bool {
 	if req == nil {
 		return false
@@ -8242,6 +8856,9 @@ func requestExplicitlyWantsSearchIntent(req map[string]any, workflowState ToolWo
 	hasResearchHistory := requestHistoryContainsResearchArtifacts(req, workflowState)
 	if requestTextLooksLikeRetry(lowerText) && hasResearchHistory {
 		return true
+	}
+	if responsesRequestContractMode(req) == "plan" && hasResearchHistory {
+		return false
 	}
 	if isCodexManagedPlanModeFromResponsesRequest(req) &&
 		hasAnsweredRequestUserInput &&
@@ -8510,6 +9127,9 @@ func buildToolWorkflowState(req map[string]any) ToolWorkflowState {
 		(requestInputMentionsApplyPatch(req) ||
 			requestWantsShellInspectionBeforeApplyPatch(req) ||
 			completedToolNamesContain(completedSequence, "apply_patch"))
+	if !state.VerificationExpected && requestNeedsCodexSkillFilesystemProof(req) {
+		state.VerificationExpected = true
+	}
 
 	if state.VerificationExpected {
 		seenApplyPatch := false
@@ -8522,6 +9142,9 @@ func buildToolWorkflowState(req map[string]any) ToolWorkflowState {
 					state.VerificationCompleted = true
 				}
 			}
+		}
+		if !state.VerificationCompleted && requestHistoryShowsCodexSkillFilesystemProof(req) {
+			state.VerificationCompleted = true
 		}
 	}
 
@@ -8678,7 +9301,11 @@ func extractWorkflowRecoveryContextFromRequestBody(body []byte) (ToolWorkflowSta
 		return ToolWorkflowState{}, ""
 	}
 	workflowState := buildToolWorkflowState(req)
-	return workflowState, extractLatestCompletedShellArguments(req)
+	verificationShellArgs := extractLatestCompletedShellArguments(req)
+	if strings.TrimSpace(verificationShellArgs) == "" && requestNeedsCodexSkillFilesystemProof(req) {
+		verificationShellArgs = buildCodexSkillProofShellArguments(req)
+	}
+	return workflowState, verificationShellArgs
 }
 
 func completedToolNamesContain(names []string, want string) bool {
@@ -8759,31 +9386,66 @@ func deriveContinuationAllowedToolNames(req map[string]any) []string {
 	if requestMentionsAgentOrchestration(req) || allCompletedToolNamesWithinSet(completed, "spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent") {
 		return []string{"spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent"}
 	}
+	hasResearchHistory := requestHistoryContainsResearchArtifacts(req, workflowState)
 	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
 	wantsShell := strings.Contains(text, "shell") || strings.Contains(text, "verify with shell") || strings.Contains(text, "use shell")
 	// A prior apply_patch completion is workflow history, not proof that the
 	// next turn should be narrowed to patch-only semantics. Keep patch-family
 	// narrowing for turns that still explicitly ask for patch sequencing.
-	wantsPatchFamily := requestInputMentionsApplyPatch(req) || requestWantsShellInspectionBeforeApplyPatch(req)
+	wantsPatchFamily := requestInputMentionsApplyPatch(req) || requestWantsShellInspectionBeforeApplyPatch(req) || responsesRequestExposesTool(req, "apply_patch")
 	if workflowState.VerificationExpected && completedToolNamesContain(completed, "apply_patch") && !workflowState.VerificationCompleted {
 		return []string{"shell"}
+	}
+	// Local web research continuations should not collapse into patch-only tool
+	// exposure just because apply_patch is mentioned somewhere in the original
+	// request. Until a patch step has actually started, preserve broad tools so
+	// the model can continue or finish research naturally.
+	if hasResearchHistory && !completedToolNamesContain(completed, "apply_patch") {
+		return nil
 	}
 	if wantsPatchFamily {
 		allowed := make([]string, 0, 2)
 		if completedToolNamesContain(completed, "shell") || wantsShell || requestWantsShellInspectionBeforeApplyPatch(req) {
 			allowed = append(allowed, "shell")
 		}
-		if requestInputMentionsApplyPatch(req) {
+		if requestInputMentionsApplyPatch(req) || responsesRequestExposesTool(req, "apply_patch") {
 			allowed = append(allowed, "apply_patch")
 		}
 		if len(allowed) > 0 {
 			return allowed
 		}
 	}
-	if len(completed) == 1 && completedToolNamesContain(completed, "shell") {
-		return []string{"shell"}
-	}
 	return nil
+}
+
+func responsesRequestExposesTool(req map[string]any, target string) bool {
+	if req == nil {
+		return false
+	}
+	target = normalizeToolTierName(target)
+	tools, ok := req["tools"].([]any)
+	if !ok {
+		return false
+	}
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := normalizeToolTierName(strings.TrimSpace(fmt.Sprintf("%v", tool["name"])))
+		if name == "" {
+			if fn, ok := tool["function"].(map[string]any); ok {
+				name = normalizeToolTierName(strings.TrimSpace(fmt.Sprintf("%v", fn["name"])))
+			}
+		}
+		if name == "" {
+			name = normalizeToolTierName(strings.TrimSpace(fmt.Sprintf("%v", tool["type"])))
+		}
+		if name == target {
+			return true
+		}
+	}
+	return false
 }
 
 func toolChoiceTargetsSpecificTool(raw any) bool {
@@ -9129,7 +9791,6 @@ func extractApplyPatchContentHintFromResponsesRequestBody(body []byte) string {
 		if idx := strings.Index(strings.ToLower(content), " then "); idx >= 0 {
 			content = strings.TrimSpace(content[:idx])
 		}
-		content = strings.Trim(content, ".,;:!?)(")
 		if content == "" {
 			continue
 		}
@@ -9180,6 +9841,201 @@ func requestInputMentionsApplyPatch(req map[string]any) bool {
 		return true
 	}
 	return false
+}
+
+func extractRequestedCodexSkillName(req map[string]any) string {
+	if req == nil {
+		return ""
+	}
+	text := strings.TrimSpace(extractResponsesUserInputText(req))
+	if text == "" {
+		return ""
+	}
+	matches := codexSkillReferenceRegexp.FindAllStringSubmatch(text, -1)
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(match[1])
+		if name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func requestNeedsCodexSkillFilesystemProof(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(extractResponsesUserInputText(req)))
+	if text == "" {
+		return false
+	}
+	mentionsSkill := strings.Contains(text, "skill.md") ||
+		strings.Contains(text, ".codex/skills") ||
+		strings.Contains(text, ".codex\\skills") ||
+		strings.Contains(text, "codex skill") ||
+		strings.Contains(text, "skills directory") ||
+		strings.Contains(text, "available skills") ||
+		strings.Contains(text, "installed skills") ||
+		strings.Contains(text, "skill definition") ||
+		strings.Contains(text, "track down where that skill") ||
+		strings.Contains(text, "skill is actually stored") ||
+		strings.Contains(text, "find the skill") ||
+		strings.Contains(text, "create a skill") ||
+		strings.Contains(text, "update a skill") ||
+		strings.Contains(text, "modify a skill") ||
+		strings.Contains(text, "change the skill") ||
+		strings.Contains(text, "write skill.md") ||
+		extractRequestedCodexSkillName(req) != ""
+	if !mentionsSkill {
+		return false
+	}
+	return strings.Contains(text, "find") ||
+		strings.Contains(text, "found") ||
+		strings.Contains(text, "locate") ||
+		strings.Contains(text, "stored") ||
+		strings.Contains(text, "definition") ||
+		strings.Contains(text, "create") ||
+		strings.Contains(text, "created") ||
+		strings.Contains(text, "write") ||
+		strings.Contains(text, "install") ||
+		strings.Contains(text, "installed") ||
+		strings.Contains(text, "update") ||
+		strings.Contains(text, "modify") ||
+		strings.Contains(text, "change") ||
+		strings.Contains(text, "edit") ||
+		strings.Contains(text, "register")
+}
+
+func buildCodexSkillProofShellArguments(req map[string]any) string {
+	if !requestNeedsCodexSkillFilesystemProof(req) {
+		return ""
+	}
+	targetSkill := strings.TrimSpace(extractRequestedCodexSkillName(req))
+	rootExpr := `$root = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'skills' } else { Join-Path $env:USERPROFILE '.codex\skills' }`
+	var command string
+	if targetSkill != "" {
+		safeName := regexp.QuoteMeta(targetSkill)
+		command = rootExpr + "; " +
+			`Get-ChildItem -Path $root -Recurse -Filter 'SKILL.md' -ErrorAction SilentlyContinue | ` +
+			fmt.Sprintf(`Where-Object { $_.FullName -match '(?i)[\\/](%s)[\\/]SKILL\.md$' -or $_.FullName -match '(?i)%s' } | `, safeName, safeName) +
+			`Select-Object FullName`
+	} else {
+		command = rootExpr + "; Get-ChildItem -Path $root -Recurse -Filter 'SKILL.md' -ErrorAction SilentlyContinue | Select-Object FullName"
+	}
+	return mustJSONString(map[string]any{
+		"command": []string{"powershell.exe", "-Command", command},
+	})
+}
+
+func textMentionsCodexSkillProof(raw string, targetSkill string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	if lower == "" {
+		return false
+	}
+	hasSkillPath := strings.Contains(lower, "skill.md") ||
+		strings.Contains(lower, ".codex\\skills") ||
+		strings.Contains(lower, ".codex/skills") ||
+		strings.Contains(lower, "/skills/")
+	if !hasSkillPath {
+		return false
+	}
+	if strings.TrimSpace(targetSkill) == "" {
+		return true
+	}
+	return strings.Contains(lower, strings.ToLower(strings.TrimSpace(targetSkill)))
+}
+
+func requestHistoryShowsCodexSkillFilesystemProof(req map[string]any) bool {
+	if req == nil {
+		return false
+	}
+	items, ok := req["input"].([]any)
+	if !ok || len(items) == 0 {
+		return false
+	}
+	targetSkill := strings.TrimSpace(extractRequestedCodexSkillName(req))
+	callNamesByID := map[string]string{}
+	callArgsByID := map[string]string{}
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemType := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", item["type"])))
+		callID := strings.TrimSpace(fmt.Sprintf("%v", item["call_id"]))
+		switch itemType {
+		case "function_call", "custom_tool_call":
+			name := normalizeToolTierName(fmt.Sprintf("%v", item["name"]))
+			callNamesByID[callID] = name
+			callArgsByID[callID] = strings.TrimSpace(fmt.Sprintf("%v", item["arguments"]))
+			if name == "apply_patch" && textMentionsCodexSkillProof(callArgsByID[callID], targetSkill) {
+				return true
+			}
+		case "apply_patch_call":
+			if textMentionsCodexSkillProof(mustJSONString(item["operation"]), targetSkill) {
+				return true
+			}
+		case "shell_call":
+			callNamesByID[callID] = "shell"
+			callArgsByID[callID] = mustJSONString(item["action"])
+		case "function_call_output", "custom_tool_call_output", "shell_call_output":
+			if normalizeToolTierName(callNamesByID[callID]) != "shell" {
+				continue
+			}
+			if textMentionsCodexSkillProof(fmt.Sprintf("%v", item["output"]), targetSkill) {
+				return true
+			}
+		case "apply_patch_call_output":
+			if textMentionsCodexSkillProof(fmt.Sprintf("%v", item["output"]), targetSkill) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func assistantTextMakesUnverifiedCodexSkillClaim(text string, reasoning string) bool {
+	combined := strings.ToLower(strings.TrimSpace(text + "\n" + reasoning))
+	if combined == "" {
+		return false
+	}
+	claimMarkers := []string{
+		"found it",
+		"i found it",
+		"i found the skill",
+		"the skill was created",
+		"i created the skill",
+		"created the skill",
+		"skill is installed",
+		"skill exists",
+		"updated the skill",
+		"modified the skill",
+		"wrote skill.md",
+		"wrote the skill",
+		"set it up",
+	}
+	for _, marker := range claimMarkers {
+		if strings.Contains(combined, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldRecoverCodexSkillProofShellCall(req map[string]any, verificationShellArgs string, text string, reasoning string) bool {
+	if !requestNeedsCodexSkillFilesystemProof(req) {
+		return false
+	}
+	if strings.TrimSpace(verificationShellArgs) == "" {
+		return false
+	}
+	if requestHistoryShowsCodexSkillFilesystemProof(req) {
+		return false
+	}
+	return assistantTextMakesUnverifiedCodexSkillClaim(text, reasoning)
 }
 
 func requestInputExplicitlyForbidsApplyPatch(input string) bool {
@@ -9766,15 +10622,24 @@ func sanitizeStructuredPlanText(text string) string {
 	return trimmed
 }
 
-func enforcedPlanModeText() string {
-	return "<proposed_plan>\n" +
-		"Planning mode is active. Here is a structured plan only:\n" +
-		"1. Define scope and constraints: clarify functional requirements, target users, and non-functional goals.\n" +
-		"2. Design the architecture: choose components, data flow, interfaces, and error-handling strategy.\n" +
-		"3. Break implementation into phases: identify milestones, dependencies, and deliverables for each phase.\n" +
-		"4. Prepare validation: define tests, acceptance criteria, and observability checks for each milestone.\n" +
-		"5. Assess risks and rollout: list major risks, mitigations, fallback strategy, and rollout sequence.\n" +
-		"</proposed_plan>"
+func extractVisibleProposedPlanBlock(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	openIdx := strings.Index(lower, "<proposed_plan>")
+	if openIdx < 0 {
+		return ""
+	}
+	afterOpen := openIdx + len("<proposed_plan>")
+	closeRel := strings.Index(lower[afterOpen:], "</proposed_plan>")
+	if closeRel < 0 {
+		return ""
+	}
+	closeIdx := afterOpen + closeRel
+	block := strings.TrimSpace(trimmed[openIdx : closeIdx+len("</proposed_plan>")])
+	return sanitizeStructuredPlanText(block)
 }
 
 func planModeLengthDiagnosticText() string {
@@ -10036,40 +10901,13 @@ func buildStructuredPlanFromResearchNotes(text string) string {
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
-func derivePlanModeFallbackText(candidates ...string) string {
-	seen := map[string]struct{}{}
-	normalized := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		candidate = sanitizePlanModeCandidateText(candidate)
-		if candidate == "" {
-			continue
-		}
-		if _, ok := seen[candidate]; ok {
-			continue
-		}
-		seen[candidate] = struct{}{}
-		normalized = append(normalized, candidate)
-		if !shouldRewritePlanModeResponseText(candidate) {
-			return candidate
-		}
-	}
-	for _, candidate := range normalized {
-		if structured := buildStructuredPlanFromResearchNotes(candidate); strings.TrimSpace(structured) != "" {
-			return structured
-		}
-	}
-	if len(normalized) > 1 {
-		if structured := buildStructuredPlanFromResearchNotes(strings.Join(normalized, "\n\n")); strings.TrimSpace(structured) != "" {
-			return structured
-		}
-	}
-	return enforcedPlanModeText()
-}
-
 func ensureProposedPlanWrapper(text string) string {
-	trimmed := sanitizeStructuredPlanText(text)
+	trimmed := extractVisibleProposedPlanBlock(text)
 	if trimmed == "" {
-		return enforcedPlanModeText()
+		trimmed = sanitizeStructuredPlanText(text)
+	}
+	if trimmed == "" {
+		return ""
 	}
 	lower := strings.ToLower(trimmed)
 	if strings.Contains(lower, "<proposed_plan>") && strings.Contains(lower, "</proposed_plan>") {
@@ -10224,16 +11062,6 @@ func sanitizePlanModeCandidateText(text string) string {
 	return strings.TrimSpace(text)
 }
 
-func extractPlanTextFromBlockedApplyPatch(responseBody []byte) string {
-	if !gjson.ValidBytes(responseBody) {
-		return ""
-	}
-	if _, operation, ok := extractFirstApplyPatchInvocationFromResponse(responseBody); ok {
-		return extractApplyPatchPlanText(operation)
-	}
-	return ""
-}
-
 func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool) []byte {
 	if !gjson.ValidBytes(responseBody) {
 		return responseBody
@@ -10243,6 +11071,7 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 		return responseBody
 	}
 
+	preferredVisiblePlan := ""
 	textParts := make([]string, 0)
 	reasoningParts := make([]string, 0)
 	outputRaw, _ := resp["output"].([]any)
@@ -10277,29 +11106,24 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 			}
 			text := strings.TrimSpace(fmt.Sprintf("%v", part["text"]))
 			if text != "" {
+				if preferredVisiblePlan == "" {
+					preferredVisiblePlan = extractVisibleProposedPlanBlock(text)
+				}
 				textParts = append(textParts, text)
 			}
 		}
 	}
 
 	planText := strings.TrimSpace(strings.Join(textParts, "\n\n"))
-	if strings.TrimSpace(planText) == "" {
-		planText = extractPlanTextFromBlockedApplyPatch(responseBody)
+	if preferredVisiblePlan != "" {
+		planText = preferredVisiblePlan
 	}
 	finishReason := strings.TrimSpace(strings.ToLower(gjson.GetBytes(responseBody, "choices.0.finish_reason").String()))
-	if shouldRewritePlanModeResponseText(planText) {
-		if planText == "" && !upstreamFinishedNormally {
-			if finishReason == "length" {
-				planText = planModeLengthDiagnosticText()
-			} else {
-				return responseBody
-			}
+	if preferredVisiblePlan == "" {
+		if strings.TrimSpace(planText) == "" && finishReason == "length" {
+			planText = planModeLengthDiagnosticText()
 		} else {
-			planText = derivePlanModeFallbackText(
-				planText,
-				strings.Join(reasoningParts, "\n\n"),
-				extractPlanTextFromBlockedApplyPatch(responseBody),
-			)
+			return responseBody
 		}
 	}
 	if strings.TrimSpace(planText) == "" && finishReason == "length" {
@@ -10309,7 +11133,7 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 		return responseBody
 	}
 	if strings.TrimSpace(planText) == "" {
-		planText = derivePlanModeFallbackText(strings.Join(reasoningParts, "\n\n"))
+		return responseBody
 	}
 	planText = stripLeadingReasoningDirective(planText)
 	if content, _ := extractContentAndReasoning(planText); strings.TrimSpace(content) != "" {
@@ -10317,6 +11141,9 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 	}
 	planText = sanitizeStructuredPlanText(planText)
 	planText = ensureProposedPlanWrapper(planText)
+	if strings.TrimSpace(planText) == "" {
+		return responseBody
+	}
 
 	msgID := fmt.Sprintf("msg_plan_mode_%d", time.Now().UnixNano())
 	message := map[string]any{
@@ -10506,6 +11333,17 @@ func appendApplyPatchFirstAttemptConstraint(req map[string]any) {
 	if body, err := json.Marshal(req); err == nil && rawResponsesBodyLooksLikePlanMode(body) {
 		return
 	}
+	workflowState := proxyCompatibilityAdapters.Continuation.BuildWorkflowState(req)
+	userText := extractResponsesUserInputText(req)
+	if requestIncludesWebSearchTool(req) &&
+		(requestStillNeedsWebSearchBeforeApplyPatch(req, workflowState) ||
+			((requestExplicitlyWantsSearchIntent(req, workflowState) ||
+				textIndicatesSearchIntent(userText) ||
+				textLooksLikeDeferredSearchPromise(userText)) &&
+				!requestHistoryContainsResearchArtifacts(req, workflowState))) {
+		appendStrictWebSearchOnlyInstruction(req)
+		return
+	}
 	// Shell-first steering is only for explicit mixed-workflow prompts like
 	// "first use shell ... then use apply_patch". Native apply_patch remains the
 	// default for ordinary file-mutation requests.
@@ -10622,6 +11460,50 @@ func keepOnlyNamedTools(req map[string]any, allowedNames ...string) bool {
 	return true
 }
 
+func removeNamedTools(req map[string]any, names ...string) bool {
+	if req == nil || len(names) == 0 {
+		return false
+	}
+	tools, ok := req["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return false
+	}
+	blocked := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		normalized := normalizeToolTierName(name)
+		if normalized != "" {
+			blocked[normalized] = struct{}{}
+		}
+	}
+	if len(blocked) == 0 {
+		return false
+	}
+	filtered := make([]any, 0, len(tools))
+	changed := false
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		name := normalizeToolTierName(extractFunctionToolName(tool))
+		if name == "" {
+			toolType := strings.TrimSpace(strings.ToLower(fmt.Sprintf("%v", tool["type"])))
+			name = normalizeToolTierName(toolType)
+		}
+		if _, forbidden := blocked[name]; forbidden {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, tool)
+	}
+	if !changed {
+		return false
+	}
+	req["tools"] = filtered
+	return true
+}
+
 func appendEmptyPostToolRecoveryInstruction(req map[string]any) {
 	if req == nil {
 		return
@@ -10635,12 +11517,100 @@ func appendMissingWebSearchRecoveryInstruction(req map[string]any) {
 	if req == nil {
 		return
 	}
+	if requestExplicitlyForbidsWebSearch(req) {
+		return
+	}
 	instruction := "If current or external information is still needed, emit exactly one real web_search tool call next." +
 		" Do not output placeholder progress text, empty <tool_code> wrappers, <websearch> tags, or print(websearch(...))." +
 		" Prefer native web_search over Playwright/browser tools for normal research steps when web_search is available."
 	prependSystemInstructionOnce(req, instruction)
 	req["llamaswap_force_search_intent"] = true
 	req["parallel_tool_calls"] = false
+}
+
+func appendStrictWebSearchOnlyInstruction(req map[string]any) {
+	if req == nil {
+		return
+	}
+	if requestExplicitlyForbidsWebSearch(req) {
+		return
+	}
+	appendMissingWebSearchRecoveryInstruction(req)
+	req["tools"] = []any{map[string]any{"type": "web_search", "external_web_access": true}}
+	delete(req, "tool_choice")
+	req["parallel_tool_calls"] = false
+}
+
+func appendMissingShellRecoveryInstruction(req map[string]any) {
+	if req == nil {
+		return
+	}
+	instruction := "Emit exactly one real shell tool call next to inspect or verify the file." +
+		" Do not output placeholder progress text, and do not call apply_patch on this turn." +
+		" Use shell to read or inspect the concrete file state first."
+	prependSystemInstructionOnce(req, instruction)
+	keepOnlyShellTools(req)
+	req["parallel_tool_calls"] = false
+}
+
+func appendWeakFinalRecoveryInstruction(req map[string]any) {
+	if req == nil {
+		return
+	}
+	instruction := "Your previous reply was only placeholder progress text." +
+		" Provide the actual final answer for the user now based on the completed work." +
+		" Do not say 'Working on the request.', 'Running tool...', or similar progress text." +
+		" Do not call any tool on this turn unless one is strictly necessary to answer."
+	prependSystemInstructionOnce(req, instruction)
+	req["parallel_tool_calls"] = false
+}
+
+func isWeakProgressPlaceholderText(text string) bool {
+	normalized := strings.TrimSpace(strings.ToLower(text))
+	switch normalized {
+	case "",
+		"working on the request.",
+		"continuing from the latest tool results.",
+		"running tool...",
+		"applying the requested file update.",
+		"file created. now verifying the content.",
+		"file created. now verifying the saved content.",
+		"file created. now verifying the saved file.",
+		"let me check the existing codebase to understand what's already here.",
+		"file updated. verifying the saved content:",
+		"verifying the file content:",
+		"good, now let me verify the file content.",
+		"good, now let me verify the file content",
+		"file updated. verifying the saved content now.",
+		"patch applied. verifying the file contents now.",
+		"patch applied. verifying the file contents...",
+		"the patch was applied successfully. let me verify the file was saved correctly:":
+		return true
+	default:
+		return false
+	}
+}
+
+func extractResponsesVisibleText(body []byte) string {
+	text := strings.TrimSpace(gjson.GetBytes(body, "output_text").String())
+	if text != "" {
+		return text
+	}
+	for _, item := range gjson.GetBytes(body, "output").Array() {
+		if strings.TrimSpace(strings.ToLower(item.Get("type").String())) != "message" {
+			continue
+		}
+		for _, part := range item.Get("content").Array() {
+			if strings.TrimSpace(strings.ToLower(part.Get("type").String())) != "output_text" {
+				continue
+			}
+			text = strings.TrimSpace(part.Get("text").String())
+			if text != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 func responsesOutputContainsAnyToolCall(responseBody []byte) bool {
@@ -10656,6 +11626,81 @@ func responsesOutputContainsAnyToolCall(responseBody []byte) bool {
 	return false
 }
 
+func chatResponseContainsToolCallNamed(responseBody []byte, names ...string) bool {
+	if !gjson.ValidBytes(responseBody) {
+		return false
+	}
+	allowed := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		trimmed := strings.TrimSpace(strings.ToLower(name))
+		if trimmed != "" {
+			allowed[trimmed] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return false
+	}
+	for _, toolCall := range gjson.GetBytes(responseBody, "choices.0.message.tool_calls").Array() {
+		name := strings.TrimSpace(strings.ToLower(toolCall.Get("function.name").String()))
+		if name == "" {
+			name = strings.TrimSpace(strings.ToLower(toolCall.Get("name").String()))
+		}
+		if _, ok := allowed[name]; ok {
+			return true
+		}
+	}
+	functionCall := gjson.GetBytes(responseBody, "choices.0.message.function_call")
+	if functionCall.Exists() {
+		name := strings.TrimSpace(strings.ToLower(functionCall.Get("name").String()))
+		if _, ok := allowed[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func chatResponseToolCallsOnlyNamed(responseBody []byte, names ...string) bool {
+	if !gjson.ValidBytes(responseBody) {
+		return false
+	}
+	allowed := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		trimmed := strings.TrimSpace(strings.ToLower(name))
+		if trimmed != "" {
+			allowed[trimmed] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return false
+	}
+	found := false
+	for _, toolCall := range gjson.GetBytes(responseBody, "choices.0.message.tool_calls").Array() {
+		name := strings.TrimSpace(strings.ToLower(toolCall.Get("function.name").String()))
+		if name == "" {
+			name = strings.TrimSpace(strings.ToLower(toolCall.Get("name").String()))
+		}
+		if name == "" {
+			return false
+		}
+		if _, ok := allowed[name]; !ok {
+			return false
+		}
+		found = true
+	}
+	functionCall := gjson.GetBytes(responseBody, "choices.0.message.function_call")
+	if functionCall.Exists() {
+		name := strings.TrimSpace(strings.ToLower(functionCall.Get("name").String()))
+		if name == "" {
+			return false
+		}
+		if _, ok := allowed[name]; !ok {
+			return false
+		}
+		found = true
+	}
+	return found
+}
+
 func shouldRetryMissingWebSearchCall(req map[string]any, translatedChatRequest []byte, chatResponse []byte, translatedResponse []byte, workflowState ToolWorkflowState) bool {
 	if req == nil {
 		return false
@@ -10667,9 +11712,16 @@ func shouldRetryMissingWebSearchCall(req map[string]any, translatedChatRequest [
 	if responsesOutputContainsAnyToolCall(translatedResponse) {
 		return false
 	}
+	if chatResponseContainsToolCallNamed(chatResponse, "web_search", "web_search_preview", llamaSwapWebSearchFunctionName) {
+		return false
+	}
 	contentText := strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.message.content").String())
 	reasoningText := strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.message.reasoning_content").String())
-	if !(textLooksLikeWeakProgressPlaceholder(contentText) || textLooksLikeSearchArtifact(contentText) || textLooksLikeEmptyToolArtifact(contentText)) {
+	deferredSearchPromise := textLooksLikeDeferredSearchPromise(contentText)
+	if !(textLooksLikeWeakProgressPlaceholder(contentText) ||
+		textLooksLikeSearchArtifact(contentText) ||
+		textLooksLikeEmptyToolArtifact(contentText) ||
+		deferredSearchPromise) {
 		return false
 	}
 	combined := strings.TrimSpace(strings.Join([]string{
@@ -10677,10 +11729,192 @@ func shouldRetryMissingWebSearchCall(req map[string]any, translatedChatRequest [
 		contentText,
 		reasoningText,
 	}, "\n"))
-	if !textIndicatesSearchIntent(combined) && !requestExplicitlyWantsSearchIntent(req, workflowState) {
+	if !deferredSearchPromise && !textIndicatesSearchIntent(combined) && !requestExplicitlyWantsSearchIntent(req, workflowState) {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.finish_reason").String()), "stop")
+}
+
+func textLooksLikeShellInspectionPromise(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	return (strings.Contains(lower, "shell") || strings.Contains(lower, "cat ")) &&
+		(strings.Contains(lower, "verify") ||
+			strings.Contains(lower, "inspect") ||
+			strings.Contains(lower, "read the file") ||
+			strings.Contains(lower, "read the current file") ||
+			strings.Contains(lower, "check the current file") ||
+			strings.Contains(lower, "check the file"))
+}
+
+func responseOutputContainsInvalidApplyPatchMessage(responseBody []byte) bool {
+	if !gjson.ValidBytes(responseBody) {
+		return false
+	}
+	for _, item := range gjson.GetBytes(responseBody, "output").Array() {
+		if strings.TrimSpace(item.Get("type").String()) != "message" {
+			continue
+		}
+		for _, part := range item.Get("content").Array() {
+			text := strings.ToLower(strings.TrimSpace(part.Get("text").String()))
+			if strings.Contains(text, "apply_patch call was not executed because operation was invalid") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func textLooksLikeBrowserOpenPromise(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	return (strings.Contains(lower, "open it in your default browser") ||
+		strings.Contains(lower, "open it in the browser") ||
+		strings.Contains(lower, "open it in your browser") ||
+		strings.Contains(lower, "open the browser") ||
+		strings.Contains(lower, "open it so the user can see it working")) &&
+		(strings.Contains(lower, "let me") ||
+			strings.Contains(lower, "let's") ||
+			strings.Contains(lower, "i'll") ||
+			strings.Contains(lower, "i will"))
+}
+
+func shouldRetryInvalidApplyPatchOperation(req map[string]any, chatResponse []byte, translatedResponse []byte) bool {
+	if req == nil {
+		return false
+	}
+	if !responsesRequestExposesTool(req, "apply_patch") {
+		return false
+	}
+	if !responseOutputContainsInvalidApplyPatchMessage(translatedResponse) {
+		return false
+	}
+	if !chatResponseContainsToolCallNamed(chatResponse, "apply_patch") {
+		return false
+	}
+	finishReason := strings.TrimSpace(strings.ToLower(gjson.GetBytes(chatResponse, "choices.0.finish_reason").String()))
+	return finishReason == "tool_calls" || finishReason == "stop"
+}
+
+func shouldRetryMissingShellCall(req map[string]any, translatedChatRequest []byte, chatResponse []byte, translatedResponse []byte, workflowState ToolWorkflowState) bool {
+	if req == nil {
+		return false
+	}
+	contentText := strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.message.content").String())
+	reasoningText := strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.message.reasoning_content").String())
+	lowerReasoning := strings.ToLower(reasoningText)
+	lowerContent := strings.ToLower(contentText)
+	readFileIntent := strings.Contains(lowerReasoning, "read the current file") ||
+		strings.Contains(lowerReasoning, "read the file first") ||
+		strings.Contains(lowerReasoning, "check the current file") ||
+		strings.Contains(lowerReasoning, "inspect the file") ||
+		strings.Contains(lowerContent, "check the current file") ||
+		strings.Contains(lowerContent, "read the current file") ||
+		strings.Contains(lowerContent, "read the file first")
+	verifyFileIntent := strings.Contains(lowerReasoning, "verify the file") ||
+		strings.Contains(lowerReasoning, "verify the saved file") ||
+		strings.Contains(lowerReasoning, "verify the file content") ||
+		strings.Contains(lowerReasoning, "check what was saved") ||
+		strings.Contains(lowerContent, "verify the file") ||
+		strings.Contains(lowerContent, "verify the saved file") ||
+		strings.Contains(lowerContent, "verify the file content")
+	invalidPatchRecovery := responseOutputContainsInvalidApplyPatchMessage(translatedResponse) &&
+		(readFileIntent || verifyFileIntent || workflowState.VerificationExpected)
+	wrongApplyPatchInsteadOfShell := chatResponseToolCallsOnlyNamed(chatResponse, "apply_patch") &&
+		(readFileIntent || verifyFileIntent)
+	if responsesOutputContainsAnyToolCall(translatedResponse) && !invalidPatchRecovery && !wrongApplyPatchInsteadOfShell {
+		return false
+	}
+	if chatResponseContainsToolCallNamed(chatResponse, "exec_command", "write_stdin", "shell", "shellcommand") {
+		return false
+	}
+	shellInspectionStillNeeded := requestWantsShellInspectionBeforeApplyPatch(req) &&
+		!completedToolNamesContain(workflowState.CompletedToolNames, "shell")
+	verificationShellPending := workflowState.VerificationExpected &&
+		completedToolNamesContain(workflowState.CompletedToolNames, "apply_patch") &&
+		!workflowState.VerificationCompleted
+	finishReason := strings.TrimSpace(strings.ToLower(gjson.GetBytes(chatResponse, "choices.0.finish_reason").String()))
+	forcedShell := toolChoiceTargetsNormalizedName(gjson.GetBytes(translatedChatRequest, "tool_choice").Value(), "shell") &&
+		(shellInspectionStillNeeded || verificationShellPending)
+	shellPromise := textLooksLikeShellInspectionPromise(contentText) || textLooksLikeShellInspectionPromise(reasoningText)
+	if !forcedShell && !shellPromise && !invalidPatchRecovery && !wrongApplyPatchInsteadOfShell && !shellInspectionStillNeeded && !verificationShellPending {
+		return false
+	}
+	return finishReason == "stop" || finishReason == "tool_calls"
+}
+
+func appendMissingBrowserOpenRecoveryInstruction(req map[string]any) {
+	if req == nil {
+		return
+	}
+	instruction := "Emit exactly one real shell tool call next to open the finished local artifact in the user's default browser." +
+		" Do not answer with prose claiming it was opened." +
+		" Reuse the concrete file path from the completed work."
+	prependSystemInstructionOnce(req, instruction)
+	keepOnlyShellTools(req)
+	req["parallel_tool_calls"] = false
+}
+
+func shouldRetryMissingBrowserOpenCall(req map[string]any, chatResponse []byte, translatedResponse []byte) bool {
+	if req == nil {
+		return false
+	}
+	if responsesOutputContainsAnyToolCall(translatedResponse) {
+		return false
+	}
+	if chatResponseContainsToolCallNamed(chatResponse,
+		"exec_command",
+		"write_stdin",
+		"shell",
+		"shellcommand",
+		"mcp__playwright__browser_navigate",
+		"mcp__playwright__browser_click",
+		"mcp__playwright__browser_tabs",
+		"mcp__playwright__browser_snapshot",
+	) {
+		return false
+	}
+	contentText := strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.message.content").String())
+	reasoningText := strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.message.reasoning_content").String())
+	visibleText := extractResponsesVisibleText(translatedResponse)
+	if !textLooksLikeBrowserOpenPromise(contentText) &&
+		!textLooksLikeBrowserOpenPromise(reasoningText) &&
+		!textLooksLikeBrowserOpenPromise(visibleText) {
+		return false
+	}
+	finishReason := strings.TrimSpace(strings.ToLower(gjson.GetBytes(chatResponse, "choices.0.finish_reason").String()))
+	return finishReason == "stop"
+}
+
+func shouldRetryWeakPlaceholderFinal(req map[string]any, translatedChatRequest []byte, chatResponse []byte, translatedResponse []byte, workflowState ToolWorkflowState) bool {
+	if req == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(translatedResponse, "status").String()), "requires_action") {
+		return false
+	}
+	visibleText := extractResponsesVisibleText(translatedResponse)
+	visibleLooksIncomplete := isWeakProgressPlaceholderText(visibleText) || textLooksLikeEmptyToolArtifact(visibleText) || textLooksLikeDeferredToolPromise(visibleText)
+	if !visibleLooksIncomplete {
+		return false
+	}
+	if !gjson.ValidBytes(chatResponse) {
+		return !responsesOutputContainsAnyToolCall(translatedResponse)
+	}
+	chatVisibleText := strings.TrimSpace(gjson.GetBytes(chatResponse, "choices.0.message.content").String())
+	chatLooksIncomplete := isWeakProgressPlaceholderText(chatVisibleText) || textLooksLikeEmptyToolArtifact(chatVisibleText) || textLooksLikeDeferredToolPromise(chatVisibleText)
+	if !chatLooksIncomplete {
+		return false
+	}
+	if chatResponseContainsToolCallNamed(chatResponse, "exec_command", "write_stdin", "shell", "shellcommand", "apply_patch", "web_search") {
+		return false
+	}
+	finishReason := strings.TrimSpace(strings.ToLower(gjson.GetBytes(chatResponse, "choices.0.finish_reason").String()))
+	return finishReason == "stop"
 }
 
 var exactFinalReplyRegexps = []*regexp.Regexp{
@@ -10802,10 +12036,18 @@ func requestWantsShellInspectionBeforeApplyPatch(req map[string]any) bool {
 	// Require an explicit "inspect/read first" style instruction so mixed
 	// shell+patch ordering is preserved only when the user actually asked for it.
 	wantsInspectFirst := strings.Contains(text, "inspect first") ||
+		strings.Contains(text, "first inspect") ||
 		strings.Contains(text, "first use shell") ||
 		strings.Contains(text, "read the file first") ||
+		strings.Contains(text, "first read the file") ||
 		strings.Contains(text, "inspect the current file") ||
-		strings.Contains(text, "verify with shell first")
+		strings.Contains(text, "inspect the file with shell") ||
+		strings.Contains(text, "inspect with shell") ||
+		strings.Contains(text, "read the file with shell") ||
+		strings.Contains(text, "read with shell") ||
+		strings.Contains(text, "verify with shell first") ||
+		(strings.Contains(text, "with shell") && strings.Contains(text, "then use apply_patch")) ||
+		(strings.Contains(text, "with shell") && strings.Contains(text, "then update it with apply_patch"))
 	return wantsShell && wantsInspectFirst
 }
 
@@ -10818,6 +12060,10 @@ func requestExplicitlyWantsShellVerification(req map[string]any) bool {
 		return false
 	}
 	return strings.Contains(text, "verify with shell") ||
+		strings.Contains(text, "verify the saved content with shell") ||
+		strings.Contains(text, "verify the saved file with shell") ||
+		strings.Contains(text, "verify the file with shell") ||
+		strings.Contains(text, "verify the saved file content with shell") ||
 		strings.Contains(text, "verify the final content with shell") ||
 		strings.Contains(text, "verify the final file content with shell") ||
 		strings.Contains(text, "verify the final file with shell") ||
@@ -10924,7 +12170,9 @@ func appendStrictApplyPatchToolOnlyInstruction(req map[string]any, reason string
 		"\nDo not return `{}` and do not omit `operation`." +
 		"\nRecovery reason: " + reason
 	prependSystemInstructionOnce(req, instruction)
+	keepOnlyNamedTools(req, "apply_patch")
 	maybeForceRetryToolChoice(req, `name="apply_patch"`)
+	req["parallel_tool_calls"] = false
 }
 
 func applyPatchOperationPayloadValid(operation any) bool {
@@ -11670,7 +12918,6 @@ func writeResponsesStreamFromChatSSEWithWorkflowAndContext(ctx context.Context, 
 	reasoningSeen := false
 	finishReasonStop := false
 	finishReasonLength := false
-	blockedPlanMutationText := ""
 	toolStates := map[int]*StreamToolCallState{}
 	toolOrder := make([]int, 0, 4)
 	nextOutputIndex := 0
@@ -11918,7 +13165,7 @@ func writeResponsesStreamFromChatSSEWithWorkflowAndContext(ctx context.Context, 
 		})
 	}
 	finalizeToolCallPhase = func() {
-		if candidate := finalizeNormalizedToolCallPhase(
+		finalizeNormalizedToolCallPhase(
 			toolOrder,
 			toolStates,
 			respID,
@@ -11929,9 +13176,7 @@ func writeResponsesStreamFromChatSSEWithWorkflowAndContext(ctx context.Context, 
 			originalReq,
 			writeCanonicalStreamEvent,
 			emitFinalDelta,
-		); strings.TrimSpace(candidate) != "" {
-			blockedPlanMutationText = candidate
-		}
+		)
 	}
 
 	scanner := bufio.NewScanner(upstream)
@@ -12104,38 +13349,32 @@ func writeResponsesStreamFromChatSSEWithWorkflowAndContext(ctx context.Context, 
 		emitFinalDelta(finalText)
 	}
 	if planOutputRequired {
+		nativeVisiblePlan := ""
 		if normalizedView.PreferredPlan != nil {
 			if planText, ok := normalizedView.PreferredPlan.Payload["text"].(string); ok && strings.TrimSpace(planText) != "" {
-				finalText = planText
-			}
-		}
-		finalText = sanitizeStructuredPlanText(finalText)
-		if strings.TrimSpace(finalText) == "" && strings.TrimSpace(blockedPlanMutationText) != "" {
-			finalText = blockedPlanMutationText
-		}
-		if shouldRewritePlanModeResponseText(finalText) {
-			if strings.TrimSpace(finalText) == "" && !finishReasonStop {
-				// Upstream did not finish normally; preserve empty/error-shaped output
-				// instead of replacing it with a synthetic plan fallback.
-				if finishReasonLength {
-					finalText = planModeLengthDiagnosticText()
+				nativeVisiblePlan = extractVisibleProposedPlanBlock(planText)
+				if nativeVisiblePlan == "" {
+					nativeVisiblePlan = sanitizeStructuredPlanText(planText)
 				}
-			} else {
-				finalText = derivePlanModeFallbackText(
-					finalText,
-					blockedPlanMutationText,
-					reasoningDoneText,
-					reasoningSummaryDoneText,
-					commentaryTextValue,
-					commentaryReasoningText,
-				)
 			}
+		}
+		if nativeVisiblePlan == "" {
+			nativeVisiblePlan = extractVisibleProposedPlanBlock(finalText)
+		}
+		if nativeVisiblePlan != "" {
+			finalText = sanitizeStructuredPlanText(nativeVisiblePlan)
+		} else if strings.TrimSpace(finalText) == "" && !finishReasonStop && finishReasonLength {
+			finalText = planModeLengthDiagnosticText()
 		}
 		if strings.TrimSpace(finalText) != "" {
-			finalText = ensureProposedPlanWrapper(finalText)
-			finalTextBuilder.Reset()
-			finalTextBuilder.WriteString(finalText)
-			emitFinalDelta(finalText)
+			if nativeVisiblePlan != "" || finalText == planModeLengthDiagnosticText() {
+				finalText = ensureProposedPlanWrapper(finalText)
+			}
+			if strings.TrimSpace(finalText) != "" {
+				finalTextBuilder.Reset()
+				finalTextBuilder.WriteString(finalText)
+				emitFinalDelta(finalText)
+			}
 		}
 	}
 	visibleToolCount := 0
@@ -12181,23 +13420,40 @@ func writeResponsesStreamFromChatSSEWithWorkflowAndContext(ctx context.Context, 
 		commentaryReasoningText = ""
 		visibleToolCount = 1
 	}
-	if !planOutputRequired && visibleToolCount == 0 && strings.TrimSpace(finalText) == "" && strings.TrimSpace(reasoningDoneText) == "" && finishReasonStop {
-		finalText = emptyAssistantOutputFallbackText
-	}
-	if normalizedView.PreferredError != nil && strings.EqualFold(fmt.Sprintf("%v", normalizedView.PreferredError.Payload["kind"]), string(MessageErrorUpstreamMalformedTurn)) && visibleToolCount == 0 && strings.TrimSpace(finalText) == "" {
-		finalText = emptyAssistantOutputFallbackText
-	}
-	if visibleToolCount == 0 && shouldRewriteWeakFinalWorkflowText(workflowState, finalText) {
-		finalText = buildWorkflowFinalExplanation(workflowState, finalText)
+	if !planOutputRequired && visibleToolCount == 0 && shouldRecoverCodexSkillProofShellCall(originalReq, verificationShellArgs, finalText, reasoningDoneText) {
+		recoveredState := &StreamToolCallState{
+			Index:       len(toolOrder),
+			OutputIndex: -1,
+			ItemID:      fmt.Sprintf("fc_%s_%d", respID, len(toolOrder)),
+			CallID:      fmt.Sprintf("call_%s_recover_skill_shell", respID),
+			Name:        "shell",
+		}
+		recoveredState.ArgsBuilder.WriteString(strings.TrimSpace(verificationShellArgs))
+		toolStates[recoveredState.Index] = recoveredState
+		toolOrder = append(toolOrder, recoveredState.Index)
+		startToolStateIfReady(recoveredState)
+		if event, ok := streamAdapter.BuildToolArgsDoneEvent(recoveredState, respID); ok {
+			writeCanonicalStreamEvent(event)
+		}
+		if event, ok := streamAdapter.BuildToolItemDoneEvent(recoveredState, respID); ok {
+			writeCanonicalStreamEvent(event)
+		}
+		finalTextBuilder.Reset()
+		commentaryText.Reset()
+		reasoningText.Reset()
+		reasoningSummaryText.Reset()
+		finalText = ""
+		commentaryTextValue = ""
+		reasoningDoneText = ""
+		reasoningSummaryDoneText = ""
+		commentaryReasoningText = ""
+		visibleToolCount = 1
 	}
 	if visibleToolCount == 0 && workflowState.FinalAnswerSafe && strings.TrimSpace(finalText) != "" {
 		emitWorkflowProgressCommentary("", true)
 		commentaryTextValue = strings.TrimSpace(commentaryText.String())
 	}
 	finalText = strings.TrimSpace(cleanFallbackInput(finalText, ""))
-	if !planOutputRequired && visibleToolCount == 0 && strings.TrimSpace(finalText) == "" && strings.TrimSpace(reasoningDoneText) == "" && finishReasonStop {
-		finalText = emptyAssistantOutputFallbackText
-	}
 	emitReasoningCommentary := visibleToolCount == 0
 	shouldEmitMessage := visibleToolCount == 0 || (strings.TrimSpace(finalText) != "" && finishReasonStop) || planOutputRequired
 	if shouldEmitMessage {
@@ -12496,7 +13752,16 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 			logTextTransform(pm.transformLogger, modelID, "bridge_sampling_controls", summarizeBridgeSamplingControls(translated))
 			logBodyTransform(pm.transformLogger, modelID, "bridge_translate_responses_to_chat_stream", responsesReq, translated)
 
-			const maxBridgeAttempts = 3
+			maxBridgeAttempts := 4
+			maxWebSearchContinuations := 3
+			if shouldResolveWebSearchLocally {
+				// Search-first workflows need enough budget for:
+				// 1. the initial search turn
+				// 2..N additional search continuations
+				// final post-search action turn
+				// one repair retry if that first post-search action is malformed
+				maxBridgeAttempts = maxWebSearchContinuations + 2
+			}
 			var lastCode int
 			var lastHeader http.Header
 			var lastBody []byte
@@ -12560,7 +13825,23 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 			if isApplyPatchIntent && !enforceProxyPlanMode {
 				var firstReq map[string]any
 				if err := json.Unmarshal(responsesReq, &firstReq); err == nil {
-					appendApplyPatchFirstAttemptConstraint(firstReq)
+					if !requestMapContainsAnyToolOutput(firstReq) {
+						firstWorkflowState := proxyCompatibilityAdapters.Continuation.BuildWorkflowState(firstReq)
+						firstUserText := extractResponsesUserInputText(firstReq)
+						if (requestIncludesWebSearchTool(firstReq) || rawResponsesBodyIncludesWebSearchTool(responsesReq)) &&
+							(requestExplicitlyWantsSearchIntent(firstReq, firstWorkflowState) ||
+								textIndicatesSearchIntent(firstUserText) ||
+								textLooksLikeDeferredSearchPromise(firstUserText) ||
+								rawResponsesBodyMentionsSearchIntent(responsesReq) ||
+								strings.Contains(strings.ToLower(firstUserText), "research the web") ||
+								strings.Contains(strings.ToLower(firstUserText), "web research") ||
+								strings.Contains(strings.ToLower(firstUserText), "search the web")) &&
+							!requestHistoryContainsResearchArtifacts(firstReq, firstWorkflowState) {
+							appendStrictWebSearchOnlyInstruction(firstReq)
+						} else {
+							appendApplyPatchFirstAttemptConstraint(firstReq)
+						}
+					}
 					if mutated, marshalErr := json.Marshal(firstReq); marshalErr == nil {
 						responsesReq = mutated
 					}
@@ -12573,7 +13854,13 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 			// deterministic by sending translated payload directly.
 			logTextTransform(pm.transformLogger, modelID, "bridge_prompt_size_control", "skipped for completions_bridge")
 
-			const maxBridgeAttempts = 3
+				maxBridgeAttempts := 3
+				maxWebSearchContinuations := 3
+				if shouldResolveWebSearchLocally {
+					// Mirror the streamed bridge budget so a search-first workflow can
+					// spend one extra turn repairing the first malformed post-search write.
+					maxBridgeAttempts = maxWebSearchContinuations + 2
+				}
 			var lastCode int
 			var lastHeader http.Header
 			var lastBody []byte
@@ -12657,7 +13944,9 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 							applyPatchTypeHint = ""
 						}
 						workflowState, verificationShellArgs := extractWorkflowRecoveryContextFromRequestBody(responsesReq)
-						out, err := translateChatCompletionToResponsesResponseWithWorkflow(translatedUpstreamBody, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint, workflowState, verificationShellArgs)
+						var originalReq map[string]any
+						_ = json.Unmarshal(responsesReq, &originalReq)
+						out, err := translateChatCompletionToResponsesResponseWithWorkflow(translatedUpstreamBody, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint, workflowState, verificationShellArgs, originalReq)
 						if err == nil {
 							if rewritten, changed, rewriteErr := rewriteResponsesToolCallPayload(out, applyPatchPathHint, applyPatchContentHint, applyPatchTypeHint); rewriteErr == nil && changed {
 								out = rewritten
@@ -12678,8 +13967,42 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 									out = enforceExactFinalReplyHint(out, exactReply, forceExactReply)
 								}
 							}
+							if shouldRetryInvalidApplyPatchOperation(originalReq, translatedUpstreamBody, out) && attempt < maxBridgeAttempts {
+								var retryReq map[string]any
+								if err := json.Unmarshal(responsesReq, &retryReq); err == nil {
+									appendStrictApplyPatchToolOnlyInstruction(retryReq, "invalid_operation")
+									if mutated, marshalErr := json.Marshal(retryReq); marshalErr == nil {
+										responsesReq = mutated
+										logTextTransform(pm.transformLogger, modelID, "bridge_apply_patch_retry", fmt.Sprintf("attempt=%d/%d class=invalid_operation", attempt, maxBridgeAttempts))
+										continue
+									}
+								}
+							}
+							if shouldRetryMissingShellCall(originalReq, translated, translatedUpstreamBody, out, workflowState) && attempt < maxBridgeAttempts {
+								var retryReq map[string]any
+								if err := json.Unmarshal(responsesReq, &retryReq); err == nil {
+									appendMissingShellRecoveryInstruction(retryReq)
+									appendEmptyPostToolRecoveryInstruction(retryReq)
+									if mutated, marshalErr := json.Marshal(retryReq); marshalErr == nil {
+										responsesReq = mutated
+										logTextTransform(pm.transformLogger, modelID, "bridge_shell_retry", fmt.Sprintf("attempt=%d/%d class=missing_shell_call", attempt, maxBridgeAttempts))
+										continue
+									}
+								}
+							}
+							if shouldRetryMissingBrowserOpenCall(originalReq, translatedUpstreamBody, out) && attempt < maxBridgeAttempts {
+								var retryReq map[string]any
+								if err := json.Unmarshal(responsesReq, &retryReq); err == nil {
+									appendMissingBrowserOpenRecoveryInstruction(retryReq)
+									if mutated, marshalErr := json.Marshal(retryReq); marshalErr == nil {
+										responsesReq = mutated
+										logTextTransform(pm.transformLogger, modelID, "bridge_browser_open_retry", fmt.Sprintf("attempt=%d/%d class=missing_browser_open_call", attempt, maxBridgeAttempts))
+										continue
+									}
+								}
+							}
 							if shouldResolveWebSearchLocally {
-								if shouldRetryMissingWebSearchCall(initialReq, translated, translatedUpstreamBody, out, workflowState) && webSearchContinuations < maxBridgeAttempts {
+								if shouldRetryMissingWebSearchCall(initialReq, translated, translatedUpstreamBody, out, workflowState) && webSearchContinuations < maxWebSearchContinuations {
 									webSearchContinuations++
 									var retryReq map[string]any
 									if err := json.Unmarshal(responsesReq, &retryReq); err == nil {
@@ -12687,29 +14010,68 @@ func (pm *ProxyManager) buildResponsesBridgeHandler(
 										appendEmptyPostToolRecoveryInstruction(retryReq)
 										if mutated, marshalErr := json.Marshal(retryReq); marshalErr == nil {
 											responsesReq = mutated
-											logTextTransform(pm.transformLogger, modelID, "bridge_web_search_retry", fmt.Sprintf("attempt=%d/%d class=missing_tool_call", webSearchContinuations, maxBridgeAttempts))
+											logTextTransform(pm.transformLogger, modelID, "bridge_web_search_retry", fmt.Sprintf("attempt=%d/%d class=missing_tool_call", webSearchContinuations, maxWebSearchContinuations))
 											continue
 										}
 									}
 								}
-								if searchCall, ok := extractPendingBridgeWebSearchCall(out); ok && webSearchContinuations < maxBridgeAttempts {
-									webSearchContinuations++
-									callID := strings.TrimSpace(fmt.Sprintf("%v", searchCall["call_id"]))
-									if callID == "" {
-										callID = fmt.Sprintf("call_web_search_%d", time.Now().UnixNano())
-										searchCall["call_id"] = callID
+								if pendingSearchCalls := extractPendingBridgeWebSearchCalls(out); len(pendingSearchCalls) > 0 {
+									resolvedCalls := make([]map[string]any, 0, len(pendingSearchCalls))
+									resolvedOutputs := make([]map[string]any, 0, len(pendingSearchCalls))
+									callIDs := make([]string, 0, len(pendingSearchCalls))
+									for idx, pendingCall := range pendingSearchCalls {
+										callID := strings.TrimSpace(fmt.Sprintf("%v", pendingCall["call_id"]))
+										if callID == "" {
+											callID = fmt.Sprintf("call_web_search_%d_%d", time.Now().UnixNano(), idx)
+											pendingCall["call_id"] = callID
+										}
+										pendingCall["status"] = "completed"
+										resolvedCalls = append(resolvedCalls, pendingCall)
+										resolvedOutputs = append(resolvedOutputs, map[string]any{
+											"id":      fmt.Sprintf("wsout_%s", callID),
+											"type":    "web_search_call_output",
+											"call_id": callID,
+											"output":  mustJSONString(pm.executeBridgeWebSearch(r.Context(), normalizeMapValue(pendingCall["action"]))),
+										})
+										callIDs = append(callIDs, callID)
 									}
-									searchCall["status"] = "completed"
-									searchOutput := map[string]any{
-										"id":      fmt.Sprintf("wsout_%s", callID),
-										"type":    "web_search_call_output",
-										"call_id": callID,
-										"output":  mustJSONString(pm.executeBridgeWebSearch(r.Context(), normalizeMapValue(searchCall["action"]))),
+									nextContinuation := webSearchContinuations + 1
+									if nextContinuation >= maxWebSearchContinuations {
+										if finalizedOut, finalizeErr := replacePendingWebSearchCallsWithResolvedItems(out, resolvedCalls, resolvedOutputs); finalizeErr == nil {
+											out = finalizedOut
+										}
+										webSearchContinuations = nextContinuation
+										logTextTransform(pm.transformLogger, modelID, "bridge_web_search_continue", fmt.Sprintf("attempt=%d/%d call_ids=%s class=finalized_without_retry", webSearchContinuations, maxWebSearchContinuations, strings.Join(callIDs, ",")))
+									} else {
+										itemsToAppend := make([]map[string]any, 0, len(resolvedCalls)+len(resolvedOutputs))
+										for idx := range resolvedCalls {
+											itemsToAppend = append(itemsToAppend, resolvedCalls[idx], resolvedOutputs[idx])
+										}
+										if mutatedReq, appendErr := appendResponsesInputItems(responsesReq, itemsToAppend...); appendErr == nil {
+											webSearchContinuations = nextContinuation
+											for idx := range resolvedCalls {
+												resolvedWebSearchItems = append(resolvedWebSearchItems, cloneMap(resolvedCalls[idx]), cloneMap(resolvedOutputs[idx]))
+											}
+											responsesReq = mutatedReq
+											logTextTransform(pm.transformLogger, modelID, "bridge_web_search_continue", fmt.Sprintf("attempt=%d/%d call_ids=%s", webSearchContinuations, maxWebSearchContinuations, strings.Join(callIDs, ",")))
+											continue
+										}
 									}
-									resolvedWebSearchItems = append(resolvedWebSearchItems, cloneMap(searchCall), searchOutput)
-									if mutatedReq, appendErr := appendResponsesInputItems(responsesReq, searchCall, searchOutput); appendErr == nil {
-										responsesReq = mutatedReq
-										logTextTransform(pm.transformLogger, modelID, "bridge_web_search_continue", fmt.Sprintf("attempt=%d/%d call_id=%s", webSearchContinuations, maxBridgeAttempts, callID))
+								}
+							}
+							if shouldRetryWeakPlaceholderFinal(originalReq, translated, translatedUpstreamBody, out, workflowState) && attempt < maxBridgeAttempts {
+								var retryReq map[string]any
+								if err := json.Unmarshal(responsesReq, &retryReq); err == nil {
+									appendWeakFinalRecoveryInstruction(retryReq)
+									if requestStillNeedsWebSearchBeforeApplyPatch(originalReq, workflowState) {
+										appendStrictWebSearchOnlyInstruction(retryReq)
+										appendEmptyPostToolRecoveryInstruction(retryReq)
+									} else if requestInputMentionsApplyPatch(originalReq) && !workflowState.ApplyPatchSatisfied {
+										appendStrictApplyPatchToolOnlyInstruction(retryReq, "weak_placeholder_final_promised_apply_patch")
+									}
+									if mutated, marshalErr := json.Marshal(retryReq); marshalErr == nil {
+										responsesReq = mutated
+										logTextTransform(pm.transformLogger, modelID, "bridge_placeholder_retry", fmt.Sprintf("attempt=%d/%d class=weak_placeholder_final", attempt, maxBridgeAttempts))
 										continue
 									}
 								}
@@ -14076,6 +15438,12 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 
 		// Log raw request body for debugging (especially tools)
 		pm.proxyLogger.Debugf("<%s> Raw request body (before transforms): %s", modelID, string(bodyBytes))
+		if isResponsesEndpoint(requestPath) {
+			if missingSkills, extraSkills, ok := detectCodexSkillSnapshotDrift(bodyBytes); ok && (len(missingSkills) > 0 || len(extraSkills) > 0) {
+				logTextTransform(pm.transformLogger, modelID, "codex_skill_snapshot_drift",
+					fmt.Sprintf("missing_on_request=%q extra_on_request=%q", strings.Join(missingSkills, ","), strings.Join(extraSkills, ",")))
+			}
+		}
 
 		transformMode := pm.getTransformMode(modelID)
 		bypassTransforms := transformMode == TransformModeRaw

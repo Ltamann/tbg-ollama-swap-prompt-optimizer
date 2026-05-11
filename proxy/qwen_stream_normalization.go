@@ -269,10 +269,15 @@ func buildAccumulatedAssistantMessage(state *AccumulatedChoiceState) map[string]
 		return map[string]any{}
 	}
 	message := map[string]any{}
-	if content := strings.TrimSpace(state.Content.String()); content != "" {
+	content := strings.TrimSpace(state.Content.String())
+	reasoning := strings.TrimSpace(state.Reasoning.String())
+	content, reasoning = normalizeAssistantReasoningFields(content, reasoning)
+	content = strings.TrimSpace(stripLeadingReasoningDirective(content))
+	reasoning = strings.TrimSpace(stripLeadingReasoningDirective(reasoning))
+	if content != "" {
 		message["content"] = content
 	}
-	if reasoning := strings.TrimSpace(state.Reasoning.String()); reasoning != "" {
+	if reasoning != "" {
 		message["reasoning_content"] = reasoning
 	}
 	if len(state.ToolOrder) > 0 {
@@ -663,8 +668,7 @@ func finalizeNormalizedToolCallPhase(
 	originalReq map[string]any,
 	emitCanonicalStreamEvent func(StreamEvent),
 	emitFinalDelta func(string),
-) string {
-	blockedPlanMutationText := ""
+) {
 	for _, toolIdx := range toolOrder {
 		state := toolStates[toolIdx]
 		if state == nil {
@@ -694,18 +698,9 @@ func finalizeNormalizedToolCallPhase(
 		}
 		if planOutputRequired && strings.EqualFold(streamAdapter.CanonicalToolName(state.Name), "shell") &&
 			shellToolArgumentsLookLikePlainQuestion(parseToolArgsMapString(arguments)) {
-			if strings.TrimSpace(blockedPlanMutationText) == "" {
-				blockedPlanMutationText = derivePlanModeFallbackText(reasoningText, finalText)
-			}
 			continue
 		}
 		if planOutputRequired && strings.EqualFold(streamAdapter.CanonicalToolName(state.Name), "apply_patch") {
-			args := parseToolArgsMapString(normalizePossiblyMixedToolArguments(state.ArgsBuilder.String()))
-			if op, ok := normalizeApplyPatchOperation(selectApplyPatchOperation(args)).(map[string]any); ok {
-				if candidate := extractApplyPatchPlanText(op); strings.TrimSpace(candidate) != "" {
-					blockedPlanMutationText = candidate
-				}
-			}
 			continue
 		}
 		if event, ok := streamAdapter.BuildToolArgsDoneEvent(state, respID); ok {
@@ -715,7 +710,6 @@ func finalizeNormalizedToolCallPhase(
 			emitCanonicalStreamEvent(event)
 		}
 	}
-	return blockedPlanMutationText
 }
 
 func summarizeQwenNormalizedStreamFrame(frame QwenNormalizedStreamFrame, decision QwenStreamFrameDecision) QwenStreamFrameTraceSummary {

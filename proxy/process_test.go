@@ -260,6 +260,9 @@ func TestRewriteResponsesToolCallPayload(t *testing.T) {
 	operation, _ := second["operation"].(map[string]any)
 	assert.Equal(t, "update_file", operation["type"])
 	assert.Equal(t, "README.md", operation["path"])
+	args := fmt.Sprintf("%v", second["arguments"])
+	assert.Contains(t, args, `"operation"`)
+	assert.Contains(t, args, `"input"`)
 
 	third, _ := output[2].(map[string]any)
 	assert.Equal(t, "web_search_call", third["type"])
@@ -384,6 +387,7 @@ func TestRewriteResponsesToolCallPayload_ApplyPatchAcceptsPatchString(t *testing
 	assert.Equal(t, "update_file", operation["type"])
 	assert.Equal(t, "README.md", operation["path"])
 	assert.Equal(t, "@@\n-old\n+new", operation["diff"])
+	assert.Contains(t, fmt.Sprintf("%v", item["arguments"]), `"input"`)
 }
 
 func TestRewriteResponsesToolCallPayload_ApplyPatchAcceptsInputString(t *testing.T) {
@@ -419,6 +423,7 @@ func TestRewriteResponsesToolCallPayload_ApplyPatchAcceptsInputString(t *testing
 	assert.Equal(t, "update_file", operation["type"])
 	assert.Equal(t, "README.md", operation["path"])
 	assert.Equal(t, "@@\n-old\n+new", operation["diff"])
+	assert.Contains(t, fmt.Sprintf("%v", item["arguments"]), `"input"`)
 	assert.Equal(t, "in_progress", payload["status"])
 }
 
@@ -451,6 +456,7 @@ func TestRewriteResponsesToolCallPayload_ApplyPatchCallKeepsInProgressStatus(t *
 	assert.Equal(t, "apply_patch", item["name"])
 	assert.Equal(t, "call_1", item["call_id"])
 	assert.Equal(t, "in_progress", item["status"])
+	assert.Contains(t, fmt.Sprintf("%v", item["arguments"]), `"input"`)
 	assert.Equal(t, "in_progress", payload["status"])
 }
 

@@ -114,10 +114,9 @@ func TestDefaultToolRepairAdapter_ValidatesStructuredToolContracts(t *testing.T)
 		require.True(t, result.Valid)
 		require.NotNil(t, result.NormalizedItem)
 		assert.Equal(t, "shell", result.NormalizedItem["name"])
-		args := parseToolArgsMapString(fmt.Sprintf("%v", result.NormalizedItem["arguments"]))
-		assert.Equal(t, []any{"powershell.exe", "-Command", "Get-Content mutations/base_a.txt"}, args["command"])
-		_, hasCommands := args["commands"]
-		assert.False(t, hasCommands)
+		arguments := fmt.Sprintf("%v", result.NormalizedItem["arguments"])
+		assert.Contains(t, arguments, "powershell.exe")
+		assert.Contains(t, arguments, "Get-Content mutations/base_a.txt")
 	})
 
 	t.Run("request_user_input canonicalizes question list", func(t *testing.T) {
@@ -176,6 +175,27 @@ func TestDefaultToolRepairAdapter_ValidatesStructuredToolContracts(t *testing.T)
 		require.True(t, result.Valid)
 		require.NotNil(t, result.NormalizedItem)
 		assert.NotEmpty(t, strings.TrimSpace(fmt.Sprintf("%v", result.NormalizedItem["input"])))
+	})
+
+	t.Run("apply_patch function_call prefers structured operation over raw patch input", func(t *testing.T) {
+		result := proxyCompatibilityAdapters.ToolRepair.ValidateToolCallItem(map[string]any{
+			"type": "function_call",
+			"name": "apply_patch",
+			"arguments": `{"input":"*** Begin Patch\n*** Update File: index.html\n@@\n <!doctype html>\n <html><body><main>stress-suite</main></body></html>\n+<!doctype html>\n+<html><body><main>quiz home</main></body></html>\n*** End Patch","operation":{"type":"update_file","path":"index.html","content":"<!doctype html>\n<html><body><main>quiz home</main></body></html>\n"}}`,
+		})
+		require.True(t, result.Valid)
+		require.NotNil(t, result.NormalizedItem)
+		args := parseToolArgsMapString(fmt.Sprintf("%v", result.NormalizedItem["arguments"]))
+		op, _ := args["operation"].(map[string]any)
+		require.NotNil(t, op)
+		assert.Equal(t, "update_file", op["type"])
+		assert.Equal(t, "index.html", op["path"])
+		assert.Equal(t, "<!doctype html>\n<html><body><main>quiz home</main></body></html>", op["content"])
+		input := fmt.Sprintf("%v", args["input"])
+		assert.Contains(t, input, "*** Begin Patch")
+		assert.Contains(t, input, "*** Update File: index.html")
+		assert.Contains(t, input, "-<!doctype html>")
+		assert.Contains(t, input, "+<html><body><main>quiz home</main></body></html>")
 	})
 }
 
@@ -579,6 +599,22 @@ func TestDefaultContinuationController_BuildDecision_PlanOutputRequestedKeepsToo
 	assert.Nil(t, decision.ForceToolChoice)
 }
 
+func TestDefaultContinuationController_BuildDecision_ProxyPlanEnforcementKeepsSafeToolsAvailable(t *testing.T) {
+	req := map[string]any{
+		"tool_choice": "auto",
+	}
+
+	decision := defaultContinuationController{}.BuildDecision(req, ContinuationContext{
+		PlanModeRequested:    true,
+		ProxyPlanEnforcement: true,
+		ActiveToolChoice:     "auto",
+	})
+
+	assert.Equal(t, ContinuationStatePreTool, decision.State)
+	assert.False(t, decision.DisableTools)
+	assert.Nil(t, decision.ForceToolChoice)
+}
+
 func TestClassifyContinuationTurnPhase(t *testing.T) {
 	t.Run("plan gather", func(t *testing.T) {
 		phase := classifyContinuationTurnPhase(ContinuationContext{
@@ -878,6 +914,7 @@ func TestDefaultStreamReconstructionAdapter_ResponseToolViews(t *testing.T) {
 		assert.Equal(t, "function_call", normalized["type"])
 		assert.Equal(t, "apply_patch", normalized["name"])
 		assert.Contains(t, fmt.Sprintf("%v", normalized["arguments"]), `"operation"`)
+		assert.Contains(t, fmt.Sprintf("%v", normalized["arguments"]), `"input"`)
 
 		view, ok := proxyCompatibilityAdapters.Stream.BuildResponseToolItemView(normalized)
 		require.True(t, ok)
@@ -885,6 +922,7 @@ func TestDefaultStreamReconstructionAdapter_ResponseToolViews(t *testing.T) {
 		assert.Equal(t, "apply_patch", view.ToolName)
 		assert.True(t, view.EmitsArgumentEvents)
 		assert.Contains(t, view.Arguments, `"operation"`)
+		assert.Contains(t, view.Arguments, `"input"`)
 	})
 
 	t.Run("content-driven apply patch normalization does not synthesize operation diff", func(t *testing.T) {
@@ -898,6 +936,21 @@ func TestDefaultStreamReconstructionAdapter_ResponseToolViews(t *testing.T) {
 		args := fmt.Sprintf("%v", normalized["arguments"])
 		assert.Contains(t, args, `"content":"BASE_A\nORDERED_T11"`)
 		assert.NotContains(t, args, `"diff"`)
+	})
+
+	t.Run("preserves sibling input when apply patch arguments only contained operation", func(t *testing.T) {
+		item := map[string]any{
+			"type":      "function_call",
+			"name":      "apply_patch",
+			"call_id":   "call_3",
+			"arguments": `{"operation":{"type":"update_file","path":"README.md","content":"PATCH_OK"}}`,
+			"input":     "*** Begin Patch\n*** Update File: README.md\n@@\n+PATCH_OK\n*** End Patch\n",
+		}
+		normalized := proxyCompatibilityAdapters.Stream.NormalizeResponseOutputItem(item)
+		args := fmt.Sprintf("%v", normalized["arguments"])
+		assert.Contains(t, args, `"operation"`)
+		assert.Contains(t, args, `"input"`)
+		assert.Contains(t, args, `*** Begin Patch`)
 	})
 
 	t.Run("builds shell tool view with emitted argument events", func(t *testing.T) {

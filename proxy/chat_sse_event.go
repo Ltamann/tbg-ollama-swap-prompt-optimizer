@@ -265,6 +265,9 @@ func parseAssistantResponse(resp gjson.Result) *AssistantResponse {
 	}
 
 	// Only return if we found something
+	ar.Content, ar.ReasoningContent = normalizeAssistantReasoningFields(ar.Content, ar.ReasoningContent)
+	ar.Content = strings.TrimSpace(stripLeadingReasoningDirective(ar.Content))
+	ar.ReasoningContent = strings.TrimSpace(stripLeadingReasoningDirective(ar.ReasoningContent))
 	if ar.Content == "" && ar.ReasoningContent == "" {
 		return nil
 	}
@@ -337,6 +340,9 @@ func parseAssistantResponseFromBody(respBody []byte) *AssistantResponse {
 
 	content := strings.TrimSpace(strings.Join(contentParts, ""))
 	reasoning := strings.TrimSpace(strings.Join(reasoningParts, ""))
+	content, reasoning = normalizeAssistantReasoningFields(content, reasoning)
+	content = strings.TrimSpace(stripLeadingReasoningDirective(content))
+	reasoning = strings.TrimSpace(stripLeadingReasoningDirective(reasoning))
 	if content == "" && reasoning == "" {
 		return nil
 	}
@@ -581,6 +587,10 @@ func parseTimelineFromSSEResponse(respBody []byte) []ChatTimelineEntry {
 			if choices := data.Get("choices"); choices.Exists() && len(choices.Array()) > 0 {
 				delta := choices.Get("0.delta")
 				if rc := delta.Get("reasoning_content").String(); rc != "" {
+					rc = strings.TrimSpace(stripLeadingReasoningDirective(rc))
+					if rc == "" {
+						continue
+					}
 					timeline = append(timeline, ChatTimelineEntry{
 						Kind:    "reasoning",
 						Title:   "Reasoning",
