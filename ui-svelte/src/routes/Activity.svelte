@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { metrics, getCapture } from "../stores/api";
+  import { metrics, getCapture, liveMonitorEvents } from "../stores/api";
   import Tooltip from "../components/Tooltip.svelte";
   import CaptureDialog from "../components/CaptureDialog.svelte";
-  import type { Metrics, ReqRespCapture } from "../lib/types";
+  import type { Metrics, ReqRespCapture, LiveMonitorEvent } from "../lib/types";
+  import { summarizeCaptureResponse, type CaptureSummary } from "../lib/captureSummary";
 
   type PromptFlowItem = {
     metric: Metrics;
@@ -12,6 +13,8 @@
     promptPreview: string;
     requestPath: string;
     userAgent: string;
+    stageNames: string[];
+    responseSummary: CaptureSummary | null;
   };
 
   function formatSpeed(speed: number): string {
@@ -138,6 +141,7 @@
   let sortedMetrics = $derived([...$metrics].sort((a, b) => b.id - a.id));
   let promptFlow = $state<PromptFlowItem[]>([]);
   let loadingPromptFlow = $state(false);
+  let groupedMonitor = $state<Record<string, LiveMonitorEvent[]>>({});
 
   let selectedCapture = $state<ReqRespCapture | null>(null);
   let dialogOpen = $state(false);
@@ -167,6 +171,8 @@
           promptPreview: buildPromptPreview(rawRequestBody),
           requestPath: capture?.req_path || "",
           userAgent: capture?.req_headers?.["User-Agent"] || capture?.req_headers?.["user-agent"] || "",
+          stageNames: capture?.stages?.map((stage) => stage.name) || [],
+          responseSummary: capture ? summarizeCaptureResponse(decodeBody(capture.resp_body)) : null,
         };
       });
     } finally {
@@ -187,6 +193,21 @@
     if ($metrics.length > 0) {
       void refreshPromptFlow();
     }
+  });
+
+  $effect(() => {
+    const grouped: Record<string, LiveMonitorEvent[]> = {};
+    for (const item of $liveMonitorEvents) {
+      const trace = item.trace_id || "";
+      if (!trace) continue;
+      if (!grouped[trace]) grouped[trace] = [];
+      grouped[trace].push(item);
+    }
+    for (const trace of Object.keys(grouped)) {
+      const items = grouped[trace];
+      grouped[trace] = items.length > 12 ? items.slice(-12) : items;
+    }
+    groupedMonitor = grouped;
   });
 </script>
 
@@ -227,8 +248,8 @@
               <td class="px-6 py-4">{metric.model}</td>
               <td class="px-6 py-4">{metric.status_code || 200}</td>
               <td class="px-6 py-4">{metric.cache_tokens > 0 ? metric.cache_tokens.toLocaleString() : "-"}</td>
-              <td class="px-6 py-4">{metric.input_tokens.toLocaleString()}</td>
-              <td class="px-6 py-4">{metric.output_tokens.toLocaleString()}</td>
+              <td class="px-6 py-4">{metric.input_tokens > 0 ? metric.input_tokens.toLocaleString() : "-"}</td>
+              <td class="px-6 py-4">{metric.output_tokens > 0 ? metric.output_tokens.toLocaleString() : "-"}</td>
               <td class="px-6 py-4">{formatSpeed(metric.prompt_per_second)}</td>
               <td class="px-6 py-4">{formatSpeed(metric.tokens_per_second)}</td>
               <td class="px-6 py-4">{formatDuration(metric.duration_ms)}</td>
@@ -282,7 +303,84 @@
               {#if item.userAgent}
                 | ua: <span class="font-mono">{item.userAgent}</span>
               {/if}
+              {#if item.metric.trace_id}
+                | trace: <span class="font-mono">{item.metric.trace_id}</span>
+              {/if}
             </div>
+            {#if item.stageNames.length > 0}
+              <div class="mb-2">
+                <div class="text-xs font-semibold mb-1">Internal proxy calls</div>
+                <div class="flex flex-wrap gap-1">
+                  {#each item.stageNames as stageName}
+                    <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-300">
+                      {stageName}
+                    </span>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+            {#if item.responseSummary}
+              <div class="mb-2">
+                <div class="text-xs font-semibold mb-1">Stream summary</div>
+                <div class="flex flex-wrap gap-1">
+                  <span class="text-[11px] px-2 py-0.5 rounded bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300">
+                    Worked for {formatDuration(item.metric.duration_ms)}
+                  </span>
+                  {#if item.responseSummary.webSearchCount > 0}
+                    <span class="text-[11px] px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300">
+                      Searched web {item.responseSummary.webSearchCount} {item.responseSummary.webSearchCount === 1 ? "time" : "times"}
+                    </span>
+                  {/if}
+                  {#if item.responseSummary.totalToolCalls > 0}
+                    <span class="text-[11px] px-2 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">
+                      Called {item.responseSummary.totalToolCalls} {item.responseSummary.totalToolCalls === 1 ? "tool" : "tools"}
+                    </span>
+                  {/if}
+                  {#if item.responseSummary.fileChanges.length > 0}
+                    <span class="text-[11px] px-2 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-300">
+                      {item.responseSummary.fileChanges.filter((change) => change.action === "created").length > 0
+                        ? `Created ${item.responseSummary.fileChanges.filter((change) => change.action === "created").length} files`
+                        : `Edited ${item.responseSummary.fileChanges.length} files`}
+                    </span>
+                  {/if}
+                </div>
+                {#if item.responseSummary.webQueries.length > 0}
+                  <div class="mt-2 space-y-1">
+                    {#each item.responseSummary.webQueries as query}
+                      <div class="text-[11px] font-mono text-txtsecondary">Searched web for {query}</div>
+                    {/each}
+                  </div>
+                {/if}
+                {#if item.responseSummary.toolNames.length > 0}
+                  <div class="mt-2 flex flex-wrap gap-1">
+                    {#each item.responseSummary.toolNames as toolName}
+                      <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-card border border-gray-200 dark:border-white/10">
+                        {toolName}
+                      </span>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+            {#if item.metric.trace_id && groupedMonitor[item.metric.trace_id]?.length}
+              <div class="mb-2">
+                <div class="text-xs font-semibold mb-1">Latest monitor events</div>
+                <div class="bg-card border border-gray-200 dark:border-white/10 rounded p-2 space-y-1">
+                  {#each groupedMonitor[item.metric.trace_id] as monitorEvent}
+                    <div class="text-[11px] font-mono text-txtsecondary">
+                      <span class="text-sky-600 dark:text-sky-300">{monitorEvent.stage}</span>
+                      <span> {monitorEvent.direction}</span>
+                      {#if monitorEvent.event}
+                        <span> · {monitorEvent.event}</span>
+                      {/if}
+                      {#if monitorEvent.data}
+                        <div class="whitespace-pre-wrap break-all opacity-80">{monitorEvent.data}</div>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            {/if}
             {#if item.lastUserPrompt}
               <div class="mb-2">
                 <div class="text-xs font-semibold mb-1">Last user prompt</div>

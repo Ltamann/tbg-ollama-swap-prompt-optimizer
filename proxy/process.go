@@ -435,7 +435,7 @@ func rewriteResponsesOutputItem(rawItem any, applyPatchPathHint string, applyPat
 		rewritten["arguments"] = mustJSONString(payload)
 		delete(rewritten, "input")
 		return rewritten, true
-	case llamaSwapWebSearchFunctionName:
+	case llamaSwapWebSearchFunctionName, "web_search":
 		action := map[string]any{}
 		if args := parseJSONMapString(item["arguments"]); args != nil {
 			if query, ok := args["query"]; ok {
@@ -457,7 +457,7 @@ func rewriteResponsesOutputItem(rawItem any, applyPatchPathHint string, applyPat
 		delete(rewritten, "name")
 		rewritten["action"] = action
 		return rewritten, true
-	case llamaSwapFileSearchFunctionName:
+	case llamaSwapFileSearchFunctionName, "file_search":
 		action := map[string]any{}
 		if args := parseJSONMapString(item["arguments"]); args != nil {
 			for _, key := range []string{"query", "vector_store_ids", "max_num_results", "filters"} {
@@ -674,12 +674,26 @@ func (p *Process) start() error {
 	p.startMutex.Lock()
 	defer p.startMutex.Unlock()
 
-	if p.CurrentState() == StateReady {
+	currentState := p.CurrentState()
+	if currentState == StateReady {
 		return nil
 	}
 
 	if p.config.Proxy == "" {
 		return fmt.Errorf("can not start(), upstream proxy missing")
+	}
+
+	// If a healthy upstream is already serving this proxy endpoint, adopt it
+	// instead of spawning a duplicate process that may fail with "address already in use".
+	if currentState == StateStopped {
+		checkEndpoint := strings.TrimSpace(p.config.CheckEndpoint)
+		if checkEndpoint != "" && checkEndpoint != "none" {
+			if healthURL, err := url.JoinPath(strings.TrimSpace(p.config.Proxy), checkEndpoint); err == nil {
+				if p.adoptHealthyUpstream(healthURL, "start-preflight-healthy-upstream") {
+					return nil
+				}
+			}
+		}
 	}
 
 	args, err := p.config.SanitizedCommand()

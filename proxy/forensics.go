@@ -246,7 +246,11 @@ func summarizeForensicRequestShape(payload []byte, protocol string) *ForensicReq
 			if name == "" {
 				toolType := strings.TrimSpace(tool.Get("type").String())
 				switch toolType {
-				case "web_search", "web_search_preview", "file_search", "computer", "code_interpreter", "image_generation":
+				case "web_search":
+					name = toolType
+				case "web_search_preview":
+					name = "web_search"
+				case "file_search", "computer", "code_interpreter", "image_generation":
 					name = toolType
 				}
 			}

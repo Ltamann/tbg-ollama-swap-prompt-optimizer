@@ -333,6 +333,30 @@ func TestProcess_AdoptHealthyUpstream_FailsWhenUnhealthy(t *testing.T) {
 	assert.Equal(t, 2, process.failedStartCount)
 }
 
+func TestProcess_StartAdoptsHealthyUpstreamBeforeSpawning(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("alive"))
+	}))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{
+		Cmd:           "nonexistent-command",
+		Proxy:         srv.URL,
+		CheckEndpoint: "/health",
+	}
+	process := NewProcess("adopt-preflight", 1, cfg, debugLogger, debugLogger, debugLogger)
+
+	err := process.start()
+	require.NoError(t, err)
+	assert.Equal(t, StateReady, process.CurrentState())
+}
+
 func TestCalculateUnexpectedRestartDelay(t *testing.T) {
 	t.Run("base delay for first retry", func(t *testing.T) {
 		delay := calculateUnexpectedRestartDelay(1, 0)

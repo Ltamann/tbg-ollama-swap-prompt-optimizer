@@ -189,6 +189,64 @@ func TestProxyManager_WebSearchSettingsAPI(t *testing.T) {
 	assert.Equal(t, "http://127.0.0.1:18080/search", gjson.Get(getW.Body.String(), "url").String())
 }
 
+func TestRequestMapContainsNamedToolOutput(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{"type": "function_call", "call_id": "call_wait_1", "name": "wait_agent"},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_1", "output": "done"},
+		},
+	}
+	assert.True(t, requestMapContainsNamedToolOutput(req, "wait_agent"))
+	assert.False(t, requestMapContainsNamedToolOutput(req, "spawn_agent"))
+}
+
+func TestBridgeResponsesMaxAttempts_AgentContinuationIsShorter(t *testing.T) {
+	body := []byte(`{
+		"input": [
+			{"type":"function_call","call_id":"call_wait_1","name":"wait_agent"},
+			{"type":"function_call_output","call_id":"call_wait_1","output":"done"}
+		]
+	}`)
+	assert.Equal(t, 2, bridgeResponsesMaxAttempts(body, false))
+	assert.Equal(t, 2, bridgeResponsesMaxAttempts(body, true))
+}
+
+func TestBridgeResponsesAttemptTimeout_AgentContinuationIsShorter(t *testing.T) {
+	body := []byte(`{
+		"input": [
+			{"type":"function_call","call_id":"call_wait_1","name":"wait_agent"},
+			{"type":"function_call_output","call_id":"call_wait_1","output":"done"}
+		]
+	}`)
+	assert.Equal(t, 45*time.Second, bridgeResponsesAttemptTimeout(body, false))
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_ExactlyOneSubagentAfterWaitForcesApplyPatchToolChoice(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"tools":[
+			{"type":"function","function":{"name":"spawn_agent"}},
+			{"type":"function","function":{"name":"wait_agent"}},
+			{"type":"function","function":{"name":"apply_patch"}}
+		],
+		"input":[
+			{"type":"message","role":"user","content":[
+				{"type":"input_text","text":"Use exactly one subagent via spawn_agent with model gpt-5.4, wait for that agent, then use apply_patch to create src/agent-report.md."}
+			]},
+			{"type":"function_call","name":"spawn_agent","call_id":"call_spawn_1","arguments":"{\"model\":\"gpt-5.4\"}"},
+			{"type":"function_call_output","call_id":"call_spawn_1","output":"spawned"},
+			{"type":"function_call","name":"wait_agent","call_id":"call_wait_1","arguments":"{\"target\":\"agent_1\"}"},
+			{"type":"function_call_output","call_id":"call_wait_1","output":"completed"}
+		]
+	}`)
+	out, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+	assert.Equal(t, "function", gjson.GetBytes(out, "tool_choice.type").String())
+	assert.Equal(t, "apply_patch", gjson.GetBytes(out, "tool_choice.function.name").String())
+	assert.Equal(t, "apply_patch", gjson.GetBytes(out, "tools.0.function.name").String())
+	assert.Len(t, gjson.GetBytes(out, "tools").Array(), 1)
+}
+
 // When a request for a different model comes in ProxyManager should wait until
 // the first request is complete before swapping. Both requests should complete
 func TestProxyManager_SwapMultiProcessParallelRequests(t *testing.T) {
@@ -1306,7 +1364,7 @@ func TestNormalizeResponsesRequest_AdaptsBuiltInTools(t *testing.T) {
 
 	normalized, adapted, unsupported, err := normalizeResponsesRequest(body)
 	assert.NoError(t, err)
-	assert.ElementsMatch(t, []string{"shell", "apply_patch", "web_search_preview", "web_search", "file_search", "code_interpreter", "image_generation", "computer"}, adapted)
+	assert.ElementsMatch(t, []string{"shell", "apply_patch", "web_search", "file_search", "code_interpreter", "image_generation", "computer"}, adapted)
 	assert.Empty(t, unsupported)
 
 	var payload map[string]any
@@ -1339,9 +1397,9 @@ func TestNormalizeResponsesRequest_AdaptsBuiltInTools(t *testing.T) {
 		}
 	}
 	assert.Equal(t, "function", third["type"])
-	assert.Equal(t, llamaSwapWebSearchFunctionName, third["name"])
+	assert.Equal(t, "web_search", third["name"])
 	assert.Equal(t, "function", fourth["type"])
-	assert.Equal(t, llamaSwapWebSearchFunctionName, fourth["name"])
+	assert.Equal(t, "web_search", fourth["name"])
 	assert.Equal(t, "function", fifth["type"])
 	assert.Equal(t, llamaSwapFileSearchFunctionName, fifth["name"])
 	assert.Equal(t, "function", sixth["type"])
@@ -1352,6 +1410,14 @@ func TestNormalizeResponsesRequest_AdaptsBuiltInTools(t *testing.T) {
 	assert.Equal(t, llamaSwapComputerFunctionName, eighth["name"])
 	assert.Equal(t, "function", ninth["type"])
 	assert.Equal(t, "echo", ninth["name"])
+}
+
+func TestBuildQwenResponsesToolPolicy_CanonicalizesLegacyWebSearchPreview(t *testing.T) {
+	policy := buildQwenResponsesToolPolicy([]string{"web_search_preview"})
+
+	assert.Contains(t, policy, "web_search")
+	assert.NotContains(t, policy, "web_search_preview")
+	assert.NotContains(t, policy, llamaSwapWebSearchFunctionName)
 }
 
 func TestNormalizeResponsesRequest_AdaptsComputerUsePreviewTool(t *testing.T) {
@@ -1385,13 +1451,14 @@ func TestNormalizeResponsesRequest_AdaptsComputerUsePreviewTool(t *testing.T) {
 	assert.Equal(t, "echo", second["name"])
 }
 
-func TestBuildQwenResponsesToolPolicy_UsesExactWrapperNamesForBuiltInTools(t *testing.T) {
+func TestBuildQwenResponsesToolPolicy_UsesRealWebSearchName(t *testing.T) {
 	policy := buildQwenResponsesToolPolicy([]string{"web_search", "file_search", "computer"})
 
-	assert.Contains(t, policy, llamaSwapWebSearchFunctionName)
-	assert.Contains(t, policy, llamaSwapFileSearchFunctionName)
+	assert.Contains(t, policy, "web_search")
+	assert.Contains(t, policy, "file_search")
 	assert.Contains(t, policy, llamaSwapComputerFunctionName)
-	assert.NotContains(t, policy, "- Use web_search for current or external information.")
+	assert.NotContains(t, policy, llamaSwapWebSearchFunctionName)
+	assert.NotContains(t, policy, llamaSwapFileSearchFunctionName)
 	assert.NotContains(t, policy, "- Use computer actions for UI automation requests.")
 }
 
@@ -1493,7 +1560,7 @@ func TestNormalizeResponsesRequest_RewritesToolOutputs(t *testing.T) {
 	assert.Equal(t, "function_call_output", fourth["type"])
 	assert.Equal(t, "call_2", fourth["call_id"])
 	assert.Equal(t, "function_call", fifth["type"])
-	assert.Equal(t, llamaSwapWebSearchFunctionName, fifth["name"])
+	assert.Equal(t, "web_search", fifth["name"])
 	assert.Equal(t, "function_call_output", sixth["type"])
 	assert.Equal(t, "call_3", sixth["call_id"])
 	assert.Equal(t, "function_call", seventh["type"])
@@ -2928,6 +2995,543 @@ func TestDeriveContinuationAllowedToolNames_AfterWebSearchDoesNotCollapseToApply
 	assert.Nil(t, deriveContinuationAllowedToolNames(req))
 }
 
+func TestDeriveContinuationAllowedToolNames_AfterSkillCreateReturnsShellForProof(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "exec_command"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "write_stdin"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "apply_patch"}},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Create a new Codex skill at ./skills/reward-skill/SKILL.md, then read the skill you created, follow it, and create src/skill-usage.md. Use apply_patch for file writes."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "apply_patch",
+				"call_id":   "call_patch_1",
+				"arguments": `{"operation":{"type":"create_file","path":"./skills/reward-skill/SKILL.md","content":"---\nname: reward-skill\n---\n"}}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_patch_1",
+				"output":  "Patch applied.",
+			},
+		},
+	}
+
+	assert.Equal(t, []string{"shell"}, deriveContinuationAllowedToolNames(req))
+}
+
+func TestDeriveContinuationAllowedToolNames_AfterWaitAgentInMixedFlowReturnsWriteTools(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "exec_command"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "write_stdin"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "apply_patch"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "spawn_agent"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "wait_agent"}},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent via spawn_agent, wait for that agent, integrate its result, then use apply_patch to create src/agent-report.md."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "spawn_agent",
+				"call_id":   "call_agent_1",
+				"arguments": `{"model":"gpt-5.4","message":"inspect"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_agent_1",
+				"output":  "spawned",
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "wait_agent",
+				"call_id":   "call_wait_1",
+				"arguments": `{"target":"agent_123"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_wait_1",
+				"output":  "agent completed",
+			},
+		},
+	}
+
+	assert.Equal(t, []string{"apply_patch", "shell"}, deriveContinuationAllowedToolNames(req))
+}
+
+func TestRequestMentionsExactlyOneSubagent(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent via spawn_agent, wait for it, then write the report."},
+				},
+			},
+		},
+	}
+
+	assert.True(t, requestMentionsExactlyOneSubagent(req))
+	assert.False(t, requestMentionsMultipleAgentSteps(req))
+}
+
+func TestRequestMentionsExactlyOneSubagent_UsesExplicitUserInputNotEnvironmentPreamble(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written.\n</permissions instructions>"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent via spawn_agent, wait for it, then write the report."},
+				},
+			},
+		},
+	}
+
+	assert.True(t, requestMentionsExactlyOneSubagent(req))
+	assert.True(t, requestMentionsAgentOrchestration(req))
+}
+
+func TestRequestInputMentionsApplyPatch_PreservesOriginalPromptAcrossSubagentNotifications(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<environment_context>\n  <cwd>/home/admmin/llama-swap</cwd>\n</environment_context>"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent, wait for it, then use apply_patch to create src/agent-report.md."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<subagent_notification>{\"completed\":\"feature summary\"}</subagent_notification>"},
+				},
+			},
+		},
+	}
+
+	assert.True(t, requestInputMentionsApplyPatch(req))
+	assert.True(t, requestMentionsExactlyOneSubagent(req))
+}
+
+func TestNormalizeApplyPatchOperation_StripsTrailingInjectedParameterShellArtifact(t *testing.T) {
+	normalized := normalizeApplyPatchOperation(map[string]any{
+		"type":    "create_file",
+		"path":    "./tmp/demo/agent-report.md",
+		"content": "hello world\n</parameter> > /dev/null 2>&1 2>&1; echo $?",
+	})
+
+	op, ok := normalized.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "hello world", op["content"])
+}
+
+func TestDeriveContinuationAllowedToolNames_ExactlyOneSubagentAfterWaitAgentPrefersWriteTools(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "exec_command"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "write_stdin"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "apply_patch"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "spawn_agent"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "send_input"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "wait_agent"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "close_agent"}},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent via spawn_agent, wait for that agent, then use apply_patch to create src/agent-report.md and verify it."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "spawn_agent",
+				"call_id":   "call_agent_1",
+				"arguments": `{"model":"gpt-5.4","message":"inspect"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_agent_1",
+				"output":  "spawned",
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "wait_agent",
+				"call_id":   "call_wait_1",
+				"arguments": `{"target":"agent_123"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_wait_1",
+				"output":  "agent completed",
+			},
+		},
+	}
+
+	assert.Equal(t, []string{"apply_patch", "shell"}, deriveContinuationAllowedToolNames(req))
+}
+
+func TestDeriveContinuationAllowedToolNames_ExactlyOneSubagentAfterWaitAgentForcesApplyPatchWrite(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "exec_command"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "write_stdin"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "apply_patch"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "spawn_agent"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "wait_agent"}},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent via spawn_agent, wait for that agent, integrate its result, then use apply_patch to create src/agent-report.md with a short delegated summary."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "spawn_agent", "call_id": "call_agent_1", "arguments": `{"model":"gpt-5.4","message":"inspect"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_agent_1", "output": `{"agent_id":"agent_123"}`},
+			map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "call_wait_1", "arguments": `{"targets":["agent_123"]}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_1", "output": `{"status":{"agent_123":{"completed":"feature summary"}}}`},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<subagent_notification>{\"agent_path\":\"agent_123\",\"status\":{\"completed\":\"feature summary\"}}</subagent_notification>"},
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, []string{"apply_patch"}, deriveContinuationAllowedToolNames(req))
+}
+
+func TestRequestShouldForceApplyPatchAfterSingleSubagentWait(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent, wait for it, then use apply_patch to create src/agent-report.md with a short delegated summary."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "call_wait_1", "arguments": `{"targets":["agent_123"]}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_1", "output": `{"status":{"agent_123":{"completed":"feature summary"}}}`},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<subagent_notification>{\"agent_path\":\"agent_123\",\"status\":{\"completed\":\"feature summary\"}}</subagent_notification>"},
+				},
+			},
+		},
+	}
+
+	assert.True(t, requestShouldForceApplyPatchAfterSingleSubagentWait(req))
+}
+
+func TestRequestShouldForceApplyPatchAfterSingleSubagentWait_FalseWhenResumeOrSendInputStillRequested(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent, wait for it, then use resume_agent on the same agent and send_input once asking for one more feature. After that use apply_patch to create src/agent-resume-report.md."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "call_wait_1", "arguments": `{"targets":["agent_123"]}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_1", "output": `{"status":{"agent_123":{"completed":"feature summary"}}}`},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<subagent_notification>{\"agent_path\":\"agent_123\",\"status\":{\"completed\":\"feature summary\"}}</subagent_notification>"},
+				},
+			},
+		},
+	}
+
+	assert.False(t, requestShouldForceApplyPatchAfterSingleSubagentWait(req))
+}
+
+func TestShouldEnableStrictApplyPatchIntent_FalseWhenViewImageOrFileSearchPrecedesPatch(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use view_image on fixtures/solid-red.png and then use apply_patch to create src/image-report.md."},
+				},
+			},
+		},
+	}
+	assert.False(t, shouldEnableStrictApplyPatchIntent(req, nil))
+
+	req2 := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use file_search to find the marker, then use apply_patch to create src/file-search-report.md."},
+				},
+			},
+		},
+	}
+	assert.False(t, shouldEnableStrictApplyPatchIntent(req2, nil))
+}
+
+func TestDeriveContinuationAllowedToolNames_PrefersAgentToolsForResumeFollowupAfterWait(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "spawn_agent"},
+			map[string]any{"type": "function", "name": "send_input"},
+			map[string]any{"type": "function", "name": "resume_agent"},
+			map[string]any{"type": "function", "name": "wait_agent"},
+			map[string]any{"type": "function", "name": "close_agent"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent, wait for that agent, then use resume_agent on the same agent and send_input once asking for one more feature. After that use apply_patch to create src/agent-resume-report.md."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "call_wait_1", "arguments": `{"targets":["agent_123"]}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_1", "output": `{"status":{"agent_123":{"completed":"feature summary"}}}`},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<subagent_notification>{\"agent_path\":\"agent_123\",\"status\":{\"completed\":\"feature summary\"}}</subagent_notification>"},
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, []string{"spawn_agent", "send_input", "resume_agent", "wait_agent", "close_agent"}, deriveContinuationAllowedToolNames(req))
+}
+
+func TestDeriveContinuationAllowedToolNames_SwitchesToApplyPatchAfterCloseAgent(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "spawn_agent"},
+			map[string]any{"type": "function", "name": "send_input"},
+			map[string]any{"type": "function", "name": "resume_agent"},
+			map[string]any{"type": "function", "name": "wait_agent"},
+			map[string]any{"type": "function", "name": "close_agent"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+			map[string]any{"type": "function", "name": "exec_command"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent, wait for that agent, then use resume_agent on the same agent and send_input once asking for one more feature. Wait for the resumed agent, integrate both suggestions, and use apply_patch to create src/agent-resume-report.md."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "call_wait_1", "arguments": `{"targets":["agent_123"]}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_1", "output": `{"status":{"agent_123":{"completed":"feature summary"}}}`},
+			map[string]any{"type": "function_call", "name": "resume_agent", "call_id": "call_resume_1", "arguments": `{"id":"agent_123"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_resume_1", "output": `{"status":"ok"}`},
+			map[string]any{"type": "function_call", "name": "send_input", "call_id": "call_send_1", "arguments": `{"target":"agent_123","message":"one more feature"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_send_1", "output": `{"status":"ok"}`},
+			map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "call_wait_2", "arguments": `{"targets":["agent_123"]}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_2", "output": `{"status":{"agent_123":{"completed":"second feature"}}}`},
+			map[string]any{"type": "function_call", "name": "close_agent", "call_id": "call_close_1", "arguments": `{"target":"agent_123"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_close_1", "output": `{"status":"closed"}`},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<subagent_notification>{\"agent_path\":\"agent_123\",\"status\":{\"completed\":\"second feature\"}}</subagent_notification>"},
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, []string{"apply_patch", "shell"}, deriveContinuationAllowedToolNames(req))
+}
+
+func TestDeriveContinuationAllowedToolNames_ExactlyOneSubagentAfterResumeForcesSendInput(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "spawn_agent"},
+			map[string]any{"type": "function", "name": "send_input"},
+			map[string]any{"type": "function", "name": "resume_agent"},
+			map[string]any{"type": "function", "name": "wait_agent"},
+			map[string]any{"type": "function", "name": "close_agent"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent, wait for that agent, then use resume_agent on the same agent and send_input once asking for one more feature. Wait for the resumed agent, integrate both suggestions, and use apply_patch to create src/agent-resume-report.md."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "call_wait_1", "arguments": `{"targets":["agent_123"]}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_1", "output": `{"status":{"agent_123":{"completed":"feature one"}}}`},
+			map[string]any{"type": "function_call", "name": "resume_agent", "call_id": "call_resume_1", "arguments": `{"id":"agent_123"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_resume_1", "output": `{"status":{"completed":"feature one"}}`},
+		},
+	}
+
+	assert.Equal(t, []string{"send_input"}, deriveContinuationAllowedToolNames(req))
+}
+
+func TestRequestShouldForceSendInputAfterResume(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent, then resume the same agent and send_input once asking for one more feature."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "resume_agent", "call_id": "call_resume_1", "arguments": `{"id":"agent_123"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_resume_1", "output": `{"status":{"completed":"feature one"}}`},
+		},
+	}
+
+	assert.True(t, requestShouldForceSendInputAfterResume(req))
+}
+
+func TestDeriveContinuationAllowedToolNames_ExplicitFileSearchSwitchesToApplyPatchAfterSearch(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "function", "name": "file_search"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+			map[string]any{"type": "function", "name": "shell"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use file_search to find the reward marker, then use apply_patch to create src/file-search-report.md. Do not use shell for the search step."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "file_search", "call_id": "call_file_1", "arguments": `{"query":"reward marker"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_file_1", "output": `{"type":"file_search_call_output","payload":{"matches":[{"path":"docs/teacher-notes.md"}]}}`},
+		},
+	}
+
+	assert.Equal(t, []string{"apply_patch"}, deriveContinuationAllowedToolNames(req))
+}
+
+func TestRemoveRedundantSubagentNotificationMessages(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent, wait for it, then use apply_patch to create src/agent-report.md with a short delegated summary."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "call_wait_1", "arguments": `{"targets":["agent_123"]}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_1", "output": `{"status":{"agent_123":{"completed":"feature summary"}}}`},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "<subagent_notification>{\"agent_path\":\"agent_123\",\"status\":{\"completed\":\"feature summary\"}}</subagent_notification>"},
+				},
+			},
+		},
+	}
+
+	removeRedundantSubagentNotificationMessages(req)
+
+	items, ok := req["input"].([]any)
+	require.True(t, ok)
+	assert.Len(t, items, 3)
+}
+
+func TestRequestShouldFinalizeExactlyOneSubagentSummary_AfterApplyPatch(t *testing.T) {
+	req := map[string]any{
+		"model": "gpt-5.4",
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "write_stdin"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+			map[string]any{"type": "function", "name": "spawn_agent"},
+			map[string]any{"type": "function", "name": "send_input"},
+			map[string]any{"type": "function", "name": "resume_agent"},
+			map[string]any{"type": "function", "name": "wait_agent"},
+			map[string]any{"type": "function", "name": "close_agent"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent, wait for it, then use apply_patch to create src/agent-report.md with a short delegated summary."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "spawn_agent", "call_id": "call_agent_1", "arguments": `{"model":"gpt-5.4","message":"inspect"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_agent_1", "output": "spawned"},
+			map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "call_wait_1", "arguments": `{"target":"agent_123"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_1", "output": "agent completed"},
+			map[string]any{"type": "function_call", "name": "apply_patch", "call_id": "call_patch_1", "arguments": `{"operation":{"type":"create_file","path":"src/agent-report.md","content":"summary"}}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_patch_1", "output": "Patch applied."},
+		},
+	}
+
+	assert.True(t, requestShouldFinalizeExactlyOneSubagentSummary(req, buildToolWorkflowState(req)))
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(translated, &payload))
+	assert.Equal(t, "none", payload["tool_choice"])
+	assert.Nil(t, payload["tools"])
+}
+
 func TestTranslateResponsesToChatCompletionsRequest_ShellFirstThenPatchStartsWithShellTools(t *testing.T) {
 	req := map[string]any{
 		"model":       "gpt-5.4",
@@ -3545,6 +4149,85 @@ func TestShouldRetryWeakPlaceholderFinal_WhenCreatePromiseWasFinalized(t *testin
 	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
 }
 
+func TestShouldRetryWeakPlaceholderFinal_WhenDetailedPlanPromiseWasFinalized(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Ask me how to build it first and then write a detailed plan."},
+				},
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"Got it — a colorful web-based quiz in pure HTML/CSS/JS covering multiple subjects, with score tracking and a results summary. Let me put together a detailed plan.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"Got it — a colorful web-based quiz in pure HTML/CSS/JS covering multiple subjects, with score tracking and a results summary. Let me put together a detailed plan."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"Got it — a colorful web-based quiz in pure HTML/CSS/JS covering multiple subjects, with score tracking and a results summary. Let me put together a detailed plan."
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, ToolWorkflowState{}))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenDirectoryCreatePromiseWasFinalized(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Build the quiz app and create the files."},
+				},
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_patch_1",
+				"output":  `{"output":"Success. Updated the following files:\nD index.html\n"}`,
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"Good, old file is gone. Now let me create the first-grade quiz directory and build the full app.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"Good, old file is gone. Now let me create the first-grade quiz directory and build the full app."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"Good, old file is gone. Now let me create the first-grade quiz directory and build the full app."
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
 func TestShouldRetryWeakPlaceholderFinal_WhenApplyPatchPromiseWasFinalized(t *testing.T) {
 	req := map[string]any{
 		"input": []any{
@@ -3585,6 +4268,93 @@ func TestShouldRetryWeakPlaceholderFinal_WhenApplyPatchPromiseWasFinalized(t *te
 		"}")
 
 	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenSynthesisTurnReturnsLetMeAlsoCheck(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "system",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "You now have enough gathered web research context to answer. Do not call any more tools on this turn. Synthesize the final user-facing answer directly from the gathered web_search results."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Investigate the web for first-grade quiz game ideas and then write a detailed implementation plan. Do not build the app yet."},
+				},
+			},
+			map[string]any{
+				"type":    "web_search_call_output",
+				"call_id": "call_web_1",
+				"output":  `{"ok":true}`,
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"Let me also check the existing project structure to understand what we're working with.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"Let me also check the existing project structure to understand what we're working with."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"Let me also check the existing project structure to understand what we're working with.\n\n<tool_call>\nshell>\n<command>ls -la /home/admmin/llama-swap/</command>\n</function>"
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenPostAgentCompletionIsSingleLetter(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use exactly one subagent, then use apply_patch to create src/agent-resume-report.md."},
+				},
+			},
+			map[string]any{"type": "function_call", "name": "spawn_agent", "call_id": "call_spawn_1", "arguments": `{"message":"inspect"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_spawn_1", "output": `{"agent_id":"agent_123"}`},
+			map[string]any{"type": "function_call", "name": "wait_agent", "call_id": "call_wait_1", "arguments": `{"targets":["agent_123"]}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_wait_1", "output": `{"status":{"agent_123":{"completed":"feature summary"}}}`},
+			map[string]any{"type": "function_call", "name": "resume_agent", "call_id": "call_resume_1", "arguments": `{"id":"agent_123"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_resume_1", "output": `{"status":"completed"}`},
+		},
+	}
+	workflowState := buildToolWorkflowState(req)
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"I",
+		"output":[
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I"}]}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{"content":"I"}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, workflowState))
 }
 
 func TestNormalizeResponsesInputItem_ApplyPatchCallIncludesExecutableInput(t *testing.T) {
@@ -3952,6 +4722,349 @@ func TestExtractPendingBridgeWebSearchCalls_ReturnsAllUnresolvedCalls(t *testing
 	assert.Equal(t, "call_3", strings.TrimSpace(fmt.Sprintf("%v", pending[1]["call_id"])))
 }
 
+func TestExtractPendingBridgeFileSearchCalls_ReturnsAllUnresolvedCalls(t *testing.T) {
+	body := []byte(`{
+		"status":"requires_action",
+		"output":[
+			{"type":"file_search_call","call_id":"call_1","name":"file_search","status":"completed","action":{"query":"alpha"}},
+			{"type":"file_search_call_output","call_id":"call_1","output":"{\"matches\":[{\"path\":\"docs/a.md\"}]}"},
+			{"type":"file_search_call","call_id":"call_2","name":"file_search","status":"in_progress","action":{"query":"beta"}},
+			{"type":"file_search_call","call_id":"call_3","name":"file_search","status":"in_progress","action":{"query":"gamma"}}
+		]
+	}`)
+
+	pending := extractPendingBridgeFileSearchCalls(body)
+	require.Len(t, pending, 2)
+	assert.Equal(t, "call_2", strings.TrimSpace(fmt.Sprintf("%v", pending[0]["call_id"])))
+	assert.Equal(t, "call_3", strings.TrimSpace(fmt.Sprintf("%v", pending[1]["call_id"])))
+}
+
+func TestExecuteBridgeFileSearch_FindsWorkspaceMarker(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "docs"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "docs", "teacher-notes.md"), []byte("# Teacher Notes\nReward marker: GOLDEN_APPLE_REWARD\nMascot marker: HAPPY_FOX_MASCOT\n"), 0o644))
+
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(root))
+	defer func() { _ = os.Chdir(cwd) }()
+
+	result := executeBridgeFileSearch(map[string]any{
+		"query":           "reward marker ./docs",
+		"max_num_results": 3,
+	})
+
+	assert.Equal(t, true, result["ok"])
+	var first map[string]any
+	if typed, ok := result["matches"].([]map[string]any); ok {
+		require.NotEmpty(t, typed)
+		first = typed[0]
+	} else {
+		rawMatches, _ := result["matches"].([]any)
+		require.NotEmpty(t, rawMatches)
+		casted, ok := rawMatches[0].(map[string]any)
+		require.True(t, ok)
+		first = casted
+	}
+	assert.Contains(t, fmt.Sprintf("%v", first["path"]), "teacher-notes.md")
+	assert.Contains(t, fmt.Sprintf("%v", first["excerpt"]), "GOLDEN_APPLE_REWARD")
+}
+
+func TestExecuteBridgeFileSearch_UsesRootOverrideWhenQueryOmitsPath(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "docs"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "docs", "teacher-notes.md"), []byte("# Teacher Notes\nReward marker: GOLDEN_APPLE_REWARD\nMascot marker: HAPPY_FOX_MASCOT\n"), 0o644))
+
+	result := executeBridgeFileSearch(map[string]any{
+		"query":           "reward marker",
+		"root":            filepath.Join(root, "docs"),
+		"max_num_results": 3,
+	})
+
+	assert.Equal(t, true, result["ok"])
+	assert.Contains(t, fmt.Sprintf("%v", result["root"]), filepath.ToSlash(filepath.Join(root, "docs")))
+	var first map[string]any
+	if typed, ok := result["matches"].([]map[string]any); ok {
+		require.NotEmpty(t, typed)
+		first = typed[0]
+	} else {
+		rawMatches, _ := result["matches"].([]any)
+		require.NotEmpty(t, rawMatches)
+		casted, ok := rawMatches[0].(map[string]any)
+		require.True(t, ok)
+		first = casted
+	}
+	assert.Contains(t, fmt.Sprintf("%v", first["path"]), "teacher-notes.md")
+	assert.Contains(t, fmt.Sprintf("%v", first["excerpt"]), "GOLDEN_APPLE_REWARD")
+}
+
+func TestExecuteBridgeFileSearch_IgnoresNilRootFallback(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "docs"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "docs", "teacher-notes.md"), []byte("Reward marker: GOLDEN_APPLE_REWARD\n"), 0o644))
+
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(root))
+	defer func() { _ = os.Chdir(cwd) }()
+
+	result := executeBridgeFileSearch(map[string]any{
+		"query": "reward marker ./docs",
+	})
+
+	assert.Equal(t, true, result["ok"])
+	assert.NotContains(t, fmt.Sprintf("%v", result["root"]), "<nil>")
+}
+
+func TestExecuteBridgeFileSearch_IgnoresRootPathTermsInQuery(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "tmp", "wsl_codex_stress_suite", "workspaces", "file_search_then_patch")
+	require.NoError(t, os.MkdirAll(filepath.Join(workspace, "docs"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "docs", "teacher-notes.md"), []byte("# Teacher Notes\nReward marker: GOLDEN_APPLE_REWARD\nMascot marker: HAPPY_FOX_MASCOT\n"), 0o644))
+
+	result := executeBridgeFileSearch(map[string]any{
+		"query": "reward marker file_search_then_patch",
+		"root":  workspace,
+	})
+
+	assert.Equal(t, true, result["ok"])
+	var first map[string]any
+	if typed, ok := result["matches"].([]map[string]any); ok {
+		require.NotEmpty(t, typed)
+		first = typed[0]
+	} else {
+		rawMatches, _ := result["matches"].([]any)
+		require.NotEmpty(t, rawMatches)
+		casted, ok := rawMatches[0].(map[string]any)
+		require.True(t, ok)
+		first = casted
+	}
+	assert.Contains(t, fmt.Sprintf("%v", first["path"]), "teacher-notes.md")
+}
+
+func TestExecuteBridgeFileSearch_IgnoresRootPathFragmentTermsInQuery(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "tmp", "wsl_codex_stress_suite", "workspaces", "file_search_then_patch")
+	require.NoError(t, os.MkdirAll(filepath.Join(workspace, "docs"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(workspace, "docs", "teacher-notes.md"), []byte("# Teacher Notes\nReward marker: GOLDEN_APPLE_REWARD\nMascot marker: HAPPY_FOX_MASCOT\n"), 0o644))
+
+	result := executeBridgeFileSearch(map[string]any{
+		"query": "reward marker workspaces/file_search_then_patch",
+		"root":  workspace,
+	})
+
+	assert.Equal(t, true, result["ok"])
+	var first map[string]any
+	if typed, ok := result["matches"].([]map[string]any); ok {
+		require.NotEmpty(t, typed)
+		first = typed[0]
+	} else {
+		rawMatches, _ := result["matches"].([]any)
+		require.NotEmpty(t, rawMatches)
+		casted, ok := rawMatches[0].(map[string]any)
+		require.True(t, ok)
+		first = casted
+	}
+	assert.Contains(t, fmt.Sprintf("%v", first["path"]), "teacher-notes.md")
+}
+
+func TestExtractFileSearchRootHintFromRequest_FindsWorkspacePath(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "tmp", "wsl_codex_stress_suite", "workspaces", "file_search_then_patch")
+	require.NoError(t, os.MkdirAll(workspace, 0o755))
+
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(root))
+	defer func() { _ = os.Chdir(cwd) }()
+
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Use file_search to find the reward marker inside ./tmp/wsl_codex_stress_suite/workspaces/file_search_then_patch. Then use apply_patch to create ./tmp/wsl_codex_stress_suite/workspaces/file_search_then_patch/src/file-search-report.md.",
+					},
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, "./tmp/wsl_codex_stress_suite/workspaces/file_search_then_patch", filepath.ToSlash(extractFileSearchRootHintFromRequest(req)))
+}
+
+func TestExtractChatToolCallsNamed_FileSearch(t *testing.T) {
+	body := []byte(`{
+	  "choices":[{
+	    "message":{
+	      "tool_calls":[
+	        {"id":"call_file_1","type":"function","function":{"name":"file_search","arguments":"{\"query\":\"reward marker ./docs\"}"}}
+	      ]
+	    }
+	  }]
+	}`)
+
+	calls := extractChatToolCallsNamed(body, "file_search")
+	require.Len(t, calls, 1)
+	assert.Equal(t, "call_file_1", calls[0]["call_id"])
+	action := normalizeMapValue(calls[0]["action"])
+	assert.Equal(t, "reward marker ./docs", fmt.Sprintf("%v", action["query"]))
+}
+
+func TestShouldDeferApplyPatchValidationForCurrentTurn_MixedSearchThenPatch(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "web_search"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Research the web for first grade quiz reward ideas, then use apply_patch to create src/research-brief.md.",
+					},
+				},
+			},
+		},
+	}
+
+	chatResponse := []byte(`{
+	  "choices":[{"message":{"tool_calls":[
+	    {"id":"call_web_1","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"first grade quiz rewards\"}"}}
+	  ]}}]
+	}`)
+	responsesOutput := []byte(`{
+	  "output":[
+	    {"type":"web_search_call","id":"call_web_1","name":"web_search","arguments":"{\"query\":\"first grade quiz rewards\"}"}
+	  ]
+	}`)
+
+	assert.True(t, shouldDeferApplyPatchValidationForCurrentTurn(req, ToolWorkflowState{}, chatResponse, responsesOutput))
+}
+
+func TestShouldDeferApplyPatchValidationForCurrentTurn_ApplyPatchTurnDoesNotDefer(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "web_search"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Research the web for first grade quiz reward ideas, then use apply_patch to create src/research-brief.md.",
+					},
+				},
+			},
+			map[string]any{"type": "web_search_call", "call_id": "call_web_1", "name": "web_search", "query": "first grade quiz reward ideas"},
+			map[string]any{"type": "web_search_call_output", "call_id": "call_web_1", "output": "stars and badges"},
+		},
+	}
+	workflowState := buildToolWorkflowState(req)
+	chatResponse := []byte(`{
+	  "choices":[{"message":{"tool_calls":[
+	    {"id":"call_patch_1","type":"function","function":{"name":"apply_patch","arguments":"{\"operation\":{\"type\":\"create_file\",\"path\":\"src/research-brief.md\",\"content\":\"- stars\\n- badges\\n\"}}"}}
+	  ]}}]
+	}`)
+	responsesOutput := []byte(`{
+	  "output":[
+	    {"type":"function_call","name":"apply_patch","call_id":"call_patch_1","arguments":"{\"operation\":{\"type\":\"create_file\",\"path\":\"src/research-brief.md\",\"content\":\"- stars\\n- badges\\n\"}}"}
+	  ]
+	}`)
+
+	assert.False(t, shouldDeferApplyPatchValidationForCurrentTurn(req, workflowState, chatResponse, responsesOutput))
+}
+
+func TestRequestedWebSearchContinuationsBeforeMutation_TwoSearchesThenWrite(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "web_search"},
+			map[string]any{"type": "apply_patch"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Use web_search at least twice with different queries, then create ./tmp/out.md with apply_patch and verify the saved file.",
+					},
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, 2, requestedWebSearchContinuationsBeforeMutation(req))
+}
+
+func TestRequestedWebSearchContinuationsBeforeMutation_ResearchPlanOnlyReturnsZero(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "web_search"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Investigate the web at least twice and then write a detailed plan. Do not build the app yet.",
+					},
+				},
+			},
+		},
+	}
+
+	assert.Equal(t, 0, requestedWebSearchContinuationsBeforeMutation(req))
+}
+
+func TestClearWebSearchPhaseInstructions(t *testing.T) {
+	req := map[string]any{
+		"llamaswap_force_web_search_synthesis": true,
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "system",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "If current or external information is still needed, emit exactly one real web_search tool call next."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "system",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "You now have enough gathered web research context to answer."},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Research, then create the file with apply_patch."},
+				},
+			},
+		},
+	}
+
+	clearWebSearchPhaseInstructions(req)
+
+	assert.NotContains(t, mustJSONString(req), "emit exactly one real web_search tool call next")
+	assert.NotContains(t, mustJSONString(req), "enough gathered web research context")
+	_, hasFlag := req["llamaswap_force_web_search_synthesis"]
+	assert.False(t, hasFlag)
+}
+
 func TestTextIndicatesSearchIntent_TrueForInvestigateTheWeb(t *testing.T) {
 	assert.True(t, textIndicatesSearchIntent("investigate the web for 10 best chemistry knowledge questions"))
 }
@@ -4086,6 +5199,51 @@ func TestTranslateResponsesToChatCompletionsRequest_DoesNotReAddApplyPatchBefore
 	require.NoError(t, err)
 
 	assert.True(t, chatRequestIncludesToolName(translated, "web_search"))
+	assert.False(t, chatRequestIncludesToolName(translated, "apply_patch"))
+}
+
+func TestTranslateResponsesToChatCompletionsRequest_KeepsResearchThenPlanContinuationOnWebSearch(t *testing.T) {
+	req := map[string]any{
+		"model": "gpt-5.4",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type": "input_text",
+						"text": "Investigate the web for first grade quiz game ideas and then write a detailed implementation plan. Do not build the app yet.",
+					},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "web_search",
+				"call_id":   "call_search_1",
+				"arguments": `{"query":"first grade quiz game ideas for kids educational"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_search_1",
+				"output":  `{"results":[{"title":"Quiz ideas","url":"https://example.com/quiz"}]}`,
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "name": "exec_command"},
+			map[string]any{"type": "function", "name": "write_stdin"},
+			map[string]any{"type": "function", "name": "apply_patch"},
+			map[string]any{"type": "web_search", "external_web_access": true},
+		},
+	}
+
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+
+	translated, err := translateResponsesToChatCompletionsRequest(body)
+	require.NoError(t, err)
+
+	assert.True(t, chatRequestIncludesToolName(translated, "web_search"))
+	assert.False(t, chatRequestIncludesToolName(translated, "exec_command"))
 	assert.False(t, chatRequestIncludesToolName(translated, "apply_patch"))
 }
 
@@ -4820,6 +5978,66 @@ func TestTranslateResponsesToChatCompletionsRequest_PlanResearchBeforeWritingPla
 	assert.Contains(t, names, "web_search")
 	assert.Contains(t, names, "request_user_input")
 	assert.Contains(t, names, "shell")
+}
+
+func TestShouldRecoverInvalidApplyPatchViaShell(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "apply_patch"},
+			map[string]any{"type": "shell"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Use apply_patch to recreate first-grade-quiz/index.html with the full app."},
+				},
+			},
+		},
+	}
+
+	assert.True(t, shouldRecoverInvalidApplyPatchViaShell(req, ToolWorkflowState{}, "empty_operation"))
+	assert.True(t, shouldRecoverInvalidApplyPatchViaShell(req, ToolWorkflowState{}, "wrong_tool_call"))
+	assert.False(t, shouldRecoverInvalidApplyPatchViaShell(req, ToolWorkflowState{ApplyPatchSatisfied: true}, "empty_operation"))
+	assert.False(t, shouldRecoverInvalidApplyPatchViaShell(map[string]any{
+		"tools": []any{map[string]any{"type": "apply_patch"}},
+		"input": req["input"],
+	}, ToolWorkflowState{}, "empty_operation"))
+}
+
+func TestShouldEnableStrictApplyPatchIntent_FalseForPolicyInstruction(t *testing.T) {
+	req := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "apply_patch"},
+			map[string]any{"type": "shell"},
+		},
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "If an apply_patch fails due to file drift, re-read the current file, reconcile the patch against the latest contents, reapply safely, and verify the final file state before continuing."},
+				},
+			},
+		},
+	}
+
+	assert.False(t, shouldEnableStrictApplyPatchIntent(req, nil))
+}
+
+func TestRequestMapContainsApplyPatchToolOutput_NativeApplyPatchCallOutput(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":    "apply_patch_call_output",
+				"call_id": "call_patch_1",
+				"output":  `{"ok":true}`,
+			},
+		},
+	}
+
+	assert.True(t, requestMapContainsApplyPatchToolOutput(req))
 }
 
 func TestNormalizeResponsesRequest_DoesNotInjectQwenToolPolicyForNonQwenModels(t *testing.T) {

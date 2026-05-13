@@ -28,6 +28,7 @@ export interface Model {
 
 export interface Metrics {
   id: number;
+  trace_id?: string;
   timestamp: string;
   model: string;
   status_code: number;

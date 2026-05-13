@@ -379,6 +379,14 @@ func (mp *metricsMonitor) getMetrics() []TokenMetrics {
 
 	result := make([]TokenMetrics, len(mp.metrics))
 	copy(result, mp.metrics)
+	for i := range result {
+		if !result[i].HasCapture {
+			continue
+		}
+		if _, ok := mp.captures[result[i].ID]; !ok {
+			result[i].HasCapture = false
+		}
+	}
 	return result
 }
 
@@ -401,7 +409,17 @@ func (mp *metricsMonitor) getMetricsJSON() ([]byte, error) {
 	if mp.metrics == nil {
 		return json.Marshal([]TokenMetrics{})
 	}
-	return json.Marshal(mp.metrics)
+	result := make([]TokenMetrics, len(mp.metrics))
+	copy(result, mp.metrics)
+	for i := range result {
+		if !result[i].HasCapture {
+			continue
+		}
+		if _, ok := mp.captures[result[i].ID]; !ok {
+			result[i].HasCapture = false
+		}
+	}
+	return json.Marshal(result)
 }
 
 // wrapHandler wraps the proxy handler to extract token metrics
@@ -544,7 +562,7 @@ func (mp *metricsMonitor) wrapHandler(
 			"/responses",
 			"/completion",
 		}
-		if upstreamMetric := mp.consumeUpstreamMetricAny(modelID, paths, requestStart, 250*time.Millisecond); upstreamMetric != nil {
+		if upstreamMetric := mp.consumeUpstreamMetricAny(modelID, paths, requestStart, 1500*time.Millisecond); upstreamMetric != nil {
 			applyUpstreamTimingMetric(&tm, upstreamMetric)
 		}
 	}

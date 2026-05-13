@@ -100,6 +100,38 @@ func TestMetricsMonitor_AddMetrics(t *testing.T) {
 	})
 }
 
+func TestMetricsMonitor_GetMetricsClearsEvictedCaptureFlag(t *testing.T) {
+	mm := newMetricsMonitor(testLogger, 10, 1)
+	id := mm.addMetrics(TokenMetrics{
+		Model:      "test-model",
+		HasCapture: true,
+	})
+
+	metrics := mm.getMetrics()
+	if assert.Len(t, metrics, 1) {
+		assert.Equal(t, id, metrics[0].ID)
+		assert.False(t, metrics[0].HasCapture)
+	}
+}
+
+func TestMetricsMonitor_GetMetricsJSONClearsEvictedCaptureFlag(t *testing.T) {
+	mm := newMetricsMonitor(testLogger, 10, 1)
+	_ = mm.addMetrics(TokenMetrics{
+		Model:      "test-model",
+		HasCapture: true,
+	})
+
+	body, err := mm.getMetricsJSON()
+	assert.NoError(t, err)
+
+	var metrics []TokenMetrics
+	err = json.Unmarshal(body, &metrics)
+	assert.NoError(t, err)
+	if assert.Len(t, metrics, 1) {
+		assert.False(t, metrics[0].HasCapture)
+	}
+}
+
 func TestProcessStreamingResponse_ParsesPlainJSONBody(t *testing.T) {
 	start := time.Now()
 	body := []byte(`{"usage":{"prompt_tokens":7,"completion_tokens":9}}`)
