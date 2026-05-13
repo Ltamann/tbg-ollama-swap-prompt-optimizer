@@ -4186,6 +4186,98 @@ func TestShouldRetryWeakPlaceholderFinal_WhenDetailedPlanPromiseWasFinalized(t *
 	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, ToolWorkflowState{}))
 }
 
+func TestShouldRetryWeakPlaceholderFinal_WhenSimplePlanPromiseWasFinalized(t *testing.T) {
+	req := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Ask me how to build it first and then write the plan."},
+				},
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"Great choices - a colorful browser-based quiz will be fun and engaging for a first-grader. Let me put together a plan.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"Great choices - a colorful browser-based quiz will be fun and engaging for a first-grader. Let me put together a plan."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"Great choices - a colorful browser-based quiz will be fun and engaging for a first-grader. Let me put together a plan."
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, ToolWorkflowState{}))
+}
+
+func TestShouldRewritePlanModeResponseText_WhenModelPromisesToWritePlanNext(t *testing.T) {
+	assert.True(t, shouldRewritePlanModeResponseText("Great choices - a colorful browser-based quiz will be fun and engaging for a first-grader. Let me put together a plan."))
+	assert.True(t, shouldRewritePlanModeResponseText("The user wants:\n- HTML + JavaScript\n- Web Browser interface (HTML/CSS)\n\nLet me now design a detailed plan for this."))
+}
+
+func TestShouldRetryWeakPlaceholderFinal_WhenStructuredPlanStillRequiredButReplyIsGenericAcknowledgement(t *testing.T) {
+	req := map[string]any{
+		"instructions": "<collaboration_mode># Plan Mode (Conversational)\nOnly output the final plan when it is decision complete.\nWrap the final answer in <proposed_plan>...</proposed_plan> tags exactly.\nYou are in Plan Mode.\n</collaboration_mode>",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "Ask me how to build it first and then return the final visible answer as exactly one <proposed_plan>...</proposed_plan> block."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"name":      "request_user_input",
+				"call_id":   "call_question_1",
+				"arguments": `{"questions":[{"id":"build_style","question":"How should the game be built?","options":[{"label":"HTML + JavaScript","description":"Single-page app"}]}]}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_question_1",
+				"output":  `{"answers":{"build_style":{"answers":["HTML + JavaScript"]}}}`,
+			},
+		},
+	}
+	translatedResponse := []byte(`{
+		"status":"completed",
+		"output_text":"That gives me enough information to proceed.",
+		"output":[
+			{
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"That gives me enough information to proceed."}]
+			}
+		]
+	}`)
+	chatResponse := []byte(`{
+		"choices":[
+			{
+				"finish_reason":"stop",
+				"message":{
+					"content":"That gives me enough information to proceed."
+				}
+			}
+		]
+	}`)
+
+	assert.True(t, requestStillWantsStructuredPlan(req, buildToolWorkflowState(req)))
+	assert.True(t, shouldRetryWeakPlaceholderFinal(req, nil, chatResponse, translatedResponse, buildToolWorkflowState(req)))
+}
+
 func TestShouldRetryWeakPlaceholderFinal_WhenDirectoryCreatePromiseWasFinalized(t *testing.T) {
 	req := map[string]any{
 		"input": []any{

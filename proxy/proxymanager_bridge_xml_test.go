@@ -4372,6 +4372,30 @@ func TestEnforcePlanModeResponse_PrefersVisiblePlanBlockOverReasoningSummary(t *
 	assert.NotContains(t, text, "The user has answered the questions. Now I have clear direction")
 }
 
+func TestEnforcePlanModeResponse_WrapsPlainStructuredPlanTextWithoutVisiblePlanBlock(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_plan_plain_text",
+		"object":"response",
+		"status":"completed",
+		"output":[
+			{
+				"id":"msg_1",
+				"type":"message",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"## First-Grade Quiz Game\n\n1. Build the UI\n2. Load local JSON quizzes\n3. Validate solo play flow\n\nAssumptions: plain HTML/CSS/JS, solo play first."}]
+			}
+		],
+		"output_text":"## First-Grade Quiz Game\n\n1. Build the UI\n2. Load local JSON quizzes\n3. Validate solo play flow\n\nAssumptions: plain HTML/CSS/JS, solo play first."
+	}`)
+
+	out := enforcePlanModeResponse(body, true)
+	text := gjson.GetBytes(out, "output.0.content.0.text").String()
+	assert.Contains(t, text, "<proposed_plan>")
+	assert.Contains(t, text, "## First-Grade Quiz Game")
+	assert.Contains(t, text, "Load local JSON quizzes")
+	assert.Contains(t, text, "</proposed_plan>")
+}
+
 func TestEnforcePlanModeResponse_DoesNotWrapResearchSummaryWithoutVisiblePlanBlock(t *testing.T) {
 	body := []byte(`{
 		"id":"resp_plan_research_summary",

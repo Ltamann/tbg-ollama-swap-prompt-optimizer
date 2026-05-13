@@ -6873,6 +6873,9 @@ func looksLikePlanAcknowledgementWithoutPlan(text string) bool {
 	return strings.Contains(lower, "i have everything i need") ||
 		strings.Contains(lower, "here's the plan:") ||
 		strings.Contains(lower, "here is the plan:") ||
+		strings.Contains(lower, "let me put together a plan") ||
+		strings.Contains(lower, "let me design a detailed plan") ||
+		strings.Contains(lower, "let me now design a detailed plan") ||
 		strings.Contains(lower, "great - i have everything i need") ||
 		strings.Contains(lower, "great — i have everything i need")
 }
@@ -9219,8 +9222,12 @@ func textLooksLikeDeferredToolPromise(text string) bool {
 		return false
 	}
 	promisePhrases := []string{
+		"let me put together a plan",
 		"let me put together a detailed plan",
 		"let me put together the detailed plan",
+		"let me design a detailed plan",
+		"let me now design a detailed plan",
+		"let me now design a detailed plan for this",
 		"let me create a comprehensive plan",
 		"let me write a detailed plan",
 		"now i have a few questions to finalize the plan",
@@ -12328,7 +12335,7 @@ func enforcePlanModeResponse(responseBody []byte, upstreamFinishedNormally bool)
 	if preferredVisiblePlan == "" {
 		if strings.TrimSpace(planText) == "" && finishReason == "length" {
 			planText = planModeLengthDiagnosticText()
-		} else {
+		} else if shouldRewritePlanModeResponseText(planText) {
 			return responseBody
 		}
 	}
@@ -13492,6 +13499,23 @@ func shouldRetryMissingBrowserOpenCall(req map[string]any, chatResponse []byte, 
 	return finishReason == "stop"
 }
 
+func textMissingRequiredStructuredPlan(text string, req map[string]any, workflowState ToolWorkflowState) bool {
+	if req == nil {
+		return false
+	}
+	if !requestStillWantsStructuredPlan(req, workflowState) {
+		return false
+	}
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return true
+	}
+	if extractVisibleProposedPlanBlock(trimmed) != "" {
+		return false
+	}
+	return shouldRewritePlanModeResponseText(trimmed)
+}
+
 func shouldRetryWeakPlaceholderFinal(req map[string]any, translatedChatRequest []byte, chatResponse []byte, translatedResponse []byte, workflowState ToolWorkflowState) bool {
 	if req == nil {
 		return false
@@ -13506,7 +13530,8 @@ func shouldRetryWeakPlaceholderFinal(req map[string]any, translatedChatRequest [
 	visibleLooksIncomplete := isWeakProgressPlaceholderText(visibleText) ||
 		textLooksLikeEmptyToolArtifact(visibleText) ||
 		textLooksLikeDeferredToolPromise(visibleText) ||
-		textLooksLikeTruncatedAgentContinuation(visibleText, req, workflowState)
+		textLooksLikeTruncatedAgentContinuation(visibleText, req, workflowState) ||
+		textMissingRequiredStructuredPlan(visibleText, req, workflowState)
 	if !visibleLooksIncomplete {
 		return false
 	}
@@ -13517,7 +13542,8 @@ func shouldRetryWeakPlaceholderFinal(req map[string]any, translatedChatRequest [
 	chatLooksIncomplete := isWeakProgressPlaceholderText(chatVisibleText) ||
 		textLooksLikeEmptyToolArtifact(chatVisibleText) ||
 		textLooksLikeDeferredToolPromise(chatVisibleText) ||
-		textLooksLikeTruncatedAgentContinuation(chatVisibleText, req, workflowState)
+		textLooksLikeTruncatedAgentContinuation(chatVisibleText, req, workflowState) ||
+		textMissingRequiredStructuredPlan(chatVisibleText, req, workflowState)
 	if !chatLooksIncomplete {
 		return false
 	}
